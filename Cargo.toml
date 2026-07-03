@@ -1,0 +1,38 @@
+[package]
+name = "taphttp"
+version = "0.1.0"
+edition = "2021"
+description = "Headless TLS-terminating MITM proxy for HTTP traffic inspection"
+license = "MIT"
+
+[[bin]]
+name = "taphttp"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
+hyper-util = { version = "0.1", features = ["tokio", "client", "client-legacy", "http1", "http2"] }
+http-body-util = "0.1"
+bytes = "1"
+rcgen = { version = "0.13", features = ["x509-parser"] }
+rustls = { version = "0.23", features = ["ring"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+hyper-rustls = { version = "0.27", features = ["http1", "http2", "native-tokio", "ring"] }
+webpki-roots = "0.26"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+clap = { version = "4", features = ["derive", "env"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dirs = "5"
+
+[profile.release]
+opt-level = 3

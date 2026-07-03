@@ -60,13 +60,14 @@ engineering commentary is enough.
 
 ## Commands
 
-(Fill in once the project scaffold exists: build, test, lint, run.)
-
 ```
 cargo build
 cargo test
-cargo clippy
-cargo run -- <args>
+cargo clippy -- -D warnings
+cargo run -- start                        # start proxy on 127.0.0.1:8080
+cargo run -- logs                         # query captured traffic
+cargo run -- replay <id>                  # replay a captured request
+cargo run -- ca info                      # CA cert path + install instructions
 ```
 
 ## Status
