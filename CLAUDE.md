@@ -58,6 +58,24 @@ and code comments honest about what was scaffolded vs. hand-written
 where it's relevant, but don't over-narrate it either, normal
 engineering commentary is enough.
 
+## Testing
+
+**TDD is mandatory.** This codebase is a foundation for other tools; correctness
+is non-negotiable.
+
+Rules:
+- Write the test first. No new behavior ships without a test that would catch a
+  regression in that behavior.
+- Unit-test every non-trivial pure/logic function in the module it lives in
+  (`#[cfg(test)] mod tests { … }`).
+- Integration-test every user-visible workflow (proxy records request, replay
+  hits upstream, filters work on real JSONL files, CA cert is loaded/cached).
+- `cargo test` must be green before committing.
+- `cargo clippy -- -D warnings` must be clean before committing.
+
+Coverage bar: if you delete a behavior and no test fails, that behavior was not
+tested. Treat that as a bug in the test suite, not a green light to ship.
+
 ## Commands
 
 ```

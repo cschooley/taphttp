@@ -83,3 +83,155 @@ pub async fn run(args: ReplayArgs, data_dir: PathBuf) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::ReplayArgs;
+    use crate::storage::{JsonLinesBackend, TrafficEntry};
+    use bytes::Bytes;
+    use chrono::Utc;
+    use http_body_util::Full;
+    use hyper::body::Incoming;
+    use hyper::service::service_fn;
+    use hyper::{Request, Response};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tempfile::TempDir;
+    use tokio::net::TcpListener;
+
+    async fn start_capture_server(hit: Arc<AtomicBool>) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let hit = hit.clone();
+                tokio::spawn(async move {
+                    hyper::server::conn::http1::Builder::new()
+                        .serve_connection(
+                            hyper_util::rt::TokioIo::new(stream),
+                            service_fn(move |_req: Request<Incoming>| {
+                                hit.store(true, Ordering::SeqCst);
+                                async move {
+                                    Ok::<_, anyhow::Error>(Response::new(Full::new(
+                                        Bytes::from("replayed"),
+                                    )))
+                                }
+                            }),
+                        )
+                        .await
+                        .ok();
+                });
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn replay_sends_request_to_upstream() {
+        let hit = Arc::new(AtomicBool::new(false));
+        let port = start_capture_server(hit.clone()).await;
+
+        let dir = TempDir::new().unwrap();
+        let data_dir = dir.path().to_path_buf();
+
+        let entry = TrafficEntry {
+            id: "replay-test-id".to_string(),
+            ts: Utc::now(),
+            host: format!("127.0.0.1:{port}"),
+            method: "GET".to_string(),
+            url: format!("http://127.0.0.1:{port}/check"),
+            req_headers: HashMap::new(),
+            req_body: None,
+            status: Some(200),
+            res_headers: HashMap::new(),
+            res_body: None,
+            duration_ms: Some(5),
+        };
+
+        JsonLinesBackend::new(&data_dir.join("traffic.jsonl")).append(&entry).unwrap();
+
+        let args = ReplayArgs {
+            id: "replay-test-id".to_string(),
+            method: None,
+            headers: vec![],
+            body: None,
+        };
+
+        run(args, data_dir).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(hit.load(Ordering::SeqCst), "capture server should have been hit by replay");
+    }
+
+    #[tokio::test]
+    async fn replay_applies_method_and_header_overrides() {
+        let hit = Arc::new(AtomicBool::new(false));
+        let port = start_capture_server(hit.clone()).await;
+
+        let dir = TempDir::new().unwrap();
+        let data_dir = dir.path().to_path_buf();
+
+        let entry = TrafficEntry {
+            id: "override-id".to_string(),
+            ts: Utc::now(),
+            host: format!("127.0.0.1:{port}"),
+            method: "GET".to_string(),
+            url: format!("http://127.0.0.1:{port}/"),
+            req_headers: HashMap::new(),
+            req_body: None,
+            status: Some(200),
+            res_headers: HashMap::new(),
+            res_body: None,
+            duration_ms: None,
+        };
+
+        JsonLinesBackend::new(&data_dir.join("traffic.jsonl")).append(&entry).unwrap();
+
+        let args = ReplayArgs {
+            id: "override-id".to_string(),
+            method: Some("POST".to_string()),
+            headers: vec!["x-test:yes".to_string()],
+            body: Some("new body".to_string()),
+        };
+
+        run(args, data_dir).await.unwrap();
+        assert!(hit.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn replay_errors_on_missing_id() {
+        let dir = TempDir::new().unwrap();
+        let data_dir = dir.path().to_path_buf();
+        JsonLinesBackend::new(&data_dir.join("traffic.jsonl"))
+            .append(&TrafficEntry {
+                id: "some-id".to_string(),
+                ts: Utc::now(),
+                host: "x".to_string(),
+                method: "GET".to_string(),
+                url: "http://x/".to_string(),
+                req_headers: HashMap::new(),
+                req_body: None,
+                status: None,
+                res_headers: HashMap::new(),
+                res_body: None,
+                duration_ms: None,
+            })
+            .unwrap();
+
+        let args = ReplayArgs {
+            id: "does-not-exist".to_string(),
+            method: None,
+            headers: vec![],
+            body: None,
+        };
+
+        let result = run(args, data_dir).await;
+        assert!(result.is_err(), "should error when ID not found");
+    }
+}

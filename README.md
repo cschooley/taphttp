@@ -11,7 +11,8 @@ A headless, TLS-terminating MITM proxy written in Rust. Built as a composable fo
 
 - Intercepts HTTP and HTTPS traffic via a local proxy (CONNECT tunnel + TLS termination)
 - Generates a local CA on first run; signs per-domain certificates on the fly
-- Logs every request/response as JSON lines (optional SQLite backend)
+- Streams every request/response as JSON lines to stdout
+- Optionally also writes to a file (`--log-file`) or SQLite (`--sqlite`)
 - Lets you query and filter captured traffic from the command line
 - Replays any captured request, optionally with modified headers or body
 
@@ -41,10 +42,20 @@ cargo build --release
 
 **1. Start the proxy**
 
+Traffic is streamed to stdout as JSON lines. Redirect or pipe it however you like.
+
 ```sh
-taphttp start
-# taphttp listening on 127.0.0.1:8080
-# taphttp: generated CA cert at ~/.local/share/taphttp/ca.crt
+# Stream to another tool
+taphttp start | assessment-tool
+
+# Save to a file
+taphttp start > traffic.jsonl
+
+# Save to a file and also watch live
+taphttp start | tee traffic.jsonl
+
+# Save to a file explicitly (stdout still active)
+taphttp start --log-file traffic.jsonl
 ```
 
 **2. Install the CA cert** (once, so your browser trusts intercepted HTTPS)
@@ -68,23 +79,44 @@ export https_proxy=http://127.0.0.1:8080
 curl https://example.com
 ```
 
-**4. Query traffic**
+**4. Inspect captured traffic**
 
 ```sh
-taphttp logs
-# ID                                    METHOD  HOST                  STATUS  URL
-# ----------------------------------------------------------------------------------------------------
-# 3f2a1b4c-...                          GET     example.com           200     https://example.com/
+# Show everything in a file
+taphttp show traffic.jsonl
 
-taphttp logs --host example.com --method GET --limit 20
-taphttp logs --json | jq '.req_headers'
+# Filter by host, method, or status
+taphttp show traffic.jsonl --host api.example.com
+taphttp show traffic.jsonl --method POST --status 401
+taphttp show traffic.jsonl -n 20
+
+# Raw JSON lines (pipe to jq, grep, etc.)
+taphttp show traffic.jsonl --json | jq '.res_body'
+taphttp show traffic.jsonl --json | jq 'select(.status >= 400)'
+taphttp show traffic.jsonl --json | jq '{method, url, req_headers, res_headers}'
+
+# Same patterns work on live output
+taphttp start | jq '{method, url, req_headers, res_headers}'
+taphttp start | jq 'select(.status >= 400)'
 ```
 
 **5. Replay a request**
 
 ```sh
-taphttp replay 3f2a1b4c-...
-taphttp replay 3f2a1b4c-... --method POST --header "Authorization: Bearer newtoken" --body '{"key":"val"}'
+taphttp replay <ID>
+taphttp replay <ID> --method POST --header "Authorization: Bearer newtoken" --body '{"key":"val"}'
+```
+
+**6. Intercept and modify traffic live**
+
+`--intercept-socket <path>` pauses every request and response on a Unix
+socket, one connection per event, until something on the other end writes
+back a decision (forward, forward with overrides, or drop). See
+[`demo/intercept.sh`](demo/intercept.sh) for a runnable example, including
+the exact JSON the proxy sends and expects back:
+
+```sh
+./demo/intercept.sh
 ```
 
 ---
@@ -96,17 +128,21 @@ taphttp replay 3f2a1b4c-... --method POST --header "Authorization: Bearer newtok
 | Flag | Default | Description |
 |---|---|---|
 | `--listen` | `127.0.0.1:8080` | Address to listen on |
-| `--sqlite` | off | Also write traffic to SQLite (`traffic.db`) |
+| `--log-file` | — | Also write traffic to this file |
+| `--sqlite` | off | Also write traffic to SQLite (`traffic.db` in data dir) |
 | `--filter-host` | — | Only log requests whose host contains this substring |
+| `--intercept-socket` | — | Unix socket path for the intercept hook (pauses each request/response) |
 
-### `taphttp logs`
+Traffic is always written to stdout as JSON lines. `--log-file` and `--sqlite` are additive.
+
+### `taphttp show <FILE>`
 
 | Flag | Default | Description |
 |---|---|---|
 | `--host` | — | Filter by host substring |
 | `--method` | — | Filter by HTTP method |
 | `--status` | — | Filter by response status code |
-| `-n` / `--limit` | 50 | Show last N entries |
+| `-n` / `--limit` | all | Show last N entries |
 | `--json` | off | Output raw JSON lines instead of table |
 
 ### `taphttp replay <ID>`
@@ -132,10 +168,11 @@ Default: `~/.local/share/taphttp/` (Linux) or `~/Library/Application Support/tap
 
 Override with `--data-dir <path>` or `TAPHTTP_DATA=<path>`.
 
-Files:
+Files written here:
 - `ca.crt` / `ca.key` — local CA (generated once, keep the key private)
-- `traffic.jsonl` — JSON-lines traffic log
 - `traffic.db` — SQLite traffic log (only with `--sqlite`)
+
+Traffic JSON lines go to stdout by default. Use `--log-file <path>` to also write to a file anywhere you choose.
 
 ---
 
@@ -168,7 +205,7 @@ Future tools (separate binaries that consume `taphttp`'s output):
 - `taphttp-assert` — assert response shapes for regression testing
 - `taphttp-export` — convert JSON lines to HAR, Burp XML, etc.
 
-These will be separate tools that read from `traffic.jsonl`, not flags on this binary.
+These will be separate tools that read from `taphttp`'s stdout or a saved file, not flags on this binary.
 
 ---
 

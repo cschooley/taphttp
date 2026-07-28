@@ -5,7 +5,7 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(name = "taphttp", about = "Headless TLS-terminating MITM proxy")]
 pub struct Cli {
-    /// Directory for CA keys, certs, and traffic logs
+    /// Directory for CA keys and SQLite database
     #[arg(long, env = "TAPHTTP_DATA")]
     pub data_dir: Option<PathBuf>,
 
@@ -17,8 +17,8 @@ pub struct Cli {
 pub enum Commands {
     /// Start the proxy
     Start(StartArgs),
-    /// Query captured traffic logs
-    Logs(LogsArgs),
+    /// Show captured traffic from a log file
+    Show(ShowArgs),
     /// Replay a captured request
     Replay(ReplayArgs),
     /// Manage the local CA certificate
@@ -31,17 +31,28 @@ pub struct StartArgs {
     #[arg(short, long, default_value = "127.0.0.1:8080")]
     pub listen: String,
 
-    /// Write logs to sqlite in addition to JSON lines
+    /// Also write traffic log to this file
+    #[arg(long)]
+    pub log_file: Option<PathBuf>,
+
+    /// Also write traffic log to SQLite in the data directory
     #[arg(long)]
     pub sqlite: bool,
 
     /// Only log requests matching this host (substring)
     #[arg(long)]
     pub filter_host: Option<String>,
+
+    /// Unix socket path for the intercept hook (pauses each request/response)
+    #[arg(long)]
+    pub intercept_socket: Option<PathBuf>,
 }
 
 #[derive(Args)]
-pub struct LogsArgs {
+pub struct ShowArgs {
+    /// Traffic log file to read
+    pub file: PathBuf,
+
     /// Filter by host (substring match)
     #[arg(long)]
     pub host: Option<String>,
@@ -54,9 +65,9 @@ pub struct LogsArgs {
     #[arg(long)]
     pub status: Option<u16>,
 
-    /// Show last N entries (default: 50)
-    #[arg(short = 'n', long, default_value = "50")]
-    pub limit: usize,
+    /// Show last N entries (default: all)
+    #[arg(short = 'n', long)]
+    pub limit: Option<usize>,
 
     /// Output raw JSON lines (default: pretty table)
     #[arg(long)]
@@ -65,7 +76,7 @@ pub struct LogsArgs {
 
 #[derive(Args)]
 pub struct ReplayArgs {
-    /// Request ID to replay (from logs)
+    /// Request ID to replay (from a traffic log)
     pub id: String,
 
     /// Override request method
@@ -107,4 +118,38 @@ pub fn data_dir(override_path: &Option<PathBuf>) -> Result<PathBuf> {
     };
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn data_dir_uses_override_path() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("custom");
+        let result = data_dir(&Some(target.clone())).unwrap();
+        assert_eq!(result, target);
+        assert!(target.exists(), "data_dir should create the directory");
+    }
+
+    #[test]
+    fn data_dir_creates_directory_if_missing() {
+        let dir = TempDir::new().unwrap();
+        let nested = dir.path().join("a").join("b").join("c");
+        assert!(!nested.exists());
+        data_dir(&Some(nested.clone())).unwrap();
+        assert!(nested.exists());
+    }
+
+    #[test]
+    fn data_dir_with_none_returns_system_path_ending_in_taphttp() {
+        let result = data_dir(&None).unwrap();
+        assert!(
+            result.ends_with("taphttp"),
+            "default data dir should end with 'taphttp', got: {}",
+            result.display()
+        );
+    }
 }

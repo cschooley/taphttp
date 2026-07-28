@@ -4,7 +4,7 @@ use rcgen::{
     KeyPair,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use std::collections::HashMap;
@@ -17,7 +17,7 @@ pub struct Ca {
 }
 
 impl Ca {
-    pub fn load_or_create(data_dir: &PathBuf) -> Result<Self> {
+    pub fn load_or_create(data_dir: &Path) -> Result<Self> {
         let cert_path = data_dir.join("ca.crt");
         let key_path = data_dir.join("ca.key");
 
@@ -70,7 +70,7 @@ impl Ca {
         self.cert.pem()
     }
 
-    pub fn cert_path(data_dir: &PathBuf) -> PathBuf {
+    pub fn cert_path(data_dir: &Path) -> PathBuf {
         data_dir.join("ca.crt")
     }
 
@@ -102,6 +102,85 @@ impl Ca {
         let cfg = Arc::new(server_cfg);
         cache.insert(host.to_string(), cfg.clone());
         Ok(cfg)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn install_crypto_provider() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
+    #[test]
+    fn creates_ca_files_on_first_run() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().to_path_buf();
+        Ca::load_or_create(&path).unwrap();
+        assert!(path.join("ca.crt").exists(), "ca.crt should be written");
+        assert!(path.join("ca.key").exists(), "ca.key should be written");
+    }
+
+    #[test]
+    fn loads_existing_ca_without_regenerating() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().to_path_buf();
+        Ca::load_or_create(&path).unwrap();
+        let mtime = std::fs::metadata(path.join("ca.crt"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        // Second call must not overwrite the cert
+        Ca::load_or_create(&path).unwrap();
+        let mtime2 = std::fs::metadata(path.join("ca.crt"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(mtime, mtime2, "ca.crt should not be regenerated on second load");
+    }
+
+    #[test]
+    fn cert_path_points_inside_data_dir() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().to_path_buf();
+        assert_eq!(Ca::cert_path(&path), path.join("ca.crt"));
+    }
+
+    #[tokio::test]
+    async fn server_config_caches_cert_for_same_host() {
+        install_crypto_provider();
+        let dir = TempDir::new().unwrap();
+        let ca = Ca::load_or_create(&dir.path().to_path_buf()).unwrap();
+        let cfg1 = ca.server_config_for("example.com").await.unwrap();
+        let cfg2 = ca.server_config_for("example.com").await.unwrap();
+        assert!(
+            Arc::ptr_eq(&cfg1, &cfg2),
+            "same host should return the same cached Arc"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_config_different_for_different_hosts() {
+        install_crypto_provider();
+        let dir = TempDir::new().unwrap();
+        let ca = Ca::load_or_create(&dir.path().to_path_buf()).unwrap();
+        let cfg1 = ca.server_config_for("alpha.com").await.unwrap();
+        let cfg2 = ca.server_config_for("beta.com").await.unwrap();
+        assert!(
+            !Arc::ptr_eq(&cfg1, &cfg2),
+            "different hosts should get different server configs"
+        );
+    }
+
+    #[test]
+    fn cert_pem_is_valid_pem() {
+        let dir = TempDir::new().unwrap();
+        let ca = Ca::load_or_create(&dir.path().to_path_buf()).unwrap();
+        let pem = ca.cert_pem();
+        assert!(pem.starts_with("-----BEGIN CERTIFICATE-----"));
+        assert!(pem.trim_end().ends_with("-----END CERTIFICATE-----"));
     }
 }
 
