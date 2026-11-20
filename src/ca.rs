@@ -105,6 +105,34 @@ impl Ca {
     }
 }
 
+pub async fn manage(args: CaArgs, data_dir: PathBuf) -> Result<()> {
+    match args.action {
+        CaAction::Info => {
+            let path = Ca::cert_path(&data_dir);
+            println!("CA cert: {}", path.display());
+            println!();
+            println!("Install instructions:");
+            println!(
+                "  Linux (system): sudo cp {} /usr/local/share/ca-certificates/taphttp.crt && sudo update-ca-certificates",
+                path.display()
+            );
+            println!(
+                "  macOS:          sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain {}",
+                path.display()
+            );
+            println!(
+                "  Firefox:        Settings → Privacy → Certificates → Import → {}",
+                path.display()
+            );
+        }
+        CaAction::Print => {
+            let ca = Ca::load_or_create(&data_dir)?;
+            print!("{}", ca.cert_pem());
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,7 +180,7 @@ mod tests {
     async fn server_config_caches_cert_for_same_host() {
         install_crypto_provider();
         let dir = TempDir::new().unwrap();
-        let ca = Ca::load_or_create(&dir.path().to_path_buf()).unwrap();
+        let ca = Ca::load_or_create(dir.path()).unwrap();
         let cfg1 = ca.server_config_for("example.com").await.unwrap();
         let cfg2 = ca.server_config_for("example.com").await.unwrap();
         assert!(
@@ -165,7 +193,7 @@ mod tests {
     async fn server_config_different_for_different_hosts() {
         install_crypto_provider();
         let dir = TempDir::new().unwrap();
-        let ca = Ca::load_or_create(&dir.path().to_path_buf()).unwrap();
+        let ca = Ca::load_or_create(dir.path()).unwrap();
         let cfg1 = ca.server_config_for("alpha.com").await.unwrap();
         let cfg2 = ca.server_config_for("beta.com").await.unwrap();
         assert!(
@@ -177,37 +205,10 @@ mod tests {
     #[test]
     fn cert_pem_is_valid_pem() {
         let dir = TempDir::new().unwrap();
-        let ca = Ca::load_or_create(&dir.path().to_path_buf()).unwrap();
+        let ca = Ca::load_or_create(dir.path()).unwrap();
         let pem = ca.cert_pem();
         assert!(pem.starts_with("-----BEGIN CERTIFICATE-----"));
         assert!(pem.trim_end().ends_with("-----END CERTIFICATE-----"));
     }
 }
 
-pub async fn manage(args: CaArgs, data_dir: PathBuf) -> Result<()> {
-    match args.action {
-        CaAction::Info => {
-            let path = Ca::cert_path(&data_dir);
-            println!("CA cert: {}", path.display());
-            println!();
-            println!("Install instructions:");
-            println!(
-                "  Linux (system): sudo cp {} /usr/local/share/ca-certificates/taphttp.crt && sudo update-ca-certificates",
-                path.display()
-            );
-            println!(
-                "  macOS:          sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain {}",
-                path.display()
-            );
-            println!(
-                "  Firefox:        Settings → Privacy → Certificates → Import → {}",
-                path.display()
-            );
-        }
-        CaAction::Print => {
-            let ca = Ca::load_or_create(&data_dir)?;
-            print!("{}", ca.cert_pem());
-        }
-    }
-    Ok(())
-}
