@@ -12,9 +12,6 @@ use crate::cli::ShowArgs;
 /// Version of the structured traffic schema that outside consumers
 /// (the lever API, the MCP server, the SPA) can depend on. Bump this
 /// whenever the shape of `TrafficEntry` changes in a breaking way.
-// Consumed by the lever API / MCP server (next increment); exposed now so
-// the schema contract is pinned before any consumer depends on it.
-#[allow(dead_code)]
 pub const SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,8 +131,6 @@ impl Store {
 
     /// Subscribe to the live feed of recorded entries. Each subscriber
     /// receives every entry recorded after it subscribes.
-    // Bridged to a WebSocket by the lever API / MCP server (next increment).
-    #[allow(dead_code)]
     pub fn subscribe(&self) -> broadcast::Receiver<TrafficEntry> {
         self.live.subscribe()
     }
@@ -212,19 +207,24 @@ pub fn filter_entries(entries: Vec<TrafficEntry>, args: &ShowArgs) -> Vec<Traffi
     query_entries(entries, &query)
 }
 
+/// Load all traffic entries from a JSON-lines log file, skipping blank and
+/// unparseable lines. Shared by the `show` CLI command and the lever API.
+pub fn load_entries(path: &Path) -> Result<Vec<TrafficEntry>> {
+    let content = std::fs::read_to_string(path).context("reading traffic log")?;
+    Ok(content
+        .lines()
+        .filter(|l| !l.is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect())
+}
+
 pub async fn show(args: ShowArgs) -> Result<()> {
     if !args.file.exists() {
         eprintln!("File not found: {}", args.file.display());
         return Ok(());
     }
 
-    let content = std::fs::read_to_string(&args.file)?;
-    let entries: Vec<TrafficEntry> = content
-        .lines()
-        .filter(|l| !l.is_empty())
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect();
-
+    let entries = load_entries(&args.file)?;
     let entries = filter_entries(entries, &args);
 
     if args.json {
@@ -361,6 +361,31 @@ mod tests {
     }
 
     #[test]
+    fn load_entries_reads_all_and_skips_blank_lines() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("traffic.jsonl");
+        let backend = JsonLinesBackend::new(&path);
+        backend.append(&make_entry("a", "x.com", "GET", 200)).unwrap();
+        backend.append(&make_entry("b", "y.com", "POST", 201)).unwrap();
+        // A stray blank line and a garbage line must be tolerated.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .map(|mut f| writeln!(f, "\nnot json").unwrap())
+            .unwrap();
+
+        let entries = load_entries(&path).unwrap();
+        let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["a", "b"]);
+    }
+
+    #[test]
+    fn load_entries_errors_on_missing_file() {
+        let dir = TempDir::new().unwrap();
+        assert!(load_entries(&dir.path().join("nope.jsonl")).is_err());
+    }
+
+    #[test]
     fn jsonl_appends_multiple_entries() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("traffic.jsonl");
@@ -489,11 +514,6 @@ mod tests {
         let cli_ids: Vec<&str> = via_cli.iter().map(|e| e.id.as_str()).collect();
         let core_ids: Vec<&str> = via_core.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(cli_ids, core_ids);
-    }
-
-    #[test]
-    fn schema_version_is_at_least_one() {
-        assert!(SCHEMA_VERSION >= 1);
     }
 
     // --- live feed (broadcast primitive the API/MCP bridge to) ---

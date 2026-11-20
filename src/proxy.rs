@@ -32,6 +32,22 @@ pub async fn run(args: StartArgs, data_dir: PathBuf) -> Result<()> {
     let store = Store::new(&data_dir, args.log_file.as_deref(), args.sqlite)?;
     let addr: SocketAddr = args.listen.parse().context("invalid listen address")?;
     let listener = TcpListener::bind(addr).await.context("binding listener")?;
+
+    // Optionally serve the lever API alongside the proxy, sharing the same
+    // live Store so its /feed carries real traffic as it is recorded.
+    if let Some(api_listen) = &args.api_listen {
+        let api_addr: SocketAddr = api_listen.parse().context("invalid api-listen address")?;
+        let state = Arc::new(crate::api::ApiState {
+            store: store.clone(),
+            log_path: args.log_file.clone(),
+        });
+        tokio::spawn(async move {
+            if let Err(e) = crate::api::serve(state, api_addr).await {
+                tracing::error!("lever API exited: {e}");
+            }
+        });
+    }
+
     serve(listener, ca, store, args.filter_host, args.intercept_socket).await
 }
 

@@ -46,6 +46,11 @@ pub struct StartArgs {
     /// Unix socket path for the intercept hook (pauses each request/response)
     #[arg(long)]
     pub intercept_socket: Option<PathBuf>,
+
+    /// Also serve the lever API (HTTP + WebSocket feed) on this address,
+    /// e.g. 127.0.0.1:8081. Consumed by the SPA and MCP server.
+    #[arg(long)]
+    pub api_listen: Option<String>,
 }
 
 #[derive(Args)]

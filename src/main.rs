@@ -1,3 +1,4 @@
+mod api;
 mod ca;
 mod cli;
 mod intercept;
