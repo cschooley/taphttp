@@ -5,11 +5,17 @@ edition = "2021"
 description = "Headless TLS-terminating MITM proxy for HTTP traffic inspection"
 license = "MIT"
 
+[workspace]
+members = [".", "crates/taphttp-types"]
+# So plain `cargo test` / `cargo clippy` cover the shared types crate too.
+default-members = [".", "crates/taphttp-types"]
+
 [[bin]]
 name = "taphttp"
 path = "src/main.rs"
 
 [dependencies]
+taphttp-types = { path = "crates/taphttp-types" }
 tokio = { version = "1", features = ["full"] }
 hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
 hyper-util = { version = "0.1", features = ["tokio", "client", "client-legacy", "http1", "http2"] }

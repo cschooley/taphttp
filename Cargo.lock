@@ -1629,6 +1629,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
+ "taphttp-types",
  "tempfile",
  "tokio",
  "tokio-rustls",
@@ -1638,6 +1639,15 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "taphttp-types"
+version = "0.2.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

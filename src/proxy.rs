@@ -19,7 +19,8 @@ use uuid::Uuid;
 use crate::ca::Ca;
 use crate::cli::StartArgs;
 use crate::intercept::{self, Decision, InterceptEvent, RequestEvent, ResponseEvent};
-use crate::storage::{Store, TrafficEntry};
+use crate::storage::{Headers, Store, TrafficEntry};
+use taphttp_types::{encode_body, header_value_to_string};
 
 #[derive(Clone)]
 struct ProxyConfig {
@@ -216,9 +217,7 @@ async fn forward_https(
     let mut req_headers = collect_headers(req.headers());
 
     let (_, body) = req.into_parts();
-    let body_bytes = body.collect().await?.to_bytes();
-    let mut req_body_str = maybe_utf8(&body_bytes);
-    let mut req_body_bytes = body_bytes;
+    let mut req_body_bytes = body.collect().await?.to_bytes();
 
     // --- intercept request ---
     if let Some(socket) = &config.intercept_socket {
@@ -226,8 +225,8 @@ async fn forward_https(
             id: id.clone(),
             method: method.clone(),
             url: url.clone(),
-            headers: req_headers.clone(),
-            body: req_body_str.clone(),
+            headers: intercept_header_map(&req_headers),
+            body: maybe_utf8(&req_body_bytes),
         });
         match intercept::pause(socket, &event).await {
             Ok(Decision::Forward(mods)) => {
@@ -235,7 +234,6 @@ async fn forward_https(
                     &mut method,
                     &mut url,
                     &mut req_headers,
-                    &mut req_body_str,
                     &mut req_body_bytes,
                     mods,
                 );
@@ -263,7 +261,7 @@ async fn forward_https(
         }
         Err(e) => {
             tracing::debug!("upstream error: {e}");
-            (None, HashMap::new(), Bytes::new())
+            (None, Headers::new(), Bytes::new())
         }
     };
 
@@ -274,7 +272,7 @@ async fn forward_https(
                 id: Uuid::new_v4().to_string(),
                 request_id: id.clone(),
                 status: s,
-                headers: res_headers.clone(),
+                headers: intercept_header_map(&res_headers),
                 body: maybe_utf8(&res_body_bytes),
             });
             match intercept::pause(socket, &event).await {
@@ -292,6 +290,8 @@ async fn forward_https(
         }
     }
 
+    let (req_body, req_body_encoding) = encode_body(&req_body_bytes);
+    let (res_body, res_body_encoding) = encode_body(&res_body_bytes);
     let entry = TrafficEntry {
         id,
         ts: Utc::now(),
@@ -299,10 +299,12 @@ async fn forward_https(
         method,
         url,
         req_headers,
-        req_body: req_body_str,
+        req_body,
+        req_body_encoding,
         status,
         res_headers,
-        res_body: maybe_utf8(&res_body_bytes),
+        res_body,
+        res_body_encoding,
         duration_ms: Some(duration_ms),
         replay_of: None,
     };
@@ -375,9 +377,7 @@ async fn handle_http(
     let mut req_headers = collect_headers(req.headers());
 
     let (_, body) = req.into_parts();
-    let body_bytes = body.collect().await?.to_bytes();
-    let mut req_body_str = maybe_utf8(&body_bytes);
-    let mut req_body_bytes = body_bytes;
+    let mut req_body_bytes = body.collect().await?.to_bytes();
 
     // --- intercept request ---
     if let Some(socket) = &config.intercept_socket {
@@ -385,8 +385,8 @@ async fn handle_http(
             id: id.clone(),
             method: method.clone(),
             url: url.clone(),
-            headers: req_headers.clone(),
-            body: req_body_str.clone(),
+            headers: intercept_header_map(&req_headers),
+            body: maybe_utf8(&req_body_bytes),
         });
         match intercept::pause(socket, &event).await {
             Ok(Decision::Forward(mods)) => {
@@ -394,7 +394,6 @@ async fn handle_http(
                     &mut method,
                     &mut url,
                     &mut req_headers,
-                    &mut req_body_str,
                     &mut req_body_bytes,
                     mods,
                 );
@@ -422,7 +421,7 @@ async fn handle_http(
         }
         Err(e) => {
             tracing::debug!("http upstream error: {e}");
-            (None, HashMap::new(), Bytes::new())
+            (None, Headers::new(), Bytes::new())
         }
     };
 
@@ -433,7 +432,7 @@ async fn handle_http(
                 id: Uuid::new_v4().to_string(),
                 request_id: id.clone(),
                 status: s,
-                headers: res_headers.clone(),
+                headers: intercept_header_map(&res_headers),
                 body: maybe_utf8(&res_body_bytes),
             });
             match intercept::pause(socket, &event).await {
@@ -451,6 +450,8 @@ async fn handle_http(
         }
     }
 
+    let (req_body, req_body_encoding) = encode_body(&req_body_bytes);
+    let (res_body, res_body_encoding) = encode_body(&res_body_bytes);
     let entry = TrafficEntry {
         id,
         ts: Utc::now(),
@@ -458,10 +459,12 @@ async fn handle_http(
         method,
         url,
         req_headers,
-        req_body: req_body_str,
+        req_body,
+        req_body_encoding,
         status,
         res_headers,
-        res_body: maybe_utf8(&res_body_bytes),
+        res_body,
+        res_body_encoding,
         duration_ms: Some(duration_ms),
         replay_of: None,
     };
@@ -509,15 +512,16 @@ async fn forward_http_request(req: Request<Full<Bytes>>) -> Result<Response<Inco
 fn build_upstream_request(
     method: &str,
     url: &str,
-    headers: &HashMap<String, String>,
+    headers: &Headers,
     body: Bytes,
 ) -> Result<Request<Full<Bytes>>> {
     let mut builder = Request::builder()
         .method(method)
         .uri(url.parse::<hyper::Uri>()?);
-    for (k, v) in headers {
-        if k != "host" && k != "proxy-connection" {
-            builder = builder.header(k.as_str(), v.as_str());
+    // `header` appends, so repeated headers go upstream as captured.
+    for (k, v) in headers.iter() {
+        if !k.eq_ignore_ascii_case("host") && !k.eq_ignore_ascii_case("proxy-connection") {
+            builder = builder.header(k, v);
         }
     }
     Ok(builder.body(Full::new(body))?)
@@ -542,28 +546,24 @@ fn rebuild_request(
 fn apply_request_mods(
     method: &mut String,
     url: &mut String,
-    headers: &mut HashMap<String, String>,
-    body_str: &mut Option<String>,
+    headers: &mut Headers,
     body_bytes: &mut Bytes,
     mods: crate::intercept::ForwardDecision,
 ) {
     if let Some(m) = mods.method { *method = m; }
     if let Some(u) = mods.url { *url = u; }
-    if let Some(h) = mods.headers { *headers = h; }
-    if let Some(b) = mods.body {
-        *body_bytes = Bytes::from(b.clone().into_bytes());
-        *body_str = Some(b);
-    }
+    if let Some(h) = mods.headers { *headers = h.into_iter().collect(); }
+    if let Some(b) = mods.body { *body_bytes = Bytes::from(b.into_bytes()); }
 }
 
 fn apply_response_mods(
     status: &mut Option<u16>,
-    headers: &mut HashMap<String, String>,
+    headers: &mut Headers,
     body_bytes: &mut Bytes,
     mods: crate::intercept::ForwardDecision,
 ) {
     if let Some(s) = mods.status { *status = Some(s); }
-    if let Some(h) = mods.headers { *headers = h; }
+    if let Some(h) = mods.headers { *headers = h.into_iter().collect(); }
     if let Some(b) = mods.body { *body_bytes = Bytes::from(b.into_bytes()); }
 }
 
@@ -577,13 +577,34 @@ fn make_drop_response(status: u16, body: Option<String>) -> Result<Response<Full
         .unwrap())
 }
 
-fn collect_headers(headers: &hyper::HeaderMap) -> HashMap<String, String> {
+/// Every header in wire order, repeated names included. Values that are not
+/// valid UTF-8 are kept lossily rather than dropped.
+pub(crate) fn collect_headers(headers: &hyper::HeaderMap) -> Headers {
     headers
         .iter()
-        .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+        .map(|(k, v)| (k.to_string(), header_value_to_string(v.as_bytes())))
         .collect()
 }
 
+/// The intercept-socket protocol still carries headers as a `{name: value}`
+/// map. Repeated names are joined with ", " (RFC 9110 field combining) so a
+/// hook sees every value; Set-Cookie is joined too, which is lossy only if
+/// the hook writes the map back.
+fn intercept_header_map(headers: &Headers) -> HashMap<String, String> {
+    let mut map: HashMap<String, String> = HashMap::new();
+    for (k, v) in headers.iter() {
+        map.entry(k.to_string())
+            .and_modify(|existing| {
+                existing.push_str(", ");
+                existing.push_str(v);
+            })
+            .or_insert_with(|| v.to_string());
+    }
+    map
+}
+
+/// Body as text for the intercept-socket protocol, which is string-only.
+/// The traffic log uses `encode_body` instead, which is byte-exact.
 fn maybe_utf8(b: &Bytes) -> Option<String> {
     if b.is_empty() {
         None
@@ -636,11 +657,42 @@ mod tests {
         );
         map.insert(hyper::header::ACCEPT, "*/*".parse().unwrap());
         let collected = collect_headers(&map);
-        assert_eq!(
-            collected.get("content-type").map(|s| s.as_str()),
-            Some("application/json")
-        );
-        assert_eq!(collected.get("accept").map(|s| s.as_str()), Some("*/*"));
+        assert_eq!(collected.get("content-type"), Some("application/json"));
+        assert_eq!(collected.get("accept"), Some("*/*"));
+    }
+
+    #[test]
+    fn collect_headers_keeps_repeated_values_in_order() {
+        let mut map = hyper::HeaderMap::new();
+        map.append(hyper::header::SET_COOKIE, "a=1".parse().unwrap());
+        map.append(hyper::header::SET_COOKIE, "b=2".parse().unwrap());
+        let collected = collect_headers(&map);
+        assert_eq!(collected.get_all("set-cookie").collect::<Vec<_>>(), ["a=1", "b=2"]);
+    }
+
+    #[test]
+    fn collect_headers_keeps_non_utf8_values() {
+        let mut map = hyper::HeaderMap::new();
+        map.insert("x-odd", hyper::header::HeaderValue::from_bytes(b"caf\xe9").unwrap());
+        let v = collect_headers(&map).get("x-odd").unwrap().to_string();
+        assert!(v.starts_with("caf") && v.len() > 3, "got {v:?}");
+    }
+
+    #[test]
+    fn build_upstream_request_sends_repeated_headers() {
+        let h: Headers = [("x-multi", "one"), ("host", "h"), ("x-multi", "two")].into_iter().collect();
+        let req = build_upstream_request("GET", "http://h/", &h, Bytes::new()).unwrap();
+        let vals: Vec<_> = req.headers().get_all("x-multi").iter().map(|v| v.to_str().unwrap()).collect();
+        assert_eq!(vals, ["one", "two"]);
+        assert!(!req.headers().contains_key("host"));
+    }
+
+    #[test]
+    fn intercept_header_map_joins_repeated_values() {
+        let h: Headers = [("a", "1"), ("b", "x"), ("a", "2")].into_iter().collect();
+        let m = intercept_header_map(&h);
+        assert_eq!(m["a"], "1, 2");
+        assert_eq!(m["b"], "x");
     }
 
     #[test]
@@ -758,6 +810,69 @@ mod tests {
         assert_eq!(entry.status, Some(200));
         assert!(entry.url.contains("/probe"), "url was: {}", entry.url);
         assert!(entry.duration_ms.is_some());
+    }
+
+    /// Upstream that answers with two Set-Cookie headers, a header value that
+    /// is not valid UTF-8, and a binary body; it echoes nothing. Raw TCP so
+    /// the bytes on the wire are exactly what the test says.
+    async fn start_awkward_upstream() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else { return };
+            let mut buf = vec![0u8; 8192];
+            let _ = stream.read(&mut buf).await;
+            let mut res: Vec<u8> = b"HTTP/1.1 200 OK\r\n\
+                set-cookie: session=abc; Secure; HttpOnly\r\n\
+                set-cookie: theme=dark; SameSite=Lax\r\n\
+                x-odd: caf\xe9\r\n\
+                content-length: 6\r\n\
+                connection: close\r\n\r\n"
+                .to_vec();
+            res.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x00, 0xff]);
+            stream.write_all(&res).await.ok();
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn proxy_log_keeps_repeated_headers_odd_values_and_binary_bodies() {
+        let up = start_awkward_upstream().await;
+        let dir = TempDir::new().unwrap();
+        let log_file = dir.path().join("traffic.jsonl");
+        let proxy_port = start_proxy(dir.path(), &log_file, None).await;
+
+        let req_body: &[u8] = &[0x1f, 0x8b, 0x08, 0x00, 0xfe];
+        let mut raw = format!(
+            "POST http://127.0.0.1:{up}/bin HTTP/1.1\r\nHost: 127.0.0.1:{up}\r\n\
+             x-multi: one\r\nx-multi: two\r\ncontent-length: {}\r\nConnection: close\r\n\r\n",
+            req_body.len()
+        )
+        .into_bytes();
+        raw.extend_from_slice(req_body);
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await.unwrap();
+        stream.write_all(&raw).await.unwrap();
+        let mut sink = Vec::new();
+        stream.read_to_end(&mut sink).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let line = std::fs::read_to_string(&log_file).unwrap();
+        let entry: TrafficEntry = serde_json::from_str(line.lines().next().unwrap()).unwrap();
+
+        assert_eq!(
+            entry.res_headers.get_all("set-cookie").collect::<Vec<_>>(),
+            ["session=abc; Secure; HttpOnly", "theme=dark; SameSite=Lax"],
+            "every Set-Cookie must be logged, in order"
+        );
+        assert_eq!(entry.req_headers.get_all("x-multi").collect::<Vec<_>>(), ["one", "two"]);
+        let odd = entry.res_headers.get("x-odd").unwrap();
+        assert!(odd.starts_with("caf") && odd.len() > 3, "non-UTF-8 value kept, got {odd:?}");
+        assert_eq!(entry.req_body_bytes().unwrap().as_deref(), Some(req_body));
+        assert_eq!(
+            entry.res_body_bytes().unwrap().as_deref(),
+            Some(&[0x89, b'P', b'N', b'G', 0x00, 0xff][..]),
+            "binary response body must be byte-exact"
+        );
     }
 
     #[tokio::test]

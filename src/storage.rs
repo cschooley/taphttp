@@ -1,38 +1,16 @@
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 use crate::cli::ShowArgs;
 
-/// Version of the structured traffic schema that outside consumers
-/// (the lever API, the MCP server, the SPA) can depend on. Bump this
-/// whenever the shape of `TrafficEntry` changes in a breaking way.
-/// v2 added `replay_of` (links a replayed exchange to its original).
-pub const SCHEMA_VERSION: u32 = 2;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TrafficEntry {
-    pub id: String,
-    pub ts: DateTime<Utc>,
-    pub host: String,
-    pub method: String,
-    pub url: String,
-    pub req_headers: HashMap<String, String>,
-    pub req_body: Option<String>,
-    pub status: Option<u16>,
-    pub res_headers: HashMap<String, String>,
-    pub res_body: Option<String>,
-    pub duration_ms: Option<u64>,
-    /// If this entry is a replay, the `id` of the original it was replayed
-    /// from. `serde(default)` so logs written before this field still load.
-    #[serde(default)]
-    pub replay_of: Option<String>,
-}
+// The traffic schema lives in the `taphttp-types` crate so consumers can
+// depend on it without the proxy. Re-exported here so the rest of the crate
+// keeps one import path.
+pub use taphttp_types::{Headers, TrafficEntry, SCHEMA_VERSION};
 
 pub struct JsonLinesBackend {
     path: PathBuf,
@@ -64,34 +42,64 @@ pub struct SqliteBackend {
     conn: Arc<Mutex<Connection>>,
 }
 
+/// Columns of the `traffic` table, in insert order. v1/v2 databases have
+/// only the first eleven; [`SqliteBackend::new`] adds the rest.
+const SQLITE_COLUMNS: [(&str, &str); 15] = [
+    ("id", "TEXT PRIMARY KEY"),
+    ("ts", "TEXT NOT NULL"),
+    ("host", "TEXT NOT NULL"),
+    ("method", "TEXT NOT NULL"),
+    ("url", "TEXT NOT NULL"),
+    ("req_headers", "TEXT"),
+    ("req_body", "TEXT"),
+    ("status", "INTEGER"),
+    ("res_headers", "TEXT"),
+    ("res_body", "TEXT"),
+    ("duration_ms", "INTEGER"),
+    // v3 additions (replay_of was v2 in the JSON schema but never reached sqlite).
+    ("replay_of", "TEXT"),
+    ("req_body_encoding", "TEXT"),
+    ("res_body_encoding", "TEXT"),
+    ("schema_version", "INTEGER"),
+];
+
 impl SqliteBackend {
     pub fn new(data_dir: &Path) -> Result<Self> {
         let conn = Connection::open(data_dir.join("traffic.db"))
             .context("opening sqlite db")?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS traffic (
-                id TEXT PRIMARY KEY,
-                ts TEXT NOT NULL,
-                host TEXT NOT NULL,
-                method TEXT NOT NULL,
-                url TEXT NOT NULL,
-                req_headers TEXT,
-                req_body TEXT,
-                status INTEGER,
-                res_headers TEXT,
-                res_body TEXT,
-                duration_ms INTEGER
-            );",
-        )?;
+        let defs: Vec<String> = SQLITE_COLUMNS.iter().map(|(n, t)| format!("{n} {t}")).collect();
+        conn.execute_batch(&format!(
+            "CREATE TABLE IF NOT EXISTS traffic ({});",
+            defs.join(", ")
+        ))?;
+        // Migrate a database created by an older taphttp: add missing columns.
+        // Old rows keep NULL there, which reads as utf8 / pre-v3.
+        let existing: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('traffic')")?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (name, ty) in SQLITE_COLUMNS {
+            if !existing.iter().any(|c| c == name) {
+                conn.execute_batch(&format!("ALTER TABLE traffic ADD COLUMN {name} {ty};"))
+                    .with_context(|| format!("migrating sqlite: adding column {name}"))?;
+            }
+        }
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
     }
 
     pub fn append(&self, e: &TrafficEntry) -> Result<()> {
+        let names: Vec<&str> = SQLITE_COLUMNS.iter().map(|(n, _)| *n).collect();
+        let slots: Vec<String> = (1..=names.len()).map(|i| format!("?{i}")).collect();
+        let encoding = |enc| serde_json::to_value(enc).ok().and_then(|v| v.as_str().map(str::to_owned));
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT OR REPLACE INTO traffic VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            &format!(
+                "INSERT OR REPLACE INTO traffic ({}) VALUES ({})",
+                names.join(","),
+                slots.join(",")
+            ),
             rusqlite::params![
                 e.id,
                 e.ts.to_rfc3339(),
@@ -104,6 +112,10 @@ impl SqliteBackend {
                 serde_json::to_string(&e.res_headers)?,
                 e.res_body,
                 e.duration_ms,
+                e.replay_of,
+                encoding(e.req_body_encoding),
+                encoding(e.res_body_encoding),
+                SCHEMA_VERSION,
             ],
         )?;
         Ok(())
@@ -290,11 +302,13 @@ mod tests {
             host: host.to_string(),
             method: method.to_string(),
             url: format!("http://{host}/"),
-            req_headers: HashMap::new(),
+            req_headers: Headers::new(),
             req_body: None,
+            req_body_encoding: Default::default(),
             status: Some(status),
-            res_headers: HashMap::new(),
+            res_headers: Headers::new(),
             res_body: None,
+            res_body_encoding: Default::default(),
             duration_ms: Some(10),
             replay_of: None,
         }
@@ -326,7 +340,7 @@ mod tests {
         let mut entry = make_entry("abc-123", "example.com", "POST", 201);
         entry.req_body = Some("body text".to_string());
         entry.res_body = Some(r#"{"ok":true}"#.to_string());
-        entry.req_headers.insert("content-type".into(), "text/plain".into());
+        entry.req_headers.append("content-type", "text/plain");
 
         backend.append(&entry).unwrap();
 
@@ -337,10 +351,7 @@ mod tests {
         assert_eq!(loaded.status, Some(201));
         assert_eq!(loaded.req_body.as_deref(), Some("body text"));
         assert_eq!(loaded.res_body.as_deref(), Some(r#"{"ok":true}"#));
-        assert_eq!(
-            loaded.req_headers.get("content-type").map(|s| s.as_str()),
-            Some("text/plain")
-        );
+        assert_eq!(loaded.req_headers.get("content-type"), Some("text/plain"));
     }
 
     #[test]
@@ -420,6 +431,98 @@ mod tests {
         assert_eq!(loaded.id, "sql-1");
         assert_eq!(loaded.method, "DELETE");
         assert_eq!(loaded.status, Some(204));
+    }
+
+    /// Read one row back the way a downstream sqlite reader would.
+    fn sqlite_row(dir: &Path, id: &str) -> (Headers, Option<String>, Option<String>, Option<String>, Option<u32>) {
+        let conn = Connection::open(dir.join("traffic.db")).unwrap();
+        conn.query_row(
+            "SELECT res_headers, res_body, res_body_encoding, replay_of, schema_version FROM traffic WHERE id = ?1",
+            [id],
+            |r| {
+                let h: String = r.get(0)?;
+                Ok((serde_json::from_str(&h).unwrap(), r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn sqlite_stores_repeated_headers_encoding_replay_of_and_version() {
+        let dir = TempDir::new().unwrap();
+        let sqlite = SqliteBackend::new(dir.path()).unwrap();
+        let mut e = make_entry("v3", "h", "GET", 200);
+        e.res_headers.append("set-cookie", "a=1");
+        e.res_headers.append("set-cookie", "b=2");
+        e.set_res_body(&[0xff, 0x00]);
+        e.replay_of = Some("orig".into());
+        sqlite.append(&e).unwrap();
+
+        let (h, body, enc, replay_of, version) = sqlite_row(dir.path(), "v3");
+        assert_eq!(h.get_all("set-cookie").collect::<Vec<_>>(), ["a=1", "b=2"]);
+        assert_eq!(body.as_deref(), Some("/wA="));
+        assert_eq!(enc.as_deref(), Some("base64"));
+        assert_eq!(replay_of.as_deref(), Some("orig"));
+        assert_eq!(version, Some(SCHEMA_VERSION));
+    }
+
+    #[test]
+    fn sqlite_migrates_a_v2_database_and_old_rows_still_read() {
+        let dir = TempDir::new().unwrap();
+        {
+            // The exact table an older taphttp created, with one v2 row.
+            let conn = Connection::open(dir.path().join("traffic.db")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE traffic (id TEXT PRIMARY KEY, ts TEXT NOT NULL, host TEXT NOT NULL,
+                    method TEXT NOT NULL, url TEXT NOT NULL, req_headers TEXT, req_body TEXT,
+                    status INTEGER, res_headers TEXT, res_body TEXT, duration_ms INTEGER);
+                 INSERT INTO traffic VALUES ('old','2026-01-01T00:00:00+00:00','h','GET','http://h/',
+                    '{}',NULL,200,'{\"set-cookie\":\"a=1\"}','ok',5);",
+            )
+            .unwrap();
+        }
+
+        let sqlite = SqliteBackend::new(dir.path()).unwrap();
+        sqlite.append(&make_entry("new", "h", "GET", 200)).unwrap();
+
+        let (h, body, enc, _, version) = sqlite_row(dir.path(), "old");
+        assert_eq!(h.get("set-cookie"), Some("a=1"), "v2 header map still reads");
+        assert_eq!(body.as_deref(), Some("ok"));
+        assert_eq!(enc, None, "missing encoding means utf8");
+        assert_eq!(version, None);
+        assert_eq!(sqlite_row(dir.path(), "new").4, Some(SCHEMA_VERSION));
+    }
+
+    #[test]
+    fn v2_jsonl_log_still_loads() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("traffic.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"id":"v2","ts":"2026-01-01T00:00:00Z","host":"h","method":"GET","url":"http://h/","req_headers":{"accept":"*/*"},"req_body":null,"status":200,"res_headers":{"set-cookie":"a=1"},"res_body":"ok","duration_ms":1,"replay_of":null}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let e = load_entry(&path, "v2").unwrap();
+        assert_eq!(e.req_headers.get("accept"), Some("*/*"));
+        assert_eq!(e.res_body_bytes().unwrap().as_deref(), Some(&b"ok"[..]));
+        assert_eq!(load_entries(&path).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn record_writes_schema_version_on_every_line() {
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("traffic.jsonl");
+        let store = Store::new(dir.path(), Some(&log), false).unwrap();
+        store.record(make_entry("a", "h", "GET", 200));
+        store.record(make_entry("b", "h", "GET", 200));
+        let content = std::fs::read_to_string(&log).unwrap();
+        for line in content.lines() {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(v["schema_version"], SCHEMA_VERSION, "{line}");
+        }
     }
 
     // --- filter_entries ---

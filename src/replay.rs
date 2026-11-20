@@ -6,20 +6,20 @@ use hyper::Request;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use rustls::ClientConfig;
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
 use uuid::Uuid;
 
 use crate::cli::ReplayArgs;
-use crate::storage::{self, Store, TrafficEntry};
+use crate::storage::{self, Headers, Store, TrafficEntry};
 
 /// Modifications applied to a captured request before replaying it.
 #[derive(Debug, Default, Clone)]
 pub struct ReplayMods {
     /// Override the HTTP method.
     pub method: Option<String>,
-    /// Headers to insert or overwrite (applied over the captured headers).
+    /// Headers to set over the captured ones. Each replaces every captured
+    /// value for that name (so one override wins over repeated headers).
     pub headers: Vec<(String, String)>,
     /// Override the request body.
     pub body: Option<String>,
@@ -41,34 +41,35 @@ pub async fn replay_entry(
         original.method = method.to_uppercase();
     }
     for (k, v) in &mods.headers {
-        original.req_headers.insert(k.clone(), v.clone());
+        original.req_headers.set(k.clone(), v.clone());
     }
     if let Some(body) = &mods.body {
-        original.req_body = Some(body.clone());
+        original.set_req_body(body.as_bytes());
     }
+    // Byte-exact: a base64-stored body goes out as the original bytes.
+    let req_body = original
+        .req_body_bytes()
+        .with_context(|| format!("decoding stored request body of {original_id}"))?
+        .unwrap_or_default();
 
     let (status, res_headers, res_body, duration_ms) = send_request(
         &original.method,
         &original.url,
         &original.req_headers,
-        original.req_body.as_deref(),
+        req_body,
     )
     .await?;
 
-    let replay = TrafficEntry {
+    let mut replay = TrafficEntry {
         id: Uuid::new_v4().to_string(),
         ts: Utc::now(),
-        host: original.host.clone(),
-        method: original.method.clone(),
-        url: original.url.clone(),
-        req_headers: original.req_headers.clone(),
-        req_body: original.req_body.clone(),
-        status: Some(status),
         res_headers,
-        res_body,
+        status: Some(status),
         duration_ms: Some(duration_ms),
         replay_of: Some(original_id),
+        ..original
     };
+    replay.set_res_body(&res_body);
 
     store.record(replay.clone());
     Ok(replay)
@@ -79,20 +80,18 @@ pub async fn replay_entry(
 async fn send_request(
     method: &str,
     url: &str,
-    req_headers: &HashMap<String, String>,
-    req_body: Option<&str>,
-) -> Result<(u16, HashMap<String, String>, Option<String>, u64)> {
+    req_headers: &Headers,
+    req_body: Vec<u8>,
+) -> Result<(u16, Headers, Bytes, u64)> {
     let method = hyper::Method::from_bytes(method.as_bytes()).context("invalid method")?;
     let uri: hyper::Uri = url.parse().context("invalid url")?;
-    let body_bytes = req_body
-        .map(|b| Bytes::from(b.to_owned().into_bytes()))
-        .unwrap_or_default();
 
     let mut builder = Request::builder().method(method).uri(uri.clone());
-    for (k, v) in req_headers {
-        builder = builder.header(k.as_str(), v.as_str());
+    // `header` appends, so repeated headers are sent as captured.
+    for (k, v) in req_headers.iter() {
+        builder = builder.header(k, v);
     }
-    let req = builder.body(Full::new(body_bytes)).context("building request")?;
+    let req = builder.body(Full::new(Bytes::from(req_body))).context("building request")?;
 
     let scheme = uri.scheme_str().unwrap_or("http");
     let start = Instant::now();
@@ -116,18 +115,10 @@ async fn send_request(
     };
 
     let status = res.status().as_u16();
-    let mut headers = HashMap::new();
-    for (k, v) in res.headers() {
-        headers.insert(k.to_string(), v.to_str().unwrap_or("").to_string());
-    }
+    let headers = crate::proxy::collect_headers(res.headers());
     let body = res.into_body().collect().await?.to_bytes();
     let duration_ms = start.elapsed().as_millis() as u64;
-    let res_body = if body.is_empty() {
-        None
-    } else {
-        Some(String::from_utf8_lossy(&body).into_owned())
-    };
-    Ok((status, headers, res_body, duration_ms))
+    Ok((status, headers, body, duration_ms))
 }
 
 pub async fn run(args: ReplayArgs, data_dir: PathBuf) -> Result<()> {
@@ -163,7 +154,7 @@ pub async fn run(args: ReplayArgs, data_dir: PathBuf) -> Result<()> {
     // Human-readable summary to stderr; the recorded JSON line (emitted by the
     // store) is the structured stdout output, consistent with `start`.
     eprintln!("Status: {}", replay.status.unwrap_or(0));
-    for (k, v) in &replay.res_headers {
+    for (k, v) in replay.res_headers.iter() {
         eprintln!("{k}: {v}");
     }
     eprintln!(
@@ -185,7 +176,6 @@ mod tests {
     use hyper::body::Incoming;
     use hyper::service::service_fn;
     use hyper::{Request, Response};
-    use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
@@ -229,11 +219,13 @@ mod tests {
             host: format!("127.0.0.1:{port}"),
             method: method.to_string(),
             url: format!("http://127.0.0.1:{port}/check"),
-            req_headers: HashMap::new(),
+            req_headers: Headers::new(),
             req_body: None,
+            req_body_encoding: Default::default(),
             status: Some(200),
-            res_headers: HashMap::new(),
+            res_headers: Headers::new(),
             res_body: None,
+            res_body_encoding: Default::default(),
             duration_ms: Some(5),
             replay_of: None,
         }
@@ -263,6 +255,106 @@ mod tests {
             logged.iter().any(|e| e.replay_of.as_deref() == Some("orig-1") && e.id == replay.id),
             "replay must be recorded in the traffic log"
         );
+    }
+
+    /// What the recording upstream saw: every request header in order, and
+    /// the raw body bytes.
+    type Seen = Arc<tokio::sync::Mutex<Option<(Vec<(String, Vec<u8>)>, Vec<u8>)>>>;
+
+    /// Upstream that records the request it receives and answers with two
+    /// Set-Cookie headers and a binary body.
+    async fn start_recording_server(seen: Seen) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else { return };
+            hyper::server::conn::http1::Builder::new()
+                .serve_connection(
+                    hyper_util::rt::TokioIo::new(stream),
+                    service_fn(move |req: Request<Incoming>| {
+                        let seen = seen.clone();
+                        async move {
+                            let headers = req
+                                .headers()
+                                .iter()
+                                .map(|(k, v)| (k.to_string(), v.as_bytes().to_vec()))
+                                .collect();
+                            let body = req.into_body().collect().await?.to_bytes().to_vec();
+                            *seen.lock().await = Some((headers, body));
+                            Ok::<_, anyhow::Error>(
+                                Response::builder()
+                                    .header("set-cookie", "s=1; Secure")
+                                    .header("set-cookie", "t=2; HttpOnly")
+                                    .body(Full::new(Bytes::from_static(&[0xde, 0xad, 0x00, 0xff])))
+                                    .unwrap(),
+                            )
+                        }
+                    }),
+                )
+                .await
+                .ok();
+        });
+        port
+    }
+
+    fn values<'a>(headers: &'a [(String, Vec<u8>)], name: &str) -> Vec<&'a [u8]> {
+        headers.iter().filter(|(k, _)| k == name).map(|(_, v)| v.as_slice()).collect()
+    }
+
+    #[tokio::test]
+    async fn replay_sends_repeated_headers_and_binary_body_byte_exact() {
+        let seen: Seen = Default::default();
+        let port = start_recording_server(seen.clone()).await;
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("traffic.jsonl");
+        let store = Store::new(dir.path(), Some(&log), false).unwrap();
+
+        let body: &[u8] = &[0x1f, 0x8b, 0x08, 0x00, 0xff, 0xfe];
+        let mut original = upstream_entry("bin-1", port, "POST");
+        original.req_headers.append("x-multi", "one");
+        original.req_headers.append("x-multi", "two");
+        original.set_req_body(body);
+        // Go through the log as the CLI would, so base64 is decoded from disk.
+        JsonLinesBackend::new(&log).append(&original).unwrap();
+        let original = storage::load_entry(&log, "bin-1").unwrap();
+        assert_eq!(original.req_body_encoding, taphttp_types::BodyEncoding::Base64);
+
+        let replay = replay_entry(&store, original, &ReplayMods::default()).await.unwrap();
+
+        let (headers, got_body) = seen.lock().await.clone().unwrap();
+        assert_eq!(values(&headers, "x-multi"), [b"one", b"two"], "repeated headers sent as captured");
+        assert_eq!(got_body, body, "base64 body decoded before sending");
+
+        // The recorded replay keeps both Set-Cookies and the binary response.
+        let logged = storage::load_entry(&log, &replay.id).unwrap();
+        assert_eq!(
+            logged.res_headers.get_all("set-cookie").collect::<Vec<_>>(),
+            ["s=1; Secure", "t=2; HttpOnly"]
+        );
+        assert_eq!(logged.res_body_bytes().unwrap().as_deref(), Some(&[0xde, 0xad, 0x00, 0xff][..]));
+        assert_eq!(logged.req_body_bytes().unwrap().as_deref(), Some(body));
+    }
+
+    #[tokio::test]
+    async fn replay_header_override_replaces_every_value_for_that_name() {
+        let seen: Seen = Default::default();
+        let port = start_recording_server(seen.clone()).await;
+        let dir = TempDir::new().unwrap();
+        let store = Store::new(dir.path(), None, false).unwrap();
+
+        let mut original = upstream_entry("ovr-1", port, "GET");
+        original.req_headers.append("cookie", "a=1");
+        original.req_headers.append("cookie", "b=2");
+        original.req_headers.append("x-keep", "yes");
+        let mods = ReplayMods {
+            headers: vec![("Cookie".into(), "c=3".into())],
+            ..Default::default()
+        };
+        replay_entry(&store, original, &mods).await.unwrap();
+
+        let (headers, _) = seen.lock().await.clone().unwrap();
+        assert_eq!(values(&headers, "cookie"), [b"c=3"]);
+        assert_eq!(values(&headers, "x-keep"), [b"yes"]);
     }
 
     #[tokio::test]
@@ -295,11 +387,13 @@ mod tests {
             host: format!("127.0.0.1:{port}"),
             method: "GET".to_string(),
             url: format!("http://127.0.0.1:{port}/check"),
-            req_headers: HashMap::new(),
+            req_headers: Headers::new(),
             req_body: None,
+            req_body_encoding: Default::default(),
             status: Some(200),
-            res_headers: HashMap::new(),
+            res_headers: Headers::new(),
             res_body: None,
+            res_body_encoding: Default::default(),
             duration_ms: Some(5),
             replay_of: None,
         };
@@ -334,11 +428,13 @@ mod tests {
             host: format!("127.0.0.1:{port}"),
             method: "GET".to_string(),
             url: format!("http://127.0.0.1:{port}/"),
-            req_headers: HashMap::new(),
+            req_headers: Headers::new(),
             req_body: None,
+            req_body_encoding: Default::default(),
             status: Some(200),
-            res_headers: HashMap::new(),
+            res_headers: Headers::new(),
             res_body: None,
+            res_body_encoding: Default::default(),
             duration_ms: None,
             replay_of: None,
         };
@@ -415,11 +511,13 @@ mod tests {
                 host: "x".to_string(),
                 method: "GET".to_string(),
                 url: "http://x/".to_string(),
-                req_headers: HashMap::new(),
+                req_headers: Headers::new(),
                 req_body: None,
+                req_body_encoding: Default::default(),
                 status: None,
-                res_headers: HashMap::new(),
+                res_headers: Headers::new(),
                 res_body: None,
+                res_body_encoding: Default::default(),
                 duration_ms: None,
                 replay_of: None,
             })

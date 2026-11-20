@@ -225,7 +225,6 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use futures_util::StreamExt;
-    use std::collections::HashMap;
     use tempfile::TempDir;
     use tower::ServiceExt; // for `oneshot`
 
@@ -238,11 +237,13 @@ mod tests {
             host: host.to_string(),
             method: method.to_string(),
             url: format!("http://{host}/"),
-            req_headers: HashMap::new(),
+            req_headers: Default::default(),
             req_body: None,
+            req_body_encoding: Default::default(),
             status: Some(status),
-            res_headers: HashMap::new(),
+            res_headers: Default::default(),
             res_body: None,
+            res_body_encoding: Default::default(),
             duration_ms: Some(1),
             replay_of: None,
         }
