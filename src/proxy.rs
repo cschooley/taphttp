@@ -37,9 +37,14 @@ pub async fn run(args: StartArgs, data_dir: PathBuf) -> Result<()> {
     // live Store so its /feed carries real traffic as it is recorded.
     if let Some(api_listen) = &args.api_listen {
         let api_addr: SocketAddr = api_listen.parse().context("invalid api-listen address")?;
+        let token = crate::api::generate_token();
+        let token_path = crate::api::write_token_file(&data_dir, &token)?;
+        eprintln!("lever API token: {token}");
+        eprintln!("  (also written to {}, mode 0600)", token_path.display());
         let state = Arc::new(crate::api::ApiState {
             store: store.clone(),
             log_path: args.log_file.clone(),
+            token,
         });
         tokio::spawn(async move {
             if let Err(e) = crate::api::serve(state, api_addr).await {
