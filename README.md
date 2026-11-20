@@ -204,7 +204,7 @@ Future tools (separate binaries that consume `taphttp`'s output):
 - `taphttp-diff` — diff two traffic captures
 - `taphttp-assert` — assert response shapes for regression testing
 - `taphttp-export` — convert JSON lines to HAR, Burp XML, etc.
-- Companion assessment tool (name TBD): SPA dashboard + MCP server for human and agentic testing on top of `taphttp`'s log and replay, with findings exported as [flux](docs/flux/SPEC.md) (a SARIF 2.1.0 profile). See [docs/findings-architecture.md](docs/findings-architecture.md).
+- `spall`: SPA dashboard + MCP server for human and agentic testing on top of `taphttp`'s log and replay, with findings exported as [flux](docs/flux/SPEC.md) (a SARIF 2.1.0 profile). See [docs/findings-architecture.md](docs/findings-architecture.md).
 
 These will be separate tools that read from `taphttp`'s stdout or a saved file, not flags on this binary.
 

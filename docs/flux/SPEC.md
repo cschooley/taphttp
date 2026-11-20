@@ -1,6 +1,6 @@
 # flux: a SARIF 2.1.0 profile for the cschooley security toolkit
 
-Status: draft v0.1 (Nov 2026)
+Status: draft v0.2 (Nov 2026)
 
 ## What flux is (and isn't)
 
@@ -11,7 +11,8 @@ Producers and consumers:
 | Tool | Role |
 |---|---|
 | scurf (Rust SAST) | produces |
-| tap-http (Rust DAST / MITM proxy) | produces and consumes |
+| spall (Rust DAST; SPA + MCP assessment workbench on top of taphttp) | produces and consumes |
+| taphttp (Rust MITM proxy) | none directly; supplies traffic and replay IDs that spall cites as evidence |
 | sarifview (VS Code) | consumes / merges |
 | sec-actions, ghas-actions | produce / gate on |
 | Kudzu | consumes (system of record), produces (retest requests, known findings) |
@@ -50,10 +51,10 @@ Kudzu may use any internal model it likes. flux is the interchange format, not a
 | Key | Type | Meaning |
 |---|---|---|
 | `flux/status` | `candidate` \| `suspected` \| `confirmed` \| `fixed` | Verification state (orthogonal to suppression) |
-| `flux/confirmedBy` | string[] | Tools that confirmed, e.g. `["scurf", "tap-http"]` |
-| `flux/replayIds` | string[] | tap-http replay API IDs backing the evidence |
+| `flux/confirmedBy` | string[] | Tools that confirmed, e.g. `["scurf", "spall"]` |
+| `flux/replayIds` | string[] | taphttp exchange IDs (captured and replayed traffic) backing the evidence |
 | `flux/redacted` | boolean | Evidence has been scrubbed (see Redaction) |
-| `flux/hypothesisFor` | string | On tap-http output: `correlationGuid` of the ingested finding it tested |
+| `flux/hypothesisFor` | string | On spall output: `correlationGuid` of the ingested finding it tested |
 | `flux/fingerprintVersion` | string | Fingerprint algorithm version |
 
 `flux/status` is about whether the issue is real. `suppressions` is about what a human decided to do with it. A finding can be `confirmed` and suppressed (accepted risk).
@@ -85,13 +86,25 @@ Required before any flux document leaves the producing tool's local store (expor
 
 ## Flows
 
-**Promotion (tap-http to Kudzu):** results with `flux/status` in `suspected` / `confirmed`, unsuppressed, redacted.
+**Promotion (spall to Kudzu):** results with `flux/status` in `suspected` / `confirmed`, unsuppressed, redacted.
 
-**Hypotheses (scurf to tap-http):** SAST results with `flux/status: suspected`. tap-http tests them and emits a result with the same `correlationGuid`, `flux/hypothesisFor` set, the SAST location moved to `relatedLocations`, and status `confirmed` or left `suspected` with a note in `result.message`.
+**Hypotheses (scurf to spall):** SAST results with `flux/status: suspected`. spall tests them and emits a result with the same `correlationGuid`, `flux/hypothesisFor` set, the SAST location moved to `relatedLocations`, and status `confirmed` or left `suspected` with a note in `result.message`.
 
-**Retest (Kudzu to tap-http):** open findings out, results back with `baselineState` (`unchanged` = still vulnerable, `absent` = not reproduced) and `flux/status: fixed` where appropriate.
+**Retest (Kudzu to spall):** open findings out, results back with `baselineState` (`unchanged` = still vulnerable, `absent` = not reproduced) and `flux/status: fixed` where appropriate.
 
 **Known findings / suppressions (Kudzu to tools):** consumed so producers can badge results as tracked (`workItemUris`) or previously rejected (`suppressions`) instead of re-raising them.
+
+## The flux crate
+
+flux is also a Rust library, so every Rust tool in the suite shares one set of finding types instead of each defining its own.
+
+- **One `Finding` type for the suite.** spall and scurf (and Kudzu, if it is Rust) depend on `flux`; none define their own `Finding`, `Severity`, or `Evidence`.
+- **Types model this profile, not all of SARIF.** Fields map to the table above; `flux/` properties are typed fields, not a loose map.
+- **SARIF is the wire format.** `Finding` <-> SARIF `result`, `Report` <-> SARIF `log`, via serde. Evaluate building on an existing SARIF types crate (e.g. `serde-sarif`) rather than hand-writing the full SARIF object model.
+- **Fingerprint functions live here** (`flux/dast/v1`, `flux/sast/v1`), so every producer computes them identically.
+- **Redaction lives here**, so no producer can export without it.
+- **Validation lives here**: SARIF schema + flux rules, exposed as a function and a small CLI.
+- **Adapter traits** for converting to and from other formats. Core stays dependency-light; format-specific adapters (OCSF export, third-party SARIF from Semgrep/Trivy/etc., later STIX / VEX / CycloneDX) are separate crates or feature flags, never core dependencies.
 
 ## Optional exporters
 

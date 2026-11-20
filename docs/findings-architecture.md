@@ -1,4 +1,4 @@
-# Findings architecture: taphttp and its companion tool
+# Findings architecture: taphttp and spall
 
 Status: design intent (Nov 2026). Verify against current code before implementing.
 
@@ -6,13 +6,13 @@ Status: design intent (Nov 2026). Verify against current code before implementin
 
 taphttp stays what CLAUDE.md says it is: a headless proxy that captures, logs, and replays. It does **not** get a GUI, a findings model, or agent tooling.
 
-The SPA dashboard, the MCP server for agentic assessments, candidate triage, and flux export live in a **separate companion tool** (name TBD) that consumes taphttp's traffic log and replay API. A thick Burp-style client was rejected; SPA + MCP is the chosen shape for the companion.
+The SPA dashboard, the MCP server for agentic assessments, candidate triage, and flux export live in **spall** (the suite's DAST tool), a separate tool that consumes taphttp's traffic log and replay API. A thick Burp-style client was rejected; SPA + MCP is the chosen shape for spall.
 
 ```
 browser/agent traffic -> taphttp (capture, log, replay)
                               |  JSON lines / sqlite, replay API
                               v
-                       companion tool (SPA, MCP, triage)
+                       spall (SPA, MCP, triage)
                               |  flux (SARIF 2.1.0 profile)
                               v
                      Kudzu / sarifview / any SARIF consumer
@@ -22,22 +22,22 @@ browser/agent traffic -> taphttp (capture, log, replay)
 
 Findings are **flux**, a SARIF 2.1.0 profile. Spec vendored at `docs/flux/SPEC.md` (source of truth: the `flux` repo). Never invent a findings format.
 
-## What taphttp must provide (in scope here)
+## What taphttp must provide spall (in scope here)
 
-These are the things the companion needs from taphttp. They are expensive to retrofit, so get them right now:
+These are the things spall needs from taphttp. They are expensive to retrofit, so get them right now:
 
 1. **Stable exchange IDs.** Every `TrafficEntry.id` is stable and never reused. Findings evidence references these IDs (`flux/replayIds`).
 2. **Replays are recorded.** A replayed request/response is stored as its own `TrafficEntry`, linked to the original (e.g. a `replay_of` field). As of the July 2026 code, `replay` sends the request but does not appear to record the result. Evidence and retest both depend on this.
 3. **Programmatic access.** Query and replay are usable without the CLI (library API or local HTTP API), per the existing "separable modules" rule.
-4. **Raw storage, no redaction.** taphttp stores traffic as captured. Redaction is the companion's job at export time.
+4. **Raw storage, no redaction.** taphttp stores traffic as captured. Redaction is spall's job (via the flux crate) at export time.
 
 Nothing else in this document is taphttp's job.
 
-## Companion tool design (for its future repo)
+## spall design (belongs in the spall repo)
 
 ### Two tiers: candidates vs findings
 
-| | Companion (workbench) | Kudzu (system of record) |
+| | spall (workbench) | Kudzu (system of record) |
 |---|---|---|
 | Holds | Candidates | Findings |
 | Lifetime | Per engagement | Durable |
@@ -63,7 +63,7 @@ Promotion flows toward Jira. An agent must not file tickets unsupervised.
 
 ### No Kudzu coupling
 
-The companion reads and writes flux only. Kudzu ingests flux.
+spall reads and writes flux only, using the flux crate types. Kudzu ingests flux.
 
 ### Flux out
 
@@ -78,7 +78,7 @@ Fingerprint at candidate creation (`flux/dast/v1`), `webRequest`/`webResponse` e
 ### Implementation order
 
 1. taphttp requirements above.
-2. Companion: candidate model, SPA triage, flux export with redaction.
+2. spall: candidate model, SPA triage, flux export with redaction.
 3. MCP with `propose_finding` only.
 4. Flux in: suppressions and retest.
 5. Flux in: scurf hypothesis correlation.
