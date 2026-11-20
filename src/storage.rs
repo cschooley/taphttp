@@ -12,7 +12,8 @@ use crate::cli::ShowArgs;
 /// Version of the structured traffic schema that outside consumers
 /// (the lever API, the MCP server, the SPA) can depend on. Bump this
 /// whenever the shape of `TrafficEntry` changes in a breaking way.
-pub const SCHEMA_VERSION: u32 = 1;
+/// v2 added `replay_of` (links a replayed exchange to its original).
+pub const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrafficEntry {
@@ -27,6 +28,10 @@ pub struct TrafficEntry {
     pub res_headers: HashMap<String, String>,
     pub res_body: Option<String>,
     pub duration_ms: Option<u64>,
+    /// If this entry is a replay, the `id` of the original it was replayed
+    /// from. `serde(default)` so logs written before this field still load.
+    #[serde(default)]
+    pub replay_of: Option<String>,
 }
 
 pub struct JsonLinesBackend {
@@ -290,6 +295,7 @@ mod tests {
             res_headers: HashMap::new(),
             res_body: None,
             duration_ms: Some(10),
+            replay_of: None,
         }
     }
 
@@ -514,6 +520,22 @@ mod tests {
         let cli_ids: Vec<&str> = via_cli.iter().map(|e| e.id.as_str()).collect();
         let core_ids: Vec<&str> = via_core.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(cli_ids, core_ids);
+    }
+
+    #[test]
+    fn traffic_entry_without_replay_of_loads_as_none() {
+        // A pre-v2 record on disk has no `replay_of` key; it must still parse.
+        let json = r#"{"id":"old","ts":"2026-01-01T00:00:00Z","host":"h","method":"GET","url":"http://h/","req_headers":{},"req_body":null,"status":200,"res_headers":{},"res_body":null,"duration_ms":1}"#;
+        let e: TrafficEntry = serde_json::from_str(json).unwrap();
+        assert!(e.replay_of.is_none());
+    }
+
+    #[test]
+    fn traffic_entry_roundtrips_replay_of() {
+        let mut e = make_entry("r", "h", "GET", 200);
+        e.replay_of = Some("orig".into());
+        let back: TrafficEntry = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
+        assert_eq!(back.replay_of.as_deref(), Some("orig"));
     }
 
     // --- live feed (broadcast primitive the API/MCP bridge to) ---

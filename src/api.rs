@@ -188,6 +188,7 @@ mod tests {
             res_headers: HashMap::new(),
             res_body: None,
             duration_ms: Some(1),
+            replay_of: None,
         }
     }
 

@@ -304,6 +304,7 @@ async fn forward_https(
         res_headers,
         res_body: maybe_utf8(&res_body_bytes),
         duration_ms: Some(duration_ms),
+        replay_of: None,
     };
 
     tracing::info!(
@@ -462,6 +463,7 @@ async fn handle_http(
         res_headers,
         res_body: maybe_utf8(&res_body_bytes),
         duration_ms: Some(duration_ms),
+        replay_of: None,
     };
 
     tracing::info!(
