@@ -3,6 +3,7 @@
 //! endpoint delegates to the same store levers (`query_entries`, `subscribe`)
 //! the CLI and the future in-process MCP handler use.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -14,11 +15,13 @@ use axum::http::header::AUTHORIZATION;
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
+use serde::Deserialize;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
+use crate::replay::{replay_entry, ReplayMods};
 use crate::storage::{
     load_entries, query_entries, Store, TrafficEntry, TrafficQuery, SCHEMA_VERSION,
 };
@@ -61,6 +64,7 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/schema", get(schema))
         .route("/exchanges", get(exchanges))
         .route("/feed", get(feed))
+        .route("/replay", post(replay))
         .layer(middleware::from_fn_with_state(state.clone(), require_token))
         .with_state(state)
 }
@@ -134,6 +138,43 @@ async fn exchanges(
         None => Vec::new(),
     };
     Json(query_entries(entries, &query))
+}
+
+/// Body of a `POST /replay` request: which captured exchange to replay, and
+/// optional modifications to apply before sending.
+#[derive(Debug, Deserialize)]
+struct ReplayRequest {
+    id: String,
+    #[serde(default)]
+    method: Option<String>,
+    #[serde(default)]
+    headers: HashMap<String, String>,
+    #[serde(default)]
+    body: Option<String>,
+}
+
+/// `POST /replay` — replay a captured exchange by id, record the result as a
+/// new exchange linked via `replay_of`, and return that recorded entry.
+async fn replay(State(state): State<Arc<ApiState>>, Json(req): Json<ReplayRequest>) -> Response {
+    let Some(log_path) = &state.log_path else {
+        return (StatusCode::NOT_FOUND, "no traffic log configured").into_response();
+    };
+    let original = load_entries(log_path)
+        .ok()
+        .and_then(|entries| entries.into_iter().find(|e| e.id == req.id));
+    let Some(original) = original else {
+        return (StatusCode::NOT_FOUND, format!("no exchange with id {}", req.id)).into_response();
+    };
+
+    let mods = ReplayMods {
+        method: req.method,
+        headers: req.headers.into_iter().collect(),
+        body: req.body,
+    };
+    match replay_entry(&state.store, original, &mods).await {
+        Ok(entry) => Json(entry).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, format!("replay failed: {e}")).into_response(),
+    }
 }
 
 /// `GET /feed` — WebSocket of entries recorded after the client connects.
@@ -364,6 +405,62 @@ mod tests {
         assert_eq!(json["id"], "live-42");
 
         ws.close(None).await.ok();
+    }
+
+    #[tokio::test]
+    async fn replay_endpoint_records_and_returns_linked_entry() {
+        // A throwaway upstream the replayed request will hit.
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uport = upstream.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let app = Router::new().route("/", get(|| async { "pong" }));
+            axum::serve(upstream, app).await.unwrap();
+        });
+
+        let dir = TempDir::new().unwrap();
+        let (state, log) = state_with_log(&dir);
+        let mut original = entry("orig-99", &format!("127.0.0.1:{uport}"), "GET", 200);
+        original.url = format!("http://127.0.0.1:{uport}/");
+        JsonLinesBackend::new(&log).append(&original).unwrap();
+
+        let req = Request::post("/replay")
+            .header(AUTHORIZATION, format!("Bearer {TEST_TOKEN}"))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"id":"orig-99"}"#))
+            .unwrap();
+        let resp = router(state).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let json = body_json(resp).await;
+        assert_eq!(json["replay_of"], "orig-99");
+        assert_eq!(json["status"], 200);
+        assert_eq!(json["res_body"], "pong");
+        assert_ne!(json["id"], "orig-99", "replay gets its own id");
+    }
+
+    #[tokio::test]
+    async fn replay_endpoint_unknown_id_is_not_found() {
+        let dir = TempDir::new().unwrap();
+        let (state, _) = state_with_log(&dir);
+        let req = Request::post("/replay")
+            .header(AUTHORIZATION, format!("Bearer {TEST_TOKEN}"))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"id":"does-not-exist"}"#))
+            .unwrap();
+        let resp = router(state).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn replay_endpoint_requires_token() {
+        let dir = TempDir::new().unwrap();
+        let (state, _) = state_with_log(&dir);
+        let req = Request::post("/replay")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"id":"orig-99"}"#))
+            .unwrap();
+        let resp = router(state).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
