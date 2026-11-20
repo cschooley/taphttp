@@ -43,6 +43,16 @@ it rather than building it.
   cleanly into other tools rather than growing settings to replicate
   their behavior internally.
 
+## Findings, SPA, MCP: not here
+
+The SPA dashboard, MCP server, and findings/triage belong to a
+separate companion tool. Before touching storage, replay, or anything
+a downstream tool consumes, read `docs/findings-architecture.md`. It
+lists what taphttp owes that tool (stable IDs, recorded replays,
+programmatic access, raw storage). Findings anywhere in this suite
+are flux, a SARIF 2.1.0 profile: `docs/flux/SPEC.md`. Never invent a
+findings format.
+
 ## Legal / ethical use
 
 This is a security testing tool. The README must state plainly that
