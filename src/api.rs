@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Query, Request, State};
+use axum::extract::{Path as PathParam, Query, Request, State};
 use axum::http::header::AUTHORIZATION;
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
@@ -63,6 +63,7 @@ pub fn router(state: Arc<ApiState>) -> Router {
     Router::new()
         .route("/schema", get(schema))
         .route("/exchanges", get(exchanges))
+        .route("/exchanges/{id}", get(exchange))
         .route("/feed", get(feed))
         .route("/replay", post(replay))
         .layer(middleware::from_fn_with_state(state.clone(), require_token))
@@ -138,6 +139,20 @@ async fn exchanges(
         None => Vec::new(),
     };
     Json(query_entries(entries, &query))
+}
+
+/// `GET /exchanges/{id}` — a single captured exchange by id, or 404.
+async fn exchange(State(state): State<Arc<ApiState>>, PathParam(id): PathParam<String>) -> Response {
+    let found = match &state.log_path {
+        Some(path) => load_entries(path)
+            .ok()
+            .and_then(|entries| entries.into_iter().find(|e| e.id == id)),
+        None => None,
+    };
+    match found {
+        Some(entry) => Json(entry).into_response(),
+        None => (StatusCode::NOT_FOUND, format!("no exchange with id {id}")).into_response(),
+    }
 }
 
 /// Body of a `POST /replay` request: which captured exchange to replay, and
@@ -365,6 +380,31 @@ mod tests {
         let json = body_json(resp).await;
         let ids: Vec<&str> = json.as_array().unwrap().iter().map(|e| e["id"].as_str().unwrap()).collect();
         assert_eq!(ids, ["a", "c"]);
+    }
+
+    #[tokio::test]
+    async fn exchange_by_id_returns_the_entry() {
+        let dir = TempDir::new().unwrap();
+        let (state, log) = state_with_log(&dir);
+        let backend = JsonLinesBackend::new(&log);
+        backend.append(&entry("a", "x.com", "GET", 200)).unwrap();
+        backend.append(&entry("b", "y.com", "POST", 201)).unwrap();
+
+        let resp = router(state).oneshot(authed_get("/exchanges/b")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["id"], "b");
+        assert_eq!(json["method"], "POST");
+    }
+
+    #[tokio::test]
+    async fn exchange_by_id_unknown_is_not_found() {
+        let dir = TempDir::new().unwrap();
+        let (state, log) = state_with_log(&dir);
+        JsonLinesBackend::new(&log).append(&entry("a", "x.com", "GET", 200)).unwrap();
+
+        let resp = router(state).oneshot(authed_get("/exchanges/missing")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

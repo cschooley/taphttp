@@ -132,6 +132,7 @@ the exact JSON the proxy sends and expects back:
 | `--sqlite` | off | Also write traffic to SQLite (`traffic.db` in data dir) |
 | `--filter-host` | — | Only log requests whose host contains this substring |
 | `--intercept-socket` | — | Unix socket path for the intercept hook (pauses each request/response) |
+| `--api-listen` | — | Also serve the [lever API](#lever-api) (HTTP + WebSocket) on this address |
 
 Traffic is always written to stdout as JSON lines. `--log-file` and `--sqlite` are additive.
 
@@ -162,6 +163,59 @@ Traffic is always written to stdout as JSON lines. `--log-file` and `--sqlite` a
 
 ---
 
+## Lever API
+
+An optional local HTTP + WebSocket interface over the capture store, so other
+tools can query traffic and replay requests without shelling out to the CLI.
+taphttp itself stays headless — this is the seam a separate dashboard, an MCP
+server, or an agent consumes (see [docs/findings-architecture.md](docs/findings-architecture.md)).
+
+Enable it with `--api-listen`, alongside `--log-file` so there is history to
+read:
+
+```bash
+taphttp start --api-listen 127.0.0.1:8081 --log-file ./traffic.jsonl
+```
+
+### Authentication
+
+Every endpoint requires a bearer token. On startup taphttp generates one,
+prints it to stderr, and writes it to `<data-dir>/api-token` (mode `0600`).
+Pass it as a header, or — for the WebSocket, which browsers can't send headers
+on — as a `?token=` query parameter:
+
+```bash
+TOKEN=$(cat <data-dir>/api-token)
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8081/exchanges
+```
+
+### Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/schema` | `{ "schema_version": N }` — the traffic-entry contract to pin against |
+| `GET` | `/exchanges` | Captured exchanges; filter with `?host=`, `?method=`, `?status=`, `?limit=` |
+| `GET` | `/exchanges/{id}` | A single exchange by `id`, or `404` |
+| `POST` | `/replay` | Replay a captured exchange; records the result linked via `replay_of` |
+| `GET` | `/feed` | WebSocket stream of exchanges as they are recorded |
+
+`POST /replay` takes a JSON body — `id` is required, the rest optional:
+
+```bash
+curl -X POST http://127.0.0.1:8081/replay \
+  -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"id":"<exchange-id>","method":"POST","headers":{"x-test":"1"},"body":"..."}'
+```
+
+The response is the newly recorded exchange (with its own `id` and
+`replay_of` set), which also appears on `/feed` and in `/exchanges`.
+
+The API binds only where you tell it to; keep it on loopback unless you have a
+reason not to. The `?token=` form can land in logs, so prefer the header
+except for the WebSocket.
+
+---
+
 ## Data directory
 
 Default: `~/.local/share/taphttp/` (Linux) or `~/Library/Application Support/taphttp/` (macOS).
@@ -171,6 +225,7 @@ Override with `--data-dir <path>` or `TAPHTTP_DATA=<path>`.
 Files written here:
 - `ca.crt` / `ca.key` — local CA (generated once, keep the key private)
 - `traffic.db` — SQLite traffic log (only with `--sqlite`)
+- `api-token` — bearer token for the lever API, mode `0600` (only with `--api-listen`)
 
 Traffic JSON lines go to stdout by default. Use `--log-file <path>` to also write to a file anywhere you choose.
 
@@ -190,9 +245,13 @@ Traffic JSON lines go to stdout by default. Use `--log-file <path>` to also writ
   "status": 200,
   "res_headers": { "content-type": "application/json", "content-length": "42" },
   "res_body": "{\"users\":[]}",
-  "duration_ms": 183
+  "duration_ms": 183,
+  "replay_of": null
 }
 ```
+
+`replay_of` is `null` for captured traffic; for an exchange produced by a
+replay it holds the `id` of the original request it was replayed from.
 
 ---
 
