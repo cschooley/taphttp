@@ -259,9 +259,10 @@ pub async fn show(args: ShowArgs) -> Result<()> {
     Ok(())
 }
 
-pub fn load_entry(data_dir: &Path, id: &str) -> Result<TrafficEntry> {
-    let path = data_dir.join("traffic.jsonl");
-    let content = std::fs::read_to_string(&path).context("reading traffic log")?;
+/// Find the entry with `id` in the JSON-lines log at `path`.
+pub fn load_entry(path: &Path, id: &str) -> Result<TrafficEntry> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("reading traffic log {}", path.display()))?;
     content
         .lines()
         .filter(|l| !l.is_empty())
@@ -329,7 +330,7 @@ mod tests {
 
         backend.append(&entry).unwrap();
 
-        let loaded = load_entry(dir.path(), "abc-123").unwrap();
+        let loaded = load_entry(&dir.path().join("traffic.jsonl"), "abc-123").unwrap();
         assert_eq!(loaded.id, "abc-123");
         assert_eq!(loaded.host, "example.com");
         assert_eq!(loaded.method, "POST");
@@ -350,7 +351,7 @@ mod tests {
         let entry = make_entry("null-body", "example.com", "GET", 200);
         backend.append(&entry).unwrap();
 
-        let loaded = load_entry(dir.path(), "null-body").unwrap();
+        let loaded = load_entry(&dir.path().join("traffic.jsonl"), "null-body").unwrap();
         assert!(loaded.req_body.is_none());
         assert!(loaded.res_body.is_none());
     }
@@ -363,7 +364,7 @@ mod tests {
             .append(&make_entry("exists", "example.com", "GET", 200))
             .unwrap();
 
-        assert!(load_entry(dir.path(), "no-such-id").is_err());
+        assert!(load_entry(&dir.path().join("traffic.jsonl"), "no-such-id").is_err());
     }
 
     #[test]
@@ -400,7 +401,7 @@ mod tests {
             backend.append(&make_entry(&format!("id-{i}"), "host.com", "GET", 200)).unwrap();
         }
         for i in 0..5u8 {
-            load_entry(dir.path(), &format!("id-{i}")).unwrap();
+            load_entry(&dir.path().join("traffic.jsonl"), &format!("id-{i}")).unwrap();
         }
     }
 
@@ -415,7 +416,7 @@ mod tests {
         sqlite.append(&entry).unwrap();
         jsonl.append(&entry).unwrap();
 
-        let loaded = load_entry(dir.path(), "sql-1").unwrap();
+        let loaded = load_entry(&dir.path().join("traffic.jsonl"), "sql-1").unwrap();
         assert_eq!(loaded.id, "sql-1");
         assert_eq!(loaded.method, "DELETE");
         assert_eq!(loaded.status, Some(204));

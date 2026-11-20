@@ -84,6 +84,12 @@ pub struct ReplayArgs {
     /// Request ID to replay (from a traffic log)
     pub id: String,
 
+    /// Traffic log to read the request from (the file given to
+    /// `start --log-file`). The replay is recorded into the same file.
+    /// Defaults to <data-dir>/traffic.jsonl.
+    #[arg(long, value_name = "PATH")]
+    pub log_file: Option<PathBuf>,
+
     /// Override request method
     #[arg(long)]
     pub method: Option<String>,

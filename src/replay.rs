@@ -131,7 +131,18 @@ async fn send_request(
 }
 
 pub async fn run(args: ReplayArgs, data_dir: PathBuf) -> Result<()> {
-    let original = storage::load_entry(&data_dir, &args.id)?;
+    let log_path = args
+        .log_file
+        .clone()
+        .unwrap_or_else(|| data_dir.join("traffic.jsonl"));
+    if !log_path.exists() {
+        anyhow::bail!(
+            "no traffic log at {}. `taphttp start` only writes a file when given \
+             --log-file <PATH>; pass the same path here with `taphttp replay --log-file <PATH> <ID>`",
+            log_path.display()
+        );
+    }
+    let original = storage::load_entry(&log_path, &args.id)?;
 
     let mut mods = ReplayMods {
         method: args.method,
@@ -146,7 +157,7 @@ pub async fn run(args: ReplayArgs, data_dir: PathBuf) -> Result<()> {
     eprintln!("Replaying {} {}", original.method, original.url);
 
     // Record the replay into the same JSON-lines log the original came from.
-    let store = Store::new(&data_dir, Some(&data_dir.join("traffic.jsonl")), false)?;
+    let store = Store::new(&data_dir, Some(&log_path), false)?;
     let replay = replay_entry(&store, original, &mods).await?;
 
     // Human-readable summary to stderr; the recorded JSON line (emitted by the
@@ -297,6 +308,7 @@ mod tests {
 
         let args = ReplayArgs {
             id: "replay-test-id".to_string(),
+            log_file: None,
             method: None,
             headers: vec![],
             body: None,
@@ -335,6 +347,7 @@ mod tests {
 
         let args = ReplayArgs {
             id: "override-id".to_string(),
+            log_file: None,
             method: Some("POST".to_string()),
             headers: vec!["x-test:yes".to_string()],
             body: Some("new body".to_string()),
@@ -342,6 +355,53 @@ mod tests {
 
         run(args, data_dir).await.unwrap();
         assert!(hit.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn replay_reads_and_records_to_explicit_log_file() {
+        // Issue #2: under stdout-first logging the log lives wherever
+        // `start --log-file` put it, not in the data dir.
+        let hit = Arc::new(AtomicBool::new(false));
+        let port = start_capture_server(hit.clone()).await;
+        let data_dir = TempDir::new().unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        let log = elsewhere.path().join("capture.jsonl");
+        JsonLinesBackend::new(&log).append(&upstream_entry("custom-log-id", port, "GET")).unwrap();
+
+        let args = ReplayArgs {
+            id: "custom-log-id".to_string(),
+            log_file: Some(log.clone()),
+            method: None,
+            headers: vec![],
+            body: None,
+        };
+        run(args, data_dir.path().to_path_buf()).await.unwrap();
+
+        assert!(hit.load(Ordering::SeqCst), "replay should reach upstream");
+        let logged = storage::load_entries(&log).unwrap();
+        assert!(
+            logged.iter().any(|e| e.replay_of.as_deref() == Some("custom-log-id")),
+            "replay must be recorded in the log it was read from"
+        );
+        assert!(
+            !data_dir.path().join("traffic.jsonl").exists(),
+            "nothing should be written to the data-dir default"
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_missing_log_file_error_names_the_path_and_the_fix() {
+        let data_dir = TempDir::new().unwrap();
+        let args = ReplayArgs {
+            id: "x".to_string(),
+            log_file: None,
+            method: None,
+            headers: vec![],
+            body: None,
+        };
+        let err = format!("{:#}", run(args, data_dir.path().to_path_buf()).await.unwrap_err());
+        assert!(err.contains("traffic.jsonl"), "error should name the path: {err}");
+        assert!(err.contains("--log-file"), "error should point at --log-file: {err}");
     }
 
     #[tokio::test]
@@ -367,6 +427,7 @@ mod tests {
 
         let args = ReplayArgs {
             id: "does-not-exist".to_string(),
+            log_file: None,
             method: None,
             headers: vec![],
             body: None,

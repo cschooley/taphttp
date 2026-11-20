@@ -102,10 +102,20 @@ taphttp start | jq 'select(.status >= 400)'
 
 **5. Replay a request**
 
+Replay reads the original request from a log file, so capture to one first
+(stdout alone isn't enough). The replay is recorded into the same file,
+linked to the original via `replay_of`.
+
 ```sh
-taphttp replay <ID>
-taphttp replay <ID> --method POST --header "Authorization: Bearer newtoken" --body '{"key":"val"}'
+taphttp start --log-file traffic.jsonl
+# ...capture some traffic, then pick an ID:
+taphttp show traffic.jsonl
+
+taphttp replay --log-file traffic.jsonl <ID>
+taphttp replay --log-file traffic.jsonl <ID> --method POST --header "Authorization: Bearer newtoken" --body '{"key":"val"}'
 ```
+
+If `--log-file` is omitted, replay reads `<data-dir>/traffic.jsonl`.
 
 **6. Intercept and modify traffic live**
 
@@ -150,6 +160,7 @@ Traffic is always written to stdout as JSON lines. `--log-file` and `--sqlite` a
 
 | Flag | Description |
 |---|---|
+| `--log-file` | Log to read the request from and record the replay into (default `<data-dir>/traffic.jsonl`) |
 | `--method` | Override HTTP method |
 | `--header KEY:VALUE` | Add or override a header (repeatable) |
 | `--body` | Override request body |
