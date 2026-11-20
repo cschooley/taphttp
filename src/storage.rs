@@ -6,7 +6,16 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use tokio::sync::broadcast;
 use crate::cli::ShowArgs;
+
+/// Version of the structured traffic schema that outside consumers
+/// (the lever API, the MCP server, the SPA) can depend on. Bump this
+/// whenever the shape of `TrafficEntry` changes in a breaking way.
+// Consumed by the lever API / MCP server (next increment); exposed now so
+// the schema contract is pinned before any consumer depends on it.
+#[allow(dead_code)]
+pub const SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrafficEntry {
@@ -99,9 +108,16 @@ impl SqliteBackend {
     }
 }
 
+/// Capacity of the live-feed broadcast buffer. A slow subscriber that falls
+/// this far behind is lagged (and told so) rather than slowing the proxy.
+const LIVE_FEED_CAPACITY: usize = 1024;
+
 pub struct Store {
     log_file: Option<JsonLinesBackend>,
     sqlite: Option<SqliteBackend>,
+    /// Fans each recorded entry out to live subscribers (the API `/feed`
+    /// WebSocket, the MCP server, anything watching traffic as it happens).
+    live: broadcast::Sender<TrafficEntry>,
 }
 
 impl Store {
@@ -112,7 +128,16 @@ impl Store {
         } else {
             None
         };
-        Ok(Arc::new(Self { log_file, sqlite }))
+        let (live, _) = broadcast::channel(LIVE_FEED_CAPACITY);
+        Ok(Arc::new(Self { log_file, sqlite, live }))
+    }
+
+    /// Subscribe to the live feed of recorded entries. Each subscriber
+    /// receives every entry recorded after it subscribes.
+    // Bridged to a WebSocket by the lever API / MCP server (next increment).
+    #[allow(dead_code)]
+    pub fn subscribe(&self) -> broadcast::Receiver<TrafficEntry> {
+        self.live.subscribe()
     }
 
     pub fn record(&self, entry: TrafficEntry) {
@@ -136,28 +161,55 @@ impl Store {
                 tracing::warn!("Failed to write sqlite: {e}");
             }
         }
+
+        // Fan out to live subscribers last. An error here just means no one
+        // is listening, which is fine — the feed is best-effort.
+        let _ = self.live.send(entry);
     }
 }
 
-/// Apply filters and return the most recent `limit` entries in chronological order.
-/// If `limit` is None, all matching entries are returned.
-pub fn filter_entries(mut entries: Vec<TrafficEntry>, args: &ShowArgs) -> Vec<TrafficEntry> {
-    if let Some(host) = &args.host {
+/// A traffic query, independent of the CLI. The lever API and MCP server
+/// consume this directly; the CLI builds one from its own args. Keeping the
+/// query core free of clap types is what lets other tools use the store
+/// without depending on the CLI.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TrafficQuery {
+    pub host: Option<String>,
+    pub method: Option<String>,
+    pub status: Option<u16>,
+    pub limit: Option<usize>,
+}
+
+/// Apply a query and return the most recent `limit` entries in chronological
+/// order. If `limit` is None, all matching entries are returned.
+pub fn query_entries(mut entries: Vec<TrafficEntry>, q: &TrafficQuery) -> Vec<TrafficEntry> {
+    if let Some(host) = &q.host {
         let h = host.to_lowercase();
         entries.retain(|e| e.host.to_lowercase().contains(&h));
     }
-    if let Some(method) = &args.method {
+    if let Some(method) = &q.method {
         let m = method.to_uppercase();
         entries.retain(|e| e.method == m);
     }
-    if let Some(status) = args.status {
+    if let Some(status) = q.status {
         entries.retain(|e| e.status == Some(status));
     }
-    if let Some(limit) = args.limit {
+    if let Some(limit) = q.limit {
         let skip = entries.len().saturating_sub(limit);
         entries = entries.into_iter().skip(skip).collect();
     }
     entries
+}
+
+/// CLI adapter: build a [`TrafficQuery`] from `ShowArgs` and delegate.
+pub fn filter_entries(entries: Vec<TrafficEntry>, args: &ShowArgs) -> Vec<TrafficEntry> {
+    let query = TrafficQuery {
+        host: args.host.clone(),
+        method: args.method.clone(),
+        status: args.status,
+        limit: args.limit,
+    };
+    query_entries(entries, &query)
 }
 
 pub async fn show(args: ShowArgs) -> Result<()> {
@@ -395,6 +447,95 @@ mod tests {
         assert_eq!(filtered.len(), 3);
         let ids: Vec<&str> = filtered.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids, ["3", "4", "5"]);
+    }
+
+    // --- TrafficQuery / query_entries (CLI-independent core) ---
+
+    #[test]
+    fn query_entries_filters_by_host_and_method() {
+        let q = TrafficQuery {
+            host: Some("example".into()),
+            method: Some("GET".into()),
+            ..Default::default()
+        };
+        let filtered = query_entries(make_entries(), &q);
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.iter().all(|e| e.host.contains("example") && e.method == "GET"));
+    }
+
+    #[test]
+    fn query_entries_default_returns_all() {
+        let filtered = query_entries(make_entries(), &TrafficQuery::default());
+        assert_eq!(filtered.len(), 5);
+    }
+
+    #[test]
+    fn query_entries_limit_returns_most_recent() {
+        let q = TrafficQuery { limit: Some(2), ..Default::default() };
+        let filtered = query_entries(make_entries(), &q);
+        let ids: Vec<&str> = filtered.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["4", "5"]);
+    }
+
+    #[test]
+    fn filter_entries_matches_query_entries() {
+        // The CLI adapter must produce the same result as the core query.
+        let args = show_args(Some("example"), Some("GET"), None, None);
+        let via_cli = filter_entries(make_entries(), &args);
+        let via_core = query_entries(
+            make_entries(),
+            &TrafficQuery { host: Some("example".into()), method: Some("GET".into()), ..Default::default() },
+        );
+        let cli_ids: Vec<&str> = via_cli.iter().map(|e| e.id.as_str()).collect();
+        let core_ids: Vec<&str> = via_core.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(cli_ids, core_ids);
+    }
+
+    #[test]
+    fn schema_version_is_at_least_one() {
+        assert!(SCHEMA_VERSION >= 1);
+    }
+
+    // --- live feed (broadcast primitive the API/MCP bridge to) ---
+
+    #[tokio::test]
+    async fn record_broadcasts_entry_to_subscriber() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::new(dir.path(), None, false).unwrap();
+        let mut rx = store.subscribe();
+        store.record(make_entry("live-1", "example.com", "GET", 200));
+        let got = rx.recv().await.unwrap();
+        assert_eq!(got.id, "live-1");
+    }
+
+    #[tokio::test]
+    async fn record_without_subscribers_does_not_panic() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::new(dir.path(), None, false).unwrap();
+        // No subscribers: the best-effort send must be a no-op, not a panic.
+        store.record(make_entry("no-sub", "example.com", "GET", 200));
+    }
+
+    #[tokio::test]
+    async fn every_subscriber_receives_each_entry() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::new(dir.path(), None, false).unwrap();
+        let mut rx1 = store.subscribe();
+        let mut rx2 = store.subscribe();
+        store.record(make_entry("fan-out", "example.com", "GET", 200));
+        assert_eq!(rx1.recv().await.unwrap().id, "fan-out");
+        assert_eq!(rx2.recv().await.unwrap().id, "fan-out");
+    }
+
+    #[tokio::test]
+    async fn subscriber_only_sees_entries_after_it_subscribes() {
+        let dir = TempDir::new().unwrap();
+        let store = Store::new(dir.path(), None, false).unwrap();
+        store.record(make_entry("before", "example.com", "GET", 200));
+        let mut rx = store.subscribe();
+        store.record(make_entry("after", "example.com", "GET", 200));
+        let got = rx.recv().await.unwrap();
+        assert_eq!(got.id, "after", "feed is live, not a replay of history");
     }
 
     #[test]
