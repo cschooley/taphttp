@@ -44,7 +44,7 @@ Release images are published to GHCR on every `v*` tag:
 docker run --rm -e RUST_LOG=info \
   -p 127.0.0.1:8080:8080 \
   -v taphttp-ca:/ca -v taphttp-data:/data \
-  ghcr.io/cschooley/taphttp:0.2.1
+  ghcr.io/cschooley/taphttp:0.3.0
 ```
 
 Or build it yourself (`docker build -t taphttp .`). From compose, use the image
@@ -53,8 +53,8 @@ or build straight from a tag:
 ```yaml
 services:
   taphttp:
-    image: ghcr.io/cschooley/taphttp:0.2.1
-    # or: build: https://github.com/cschooley/taphttp.git#v0.2.1
+    image: ghcr.io/cschooley/taphttp:0.3.0
+    # or: build: https://github.com/cschooley/taphttp.git#v0.3.0
     ports: ["127.0.0.1:8080:8080"]
     environment: { RUST_LOG: info }
     volumes: [taphttp-ca:/ca, taphttp-data:/data]
@@ -413,7 +413,7 @@ consumers don't pull in the proxy:
 
 ```toml
 [dependencies]
-taphttp-types = { git = "https://github.com/cschooley/taphttp", tag = "v0.2.1" }
+taphttp-types = { git = "https://github.com/cschooley/taphttp", tag = "v0.3.0" }
 ```
 
 ```rust
