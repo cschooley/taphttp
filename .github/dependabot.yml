@@ -1,0 +1,31 @@
+# Dependency updates. cooldown: 14 days matches the suite's rule that new
+# versions are at least two weeks old before we take them.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 14
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 14
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 14
+    ignore:
+      # The Rust toolchain is bumped deliberately, in step with CI's
+      # RUST_TOOLCHAIN.
+      - dependency-name: rust

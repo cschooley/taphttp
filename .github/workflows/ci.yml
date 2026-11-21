@@ -1,0 +1,67 @@
+# Build and test on every push and pull request.
+# Every action is pinned to a commit SHA (tag in the comment); Dependabot
+# keeps them current with a 14-day cooldown (.github/dependabot.yml).
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.90.0" # matches the Dockerfile's rust:1.90
+
+jobs:
+  rust:
+    name: Rust (fmt, clippy, test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy,rustfmt
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      # Unit tests plus the integration tests that run the real binary
+      # (start guardrails, proxy, replay, CA).
+      - run: cargo test --locked
+
+  docker:
+    name: Docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: docker build -t taphttp:ci .
+      # The default CMD must still start (it binds 0.0.0.0 with
+      # --allow-open-proxy); a guardrail change that breaks it fails here.
+      - name: Image starts
+        run: |
+          docker run -d --name taphttp-ci taphttp:ci
+          for _ in $(seq 1 30); do
+            if docker logs taphttp-ci 2>&1 | grep -q "taphttp listening on"; then
+              docker rm -f taphttp-ci; exit 0
+            fi
+            sleep 1
+          done
+          docker logs taphttp-ci; docker rm -f taphttp-ci; exit 1

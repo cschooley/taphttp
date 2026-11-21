@@ -82,6 +82,23 @@ Rules:
   hits upstream, filters work on real JSONL files, CA cert is loaded/cached).
 - `cargo test` must be green before committing.
 - `cargo clippy -- -D warnings` must be clean before committing.
+- `cargo fmt --all --check` must be clean before committing.
+
+## CI and security
+
+- `.github/workflows/ci.yml` runs fmt, clippy (`--all-targets`), the
+  tests and a Docker build on every push and PR.
+- `.github/workflows/security.yml` runs the cschooley/sec-actions scanners
+  (gitleaks, semgrep, OSV-Scanner, syft SBOM + licenses, grype on the SBOM
+  and the image) in audit mode, uploading SARIF to the Security tab.
+  OSV suppressions go in `osv-scanner.toml`, each with a reason and an
+  `ignoreUntil` date.
+- Pin every action to a commit SHA (`@<sha> # vX.Y.Z`). The repo's Actions
+  settings require it, so an unpinned `uses:` fails. Pin every scanner
+  version too.
+- New dependency versions must be at least two weeks old, transitive ones
+  included (`cargo update --precise`). Dependabot uses a 14-day cooldown
+  to match.
 
 Coverage bar: if you delete a behavior and no test fails, that behavior was not
 tested. Treat that as a bug in the test suite, not a green light to ship.
@@ -91,7 +108,8 @@ tested. Treat that as a bug in the test suite, not a green light to ship.
 ```
 cargo build
 cargo test
-cargo clippy -- -D warnings
+cargo clippy --all-targets -- -D warnings
+cargo fmt --all --check
 cargo run -- start                        # start proxy on 127.0.0.1:8080
 cargo run -- logs                         # query captured traffic
 cargo run -- replay <id>                  # replay a captured request
