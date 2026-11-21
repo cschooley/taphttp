@@ -66,7 +66,7 @@ pub struct SqliteBackend {
 
 /// Columns of the `traffic` table, in insert order. v1/v2 databases have
 /// only the first eleven; [`SqliteBackend::new`] adds the rest.
-const SQLITE_COLUMNS: [(&str, &str); 17] = [
+const SQLITE_COLUMNS: [(&str, &str); 19] = [
     ("id", "TEXT PRIMARY KEY"),
     ("ts", "TEXT NOT NULL"),
     ("host", "TEXT NOT NULL"),
@@ -88,6 +88,10 @@ const SQLITE_COLUMNS: [(&str, &str); 17] = [
     ("ts_us", "INTEGER"),
     // v4: who sent the exchange (proxy-auth username).
     ("source", "TEXT"),
+    // v5: replay attribution (a JSON object; NULL when empty) and why the
+    // exchange has no complete response.
+    ("meta", "TEXT"),
+    ("error", "TEXT"),
 ];
 
 impl SqliteBackend {
@@ -120,7 +124,10 @@ impl SqliteBackend {
                     .with_context(|| format!("migrating sqlite: adding column {name}"))?;
             }
         }
-        conn.execute_batch("CREATE INDEX IF NOT EXISTS traffic_ts_us ON traffic (ts_us);")?;
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS traffic_ts_us ON traffic (ts_us);
+             CREATE INDEX IF NOT EXISTS traffic_replay_of ON traffic (replay_of);",
+        )?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -160,6 +167,12 @@ impl SqliteBackend {
                 SCHEMA_VERSION,
                 e.ts.unix_micros(),
                 e.source,
+                if e.meta.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::to_string(&e.meta)?)
+                },
+                e.error,
             ],
         )?;
         Ok(())
@@ -405,6 +418,8 @@ mod tests {
             duration_ms: Some(10),
             replay_of: None,
             source: None,
+            meta: Default::default(),
+            error: None,
         }
     }
 
@@ -711,6 +726,32 @@ mod tests {
         assert_eq!(enc.as_deref(), Some("base64"));
         assert_eq!(replay_of.as_deref(), Some("orig"));
         assert_eq!(version, Some(SCHEMA_VERSION));
+    }
+
+    #[test]
+    fn sqlite_stores_meta_as_json_and_error_as_text() {
+        let dir = TempDir::new().unwrap();
+        let sqlite = SqliteBackend::new(&dir.path().join("traffic.db")).unwrap();
+        let mut e = make_entry("v5", "h", "GET", 200);
+        e.meta.insert("actor".into(), "human".into());
+        e.error = Some("boom".into());
+        sqlite.append(&e).unwrap();
+        sqlite
+            .append(&make_entry("plain", "h", "GET", 200))
+            .unwrap();
+
+        let conn = Connection::open(dir.path().join("traffic.db")).unwrap();
+        let row = |id: &str| -> (Option<String>, Option<String>) {
+            conn.query_row("SELECT meta, error FROM traffic WHERE id = ?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            row("v5"),
+            (Some(r#"{"actor":"human"}"#.into()), Some("boom".into()))
+        );
+        assert_eq!(row("plain"), (None, None), "empty meta is NULL");
     }
 
     #[test]

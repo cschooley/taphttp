@@ -3,7 +3,7 @@
 //! endpoint delegates to the same store levers (`query_entries`, `subscribe`)
 //! the CLI and the future in-process MCP handler use.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -23,8 +23,9 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::history::{HistoryError, HistoryQuery};
-use crate::replay::{replay_entry, ReplayMods};
-use crate::storage::{SqliteBackend, Store, TrafficEntry, SCHEMA_VERSION};
+use crate::replay::{replay_entry, ReplayError, ReplayMods};
+use crate::storage::{Headers, SqliteBackend, Store, TrafficEntry, SCHEMA_VERSION};
+use taphttp_types::{decode_body, BodyEncoding};
 
 /// Shared state for the lever API handlers.
 pub struct ApiState {
@@ -244,7 +245,8 @@ fn db_error(e: impl std::fmt::Display) -> Response {
 }
 
 /// `GET /exchanges` — history, newest first. Filters: `host`, `method`,
-/// `status`, `q` (URL or host text), `since` / `until` (RFC 3339). Paging:
+/// `status`, `q` (URL or host text), `since` / `until` (RFC 3339),
+/// `replay_of` (an exchange's replays). Paging:
 /// `limit` (default 100, max 500) and `before=<id>` (the last id of the
 /// previous page). An unknown `before` id is a 404.
 async fn exchanges(
@@ -287,14 +289,28 @@ struct ReplayRequest {
     id: String,
     #[serde(default)]
     method: Option<String>,
+    /// The whole request header list, `[[name, value], ...]`: replaces the
+    /// captured headers, in order, repeats kept.
+    #[serde(default)]
+    req_headers: Option<Headers>,
+    /// Headers set over the captured ones (or over `req_headers`), one
+    /// value per name. Kept for clients from before `req_headers`.
     #[serde(default)]
     headers: HashMap<String, String>,
     #[serde(default)]
     body: Option<String>,
+    /// How `body` encodes the bytes: `"utf8"` (default) or `"base64"`.
+    #[serde(default)]
+    body_encoding: BodyEncoding,
+    /// Attribution stored on the recorded replay, never sent upstream.
+    #[serde(default)]
+    meta: BTreeMap<String, String>,
 }
 
 /// `POST /replay` — replay a captured exchange by id, record the result as a
 /// new exchange linked via `replay_of`, and return that recorded entry.
+/// A failed attempt is recorded too and returned with 502 (its `error`
+/// says why); a request that can't be built is 400 and isn't recorded.
 async fn replay(State(state): State<Arc<ApiState>>, Json(req): Json<ReplayRequest>) -> Response {
     let Some(history) = state.store.history() else {
         return no_history();
@@ -311,14 +327,23 @@ async fn replay(State(state): State<Arc<ApiState>>, Json(req): Json<ReplayReques
         Err(e) => return db_error(e),
     };
 
+    let body = match decode_body(req.body.as_deref(), req.body_encoding) {
+        Ok(b) => b,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("body: {e}")).into_response(),
+    };
     let mods = ReplayMods {
         method: req.method,
+        req_headers: req.req_headers,
         headers: req.headers.into_iter().collect(),
-        body: req.body,
+        body,
+        meta: req.meta,
     };
     match replay_entry(&state.store, original, &mods).await {
         Ok(entry) => Json(entry).into_response(),
-        Err(e) => (StatusCode::BAD_GATEWAY, format!("replay failed: {e}")).into_response(),
+        Err(ReplayError::Failed(entry)) => (StatusCode::BAD_GATEWAY, Json(*entry)).into_response(),
+        Err(e @ ReplayError::Invalid(_)) => {
+            (StatusCode::BAD_REQUEST, e.to_string()).into_response()
+        }
     }
 }
 
@@ -460,6 +485,8 @@ mod tests {
             duration_ms: Some(1),
             replay_of: None,
             source: None,
+            meta: Default::default(),
+            error: None,
         }
     }
 
@@ -857,6 +884,187 @@ mod tests {
         assert_eq!(json["status"], 200);
         assert_eq!(json["res_body"], "pong");
         assert_ne!(json["id"], "orig-99", "replay gets its own id");
+    }
+
+    /// Upstream that answers with what it received: `{"headers": [[k, v]...],
+    /// "body": [bytes...]}`.
+    async fn start_echo_upstream() -> u16 {
+        use axum::http::HeaderMap;
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = upstream.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let app = Router::new().route(
+                "/",
+                post(|headers: HeaderMap, body: axum::body::Bytes| async move {
+                    let pairs: Vec<(String, String)> = headers
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+                        .collect();
+                    Json(serde_json::json!({ "headers": pairs, "body": body.to_vec() }))
+                }),
+            );
+            axum::serve(upstream, app).await.unwrap();
+        });
+        port
+    }
+
+    fn authed_post(path: &str, json: serde_json::Value) -> Request<Body> {
+        Request::post(path)
+            .header(AUTHORIZATION, format!("Bearer {TEST_TOKEN}"))
+            .header("content-type", "application/json")
+            .body(Body::from(json.to_string()))
+            .unwrap()
+    }
+
+    /// An original captured from `url`, recorded into the API's history.
+    fn seed(log: &Hist, id: &str, url: String) {
+        let mut original = entry(id, "127.0.0.1", "POST", 200);
+        original.url = url;
+        original.req_headers.append("x-captured", "yes");
+        log.append(&original).unwrap();
+    }
+
+    #[tokio::test]
+    async fn replay_endpoint_takes_req_headers_base64_body_and_meta() {
+        let port = start_echo_upstream().await;
+        let dir = TempDir::new().unwrap();
+        let (state, log) = state_with_db(&dir);
+        seed(&log, "orig-rh", format!("http://127.0.0.1:{port}/"));
+
+        let resp = router(state.clone())
+            .oneshot(authed_post(
+                "/replay",
+                serde_json::json!({
+                    "id": "orig-rh",
+                    "req_headers": [["cookie", "a=1"], ["cookie", "b=2"]],
+                    "body": "AP8fiw==",
+                    "body_encoding": "base64",
+                    "meta": {"actor": "agent", "task_id": "T-3"},
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(
+            json["meta"],
+            serde_json::json!({"actor": "agent", "task_id": "T-3"})
+        );
+        assert_eq!(json["req_body"], "AP8fiw==");
+        assert_eq!(json["req_body_encoding"], "base64");
+
+        let echoed: serde_json::Value =
+            serde_json::from_str(json["res_body"].as_str().unwrap()).unwrap();
+        assert_eq!(echoed["body"], serde_json::json!([0, 255, 31, 139]));
+        let sent: Vec<(String, String)> =
+            serde_json::from_value(echoed["headers"].clone()).unwrap();
+        let cookies: Vec<&str> = sent
+            .iter()
+            .filter(|(k, _)| k == "cookie")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(cookies, ["a=1", "b=2"]);
+        assert!(!sent.iter().any(|(k, _)| k == "x-captured"), "replaced");
+        assert!(
+            !echoed.to_string().contains("T-3"),
+            "meta never goes upstream: {echoed}"
+        );
+
+        // And it was recorded with its meta.
+        let id = json["id"].as_str().unwrap();
+        let stored = state.store.history().unwrap().get(id).unwrap().unwrap();
+        assert_eq!(stored.meta.get("task_id").map(String::as_str), Some("T-3"));
+    }
+
+    #[tokio::test]
+    async fn replay_endpoint_rejects_bad_input_with_400_and_records_nothing() {
+        let port = start_echo_upstream().await;
+        let dir = TempDir::new().unwrap();
+        let (state, log) = state_with_db(&dir);
+        seed(&log, "orig-bad", format!("http://127.0.0.1:{port}/"));
+
+        for bad in [
+            serde_json::json!({"id": "orig-bad", "body": "not base64!", "body_encoding": "base64"}),
+            serde_json::json!({"id": "orig-bad", "req_headers": [["bad header", "v"]]}),
+            serde_json::json!({"id": "orig-bad", "meta": {"": "v"}}),
+        ] {
+            let resp = router(state.clone())
+                .oneshot(authed_post("/replay", bad.clone()))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{bad}");
+        }
+        let all = state
+            .store
+            .history()
+            .unwrap()
+            .query(&HistoryQuery::default())
+            .unwrap();
+        assert_eq!(all.len(), 1, "only the original");
+    }
+
+    #[tokio::test]
+    async fn failed_replay_returns_502_with_the_one_recorded_entry() {
+        let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = dead.local_addr().unwrap().port();
+        drop(dead);
+        let dir = TempDir::new().unwrap();
+        let (state, log) = state_with_db(&dir);
+        seed(&log, "orig-dead", format!("http://127.0.0.1:{port}/"));
+
+        let resp = router(state.clone())
+            .oneshot(authed_post(
+                "/replay",
+                serde_json::json!({"id": "orig-dead", "meta": {"actor": "human"}}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let json = body_json(resp).await;
+        assert_eq!(json["replay_of"], "orig-dead");
+        assert_eq!(json["status"], serde_json::Value::Null);
+        assert!(
+            json["error"].as_str().unwrap().contains("connect"),
+            "{json}"
+        );
+        assert_eq!(json["meta"]["actor"], "human");
+
+        let replays = state
+            .store
+            .history()
+            .unwrap()
+            .query(&HistoryQuery {
+                replay_of: Some("orig-dead".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(replays.len(), 1, "exactly one recorded attempt");
+        assert_eq!(replays[0].id, json["id"].as_str().unwrap());
+    }
+
+    #[tokio::test]
+    async fn exchanges_filter_by_replay_of() {
+        let dir = TempDir::new().unwrap();
+        let (state, log) = state_with_db(&dir);
+        log.append(&entry("orig", "h", "GET", 200)).unwrap();
+        for (id, of) in [("r1", Some("orig")), ("x", None), ("r2", Some("orig"))] {
+            let mut e = entry(id, "h", "GET", 200);
+            e.replay_of = of.map(String::from);
+            log.append(&e).unwrap();
+        }
+        let resp = router(state)
+            .oneshot(authed_get("/exchanges?replay_of=orig"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        let ids: Vec<&str> = json
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["r2", "r1"]);
     }
 
     #[tokio::test]

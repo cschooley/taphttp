@@ -241,6 +241,10 @@ see [Remote deployment](#remote-deployment).
 | `--header KEY:VALUE` | Set a header, replacing every captured value for that name (repeatable) |
 | `--body` | Override request body |
 
+A replay that fails (upstream unreachable, or the response broke off) is
+still recorded, with `error` set, and the command exits non-zero naming the
+recorded `id`.
+
 ### `taphttp ca`
 
 | Subcommand | Description |
@@ -297,7 +301,7 @@ Where the token comes from:
 | `POST` | `/replay` | Replay a captured exchange; records the result linked via `replay_of` |
 | `GET` | `/feed` | WebSocket stream of exchanges as they are recorded; resumable with `?since=` |
 
-Entries are `taphttp_types::TrafficEntry` v3 JSON, the same as log lines.
+Entries are `taphttp_types::TrafficEntry` JSON (current schema), the same as log lines.
 
 #### `GET /exchanges`
 
@@ -310,6 +314,7 @@ Entries are `taphttp_types::TrafficEntry` v3 JSON, the same as log lines.
 | `status` | Codes and/or classes, comma-separated: `404`, `4xx`, `401,403,5xx` |
 | `q` | URL or host contains this text (case-insensitive) |
 | `since` / `until` | RFC 3339 times; `since` is inclusive, `until` exclusive |
+| `replay_of=<id>` | Only replays of `<id>` (including failed attempts) |
 
 Order is the order taphttp recorded exchanges in, so a `before` cursor stays
 valid while new traffic arrives. Each lookup is an indexed sqlite query, not
@@ -333,20 +338,42 @@ Without `since`, the feed sends exchanges recorded after you connect. With
 first, then switches to live with no gap and no duplicates. To survive
 reconnects, remember the last `id` you received and reconnect with it.
 
-`POST /replay` takes a JSON body — `id` is required, the rest optional:
+#### `POST /replay`
+
+Takes a JSON body. `id` is required, the rest optional:
 
 ```bash
 curl -X POST http://127.0.0.1:8081/replay \
   -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
-  -d '{"id":"<exchange-id>","method":"POST","headers":{"x-test":"1"},"body":"..."}'
+  -d '{"id":"<exchange-id>","method":"POST",
+       "req_headers":[["cookie","a=1"],["cookie","b=2"]],
+       "body":"AP8fiw==","body_encoding":"base64",
+       "meta":{"actor":"agent","task_id":"T-3"}}'
 ```
 
-Each entry in `headers` replaces every captured value for that name (the same
-rule as the CLI's `--header`). Other captured headers, including repeated
-ones, are sent as captured.
+| Field | Meaning |
+|---|---|
+| `method` | Override the method |
+| `req_headers` | The whole request header list as `[name, value]` pairs. Replaces the captured headers: send a header twice, drop one, or reorder them |
+| `headers` | `{name: value}`, applied after `req_headers`. Each replaces every value for that name (the CLI's `--header` rule) |
+| `body` | Override the body |
+| `body_encoding` | `"utf8"` (default) or `"base64"`, for binary bodies |
+| `meta` | String attribution fields, stored on the recorded replay and never sent upstream. At most 16 keys; keys 1 to 64 bytes, values up to 1024 |
 
-The response is the newly recorded exchange (with its own `id` and
-`replay_of` set), which also appears on `/feed` and in `/exchanges`.
+A repeated header name goes out grouped at its first position (hyper's
+header map does this), so `[["b","1"],["a","2"],["b","3"]]` is sent as
+`b, b, a`. The recorded `req_headers` are what was sent.
+
+Responses:
+
+- **200:** the newly recorded exchange, with its own `id` and `replay_of`
+  set. It also appears on `/feed` and in `/exchanges`.
+- **502:** the attempt failed (upstream unreachable, or the response broke
+  off). It is still recorded, and the body is that recorded exchange:
+  `error` says why, and `status` is `null` unless a response head arrived.
+- **400:** the request couldn't be built (a bad base64 body, header, method,
+  URL or `meta`). Nothing was sent or recorded.
+- **404:** no exchange with that `id`.
 
 The API binds only where you tell it to; keep it on loopback unless you have a
 reason not to. The `?token=` form can land in logs, so prefer the header
@@ -457,7 +484,7 @@ Each line is one exchange (shown pretty-printed here):
 
 ```json
 {
-  "schema_version": 4,
+  "schema_version": 5,
   "id": "3f2a1b4c-8d9e-4a7b-b3c1-2e5f6a7d8e9f",
   "ts": "2026-07-02T14:23:01.123Z",
   "host": "example.com",
@@ -476,12 +503,14 @@ Each line is one exchange (shown pretty-printed here):
   "res_body_encoding": "utf8",
   "duration_ms": 183,
   "replay_of": null,
-  "source": "agent.T-3"
+  "source": "agent.T-3",
+  "meta": {},
+  "error": null
 }
 ```
 
 - `schema_version` is on every line, so a tool tailing the log can detect a
-  breaking change. The current version is 4.
+  breaking change. The current version is 5.
 - Headers are `[name, value]` pairs in wire order. Repeated headers (several
   `Set-Cookie`s, say) each get a pair. A value that isn't valid UTF-8 is
   kept with the bad bytes replaced by U+FFFD, not dropped.
@@ -492,6 +521,11 @@ Each line is one exchange (shown pretty-printed here):
   replay, it holds the `id` of the original.
 - `source` is who sent it (see [Attribution](#attribution-who-sent-each-exchange)),
   or `null`.
+- `meta` is attribution a replay's caller attached (`POST /replay`'s
+  `meta`), or `{}`. taphttp stores it and doesn't interpret it.
+- `error` is why the exchange has no complete response (the upstream
+  couldn't be reached, or the response broke off), or `null`. Failed
+  replays are recorded this way, so history has no gaps.
 
 To decode base64 bodies with jq: `jq -r 'select(.res_body_encoding=="base64") | .res_body | @base64d'`.
 
@@ -499,15 +533,16 @@ To decode base64 bodies with jq: `jq -r 'select(.res_body_encoding=="base64") | 
 
 | Version | Change |
 |---|---|
+| 5 | `meta` (replay attribution) and `error` (why there's no complete response); failed replays are recorded |
 | 4 | `source` (proxy-auth username) |
 | 3 | Headers as ordered pairs; non-UTF-8 header values kept; `req_body_encoding` / `res_body_encoding`; `schema_version` on every line |
 | 2 | `replay_of` |
 | 1 | Initial |
 
-taphttp still reads v1 to v3 logs (`show`, `replay`, the lever API): a
-header map is read as pairs, a missing encoding means `utf8`, and a missing
-`source` means `null`. Anything taphttp writes or re-emits (`show --json`,
-`/exchanges`) is v4.
+taphttp still reads v1 to v4 logs (`show`, `replay`, the lever API): a
+header map is read as pairs, a missing encoding means `utf8`, a missing
+`source` or `error` means `null`, and a missing `meta` means `{}`. Anything
+taphttp writes or re-emits (`show --json`, `/exchanges`) is v5.
 
 ### Using the types from Rust
 

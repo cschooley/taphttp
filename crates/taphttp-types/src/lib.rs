@@ -146,10 +146,15 @@ impl<'de> Deserialize<'de> for Timestamp {
 ///   and non-UTF-8 bodies are base64. Every line carries `schema_version`.
 /// - v4: added `source`, who sent the exchange (the proxy-auth username), or
 ///   `null` when the client gave none.
+/// - v5: added `meta`, an object of string attribution fields a replay's
+///   caller attached (`{}` otherwise), and `error`, why an exchange got no
+///   complete response (`null` otherwise). A failed replay is recorded with
+///   `error` set.
 ///
-/// v1 to v3 lines still deserialize: a header map is read as pairs, a
-/// missing encoding means `"utf8"`, and a missing `source` means `null`.
-pub const SCHEMA_VERSION: u32 = 4;
+/// v1 to v4 lines still deserialize: a header map is read as pairs, a
+/// missing encoding means `"utf8"`, a missing `source` or `error` means
+/// `null`, and a missing `meta` means `{}`.
+pub const SCHEMA_VERSION: u32 = 5;
 
 // ---------------------------------------------------------------------------
 // Headers
@@ -443,6 +448,16 @@ pub struct TrafficEntry {
     /// configured; otherwise it is a self-reported label for the audit trail.
     #[serde(default)]
     pub source: Option<String>,
+    /// Attribution the caller attached to a replay, e.g.
+    /// `{"actor": "agent", "task_id": "T-3"}`. Recorded, never sent
+    /// upstream, and not interpreted by taphttp. Empty for proxied traffic.
+    #[serde(default)]
+    pub meta: BTreeMap<String, String>,
+    /// Why the exchange has no complete response: the upstream couldn't be
+    /// reached, or the response broke off. `None` when it completed.
+    /// `status` is `None` too unless a response head arrived.
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 impl TrafficEntry {
@@ -470,8 +485,8 @@ impl TrafficEntry {
 impl Serialize for TrafficEntry {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         // Keep this list in step with the struct; the
-        // `serialized_keys_are_exactly_the_v3_schema` test enforces it.
-        let mut st = s.serialize_struct("TrafficEntry", 16)?;
+        // `serialized_keys_are_exactly_the_v5_schema` test enforces it.
+        let mut st = s.serialize_struct("TrafficEntry", 18)?;
         st.serialize_field("schema_version", &SCHEMA_VERSION)?;
         st.serialize_field("id", &self.id)?;
         st.serialize_field("ts", &self.ts)?;
@@ -488,6 +503,8 @@ impl Serialize for TrafficEntry {
         st.serialize_field("duration_ms", &self.duration_ms)?;
         st.serialize_field("replay_of", &self.replay_of)?;
         st.serialize_field("source", &self.source)?;
+        st.serialize_field("meta", &self.meta)?;
+        st.serialize_field("error", &self.error)?;
         st.end()
     }
 }
@@ -577,6 +594,8 @@ mod tests {
             duration_ms: Some(3),
             replay_of: None,
             source: None,
+            meta: BTreeMap::new(),
+            error: None,
         }
     }
 
@@ -722,7 +741,7 @@ mod tests {
     // --- TrafficEntry wire format ---
 
     #[test]
-    fn serialized_keys_are_exactly_the_v4_schema() {
+    fn serialized_keys_are_exactly_the_v5_schema() {
         let v = serde_json::to_value(entry()).unwrap();
         let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
         keys.sort_unstable();
@@ -730,8 +749,10 @@ mod tests {
             keys,
             [
                 "duration_ms",
+                "error",
                 "host",
                 "id",
+                "meta",
                 "method",
                 "replay_of",
                 "req_body",
@@ -747,14 +768,47 @@ mod tests {
                 "url",
             ]
         );
-        assert_eq!(v["schema_version"], 4);
+        assert_eq!(v["schema_version"], 5);
         assert_eq!(v["req_body_encoding"], "utf8");
+        assert_eq!(
+            v["meta"],
+            serde_json::json!({}),
+            "no meta is an empty object"
+        );
+        assert_eq!(v["error"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn meta_serializes_as_an_object_of_strings_in_key_order() {
+        let mut e = entry();
+        e.meta.insert("task_id".into(), "T-3".into());
+        e.meta.insert("actor".into(), "agent".into());
+        let line = serde_json::to_string(&e).unwrap();
+        assert!(
+            line.contains(r#""meta":{"actor":"agent","task_id":"T-3"}"#),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn meta_values_must_be_strings() {
+        let line = r#"{"schema_version":5,"id":"a","ts":"2026-11-20T00:00:00Z","host":"h","method":"GET","url":"/","status":null,"duration_ms":null,"meta":{"n":1}}"#;
+        assert!(serde_json::from_str::<TrafficEntry>(line).is_err());
+    }
+
+    #[test]
+    fn v4_line_without_meta_or_error_parses_as_empty() {
+        let v4 = r#"{"schema_version":4,"id":"a","ts":"2026-11-20T00:00:00Z","host":"h","method":"GET","url":"/","req_headers":[],"req_body":null,"req_body_encoding":"utf8","status":200,"res_headers":[],"res_body":null,"res_body_encoding":"utf8","duration_ms":1,"replay_of":null,"source":"alice"}"#;
+        let e: TrafficEntry = serde_json::from_str(v4).unwrap();
+        assert!(e.meta.is_empty());
+        assert_eq!(e.error, None);
+        assert_eq!(e.source.as_deref(), Some("alice"));
     }
 
     #[test]
     fn schema_version_is_the_first_key_on_the_line() {
         let line = serde_json::to_string(&entry()).unwrap();
-        assert!(line.starts_with(r#"{"schema_version":4,"#), "{line}");
+        assert!(line.starts_with(r#"{"schema_version":5,"#), "{line}");
     }
 
     #[test]
@@ -768,6 +822,9 @@ mod tests {
         e.set_res_body(&[0xff, 0x00]);
         e.replay_of = Some("orig".into());
         e.source = Some("agent.T-3".into());
+        e.meta.insert("actor".into(), "human".into());
+        e.status = None;
+        e.error = Some("sending request: connection refused".into());
         let back: TrafficEntry = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
         assert_eq!(back, e);
     }

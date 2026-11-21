@@ -464,6 +464,7 @@ async fn forward_https(
     let res = send_https(upstream_req).await;
     let duration_ms = start.elapsed().as_millis() as u64;
 
+    let mut upstream_error = None;
     let (mut status, mut res_headers, mut res_raw_headers, mut res_body_bytes) = match res {
         Ok(r) => {
             let s = r.status().as_u16();
@@ -474,6 +475,7 @@ async fn forward_https(
         }
         Err(e) => {
             tracing::debug!("upstream error: {e}");
+            upstream_error = Some(format!("{e:#}"));
             (None, Headers::new(), hyper::HeaderMap::new(), Bytes::new())
         }
     };
@@ -527,6 +529,8 @@ async fn forward_https(
         duration_ms: Some(duration_ms),
         replay_of: None,
         source: source.clone(),
+        meta: Default::default(),
+        error: upstream_error,
     };
 
     tracing::info!(
@@ -633,6 +637,7 @@ async fn handle_http(
     let res = forward_http_request(upstream_req).await;
     let duration_ms = start.elapsed().as_millis() as u64;
 
+    let mut upstream_error = None;
     let (mut status, mut res_headers, mut res_raw_headers, mut res_body_bytes) = match res {
         Ok(r) => {
             let s = r.status().as_u16();
@@ -643,6 +648,7 @@ async fn handle_http(
         }
         Err(e) => {
             tracing::debug!("http upstream error: {e}");
+            upstream_error = Some(format!("{e:#}"));
             (None, Headers::new(), hyper::HeaderMap::new(), Bytes::new())
         }
     };
@@ -696,6 +702,8 @@ async fn handle_http(
         duration_ms: Some(duration_ms),
         replay_of: None,
         source: source.clone(),
+        meta: Default::default(),
+        error: upstream_error,
     };
 
     tracing::info!(
@@ -1196,6 +1204,27 @@ mod tests {
         assert_eq!(entry.status, Some(200));
         assert!(entry.url.contains("/probe"), "url was: {}", entry.url);
         assert!(entry.duration_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn unreachable_upstream_is_recorded_with_its_error() {
+        // A port nothing listens on: bind, note it, close.
+        let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_port = dead.local_addr().unwrap().port();
+        drop(dead);
+        let dir = TempDir::new().unwrap();
+        let log_file = dir.path().join("traffic.jsonl");
+        let proxy_port = start_proxy(dir.path(), &log_file, None).await;
+
+        send_http_through_proxy(proxy_port, dead_port, "/gone").await;
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let content = std::fs::read_to_string(&log_file).unwrap();
+        let entry: TrafficEntry = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        assert_eq!(entry.status, None);
+        let error = entry.error.expect("the failure is recorded");
+        assert!(error.to_lowercase().contains("connect"), "{error}");
+        assert!(entry.meta.is_empty());
     }
 
     /// Upstream that answers with two Set-Cookie headers, a header value that

@@ -34,6 +34,8 @@ pub struct HistoryQuery {
     pub since: Option<Timestamp>,
     /// Only entries with `ts` before this RFC 3339 time.
     pub until: Option<Timestamp>,
+    /// Only replays of the exchange with this id.
+    pub replay_of: Option<String>,
     /// Cursor: only entries recorded before the entry with this id.
     pub before: Option<String>,
     /// Page size; default [`DEFAULT_LIMIT`], capped at [`MAX_LIMIT`].
@@ -95,7 +97,7 @@ impl From<rusqlite::Error> for HistoryError {
 }
 
 const COLUMNS: &str = "rowid, id, ts, host, method, url, req_headers, req_body, \
-    req_body_encoding, status, res_headers, res_body, res_body_encoding, duration_ms, replay_of, source";
+    req_body_encoding, status, res_headers, res_body, res_body_encoding, duration_ms, replay_of, source, meta, error";
 
 impl SqliteBackend {
     /// Newest first, filtered, at most `limit` entries.
@@ -109,6 +111,10 @@ impl SqliteBackend {
                 .ok_or_else(|| HistoryError::UnknownCursor(id.clone()))?;
             sql.push_str(" AND rowid < ?");
             params.push(Box::new(rowid));
+        }
+        if let Some(of) = &q.replay_of {
+            sql.push_str(" AND replay_of = ?");
+            params.push(Box::new(of.clone()));
         }
         if let Some(host) = &q.host {
             sql.push_str(r" AND host LIKE ? ESCAPE '\'");
@@ -245,6 +251,11 @@ fn row_to_entry(r: &Row) -> rusqlite::Result<(i64, TrafficEntry)> {
             .and_then(|d| u64::try_from(d).ok()),
         replay_of: r.get(14)?,
         source: r.get(15)?,
+        meta: match r.get::<_, Option<String>>(16)? {
+            Some(json) => serde_json::from_str(&json).map_err(|e| conversion(16, e.into()))?,
+            None => Default::default(),
+        },
+        error: r.get(17)?,
     };
     Ok((r.get(0)?, entry))
 }
@@ -271,6 +282,8 @@ mod tests {
             duration_ms: Some(1),
             replay_of: None,
             source: None,
+            meta: Default::default(),
+            error: None,
         }
     }
 
@@ -520,6 +533,68 @@ mod tests {
             db.get("s").unwrap().unwrap().source.as_deref(),
             Some("agent.T-3")
         );
+    }
+
+    #[test]
+    fn meta_and_error_round_trip_through_sqlite() {
+        let dir = TempDir::new().unwrap();
+        let db = SqliteBackend::new(&dir.path().join("t.db")).unwrap();
+        let mut e = entry("m", "h", "GET", 200, "/");
+        e.meta.insert("actor".into(), "agent".into());
+        e.meta.insert("task_id".into(), "T-3".into());
+        e.status = None;
+        e.error = Some("sending request: connection refused".into());
+        db.append(&e).unwrap();
+        let plain = entry("p", "h", "GET", 200, "/");
+        db.append(&plain).unwrap();
+        assert_eq!(db.get("m").unwrap().unwrap(), e);
+        assert_eq!(db.get("p").unwrap().unwrap(), plain, "empty meta, no error");
+    }
+
+    #[test]
+    fn replay_of_filter_finds_an_exchanges_replays_and_pages() {
+        let dir = TempDir::new().unwrap();
+        let db = SqliteBackend::new(&dir.path().join("t.db")).unwrap();
+        db.append(&entry("orig", "h", "GET", 200, "/")).unwrap();
+        db.append(&entry("other", "h", "GET", 200, "/")).unwrap();
+        for (id, of) in [
+            ("r1", "orig"),
+            ("x1", "other"),
+            ("r2", "orig"),
+            ("r3", "orig"),
+        ] {
+            let mut e = entry(id, "h", "GET", 200, "/");
+            e.replay_of = Some(of.into());
+            db.append(&e).unwrap();
+        }
+        let q = |before: Option<&str>| HistoryQuery {
+            replay_of: Some("orig".into()),
+            limit: Some(2),
+            before: before.map(String::from),
+            ..Default::default()
+        };
+        assert_eq!(ids(&db.query(&q(None)).unwrap()), ["r3", "r2"]);
+        assert_eq!(ids(&db.query(&q(Some("r2"))).unwrap()), ["r1"]);
+        let none = HistoryQuery {
+            replay_of: Some("r1".into()),
+            ..Default::default()
+        };
+        assert!(db.query(&none).unwrap().is_empty());
+    }
+
+    #[test]
+    fn replay_of_filter_uses_an_index() {
+        let dir = TempDir::new().unwrap();
+        let db = SqliteBackend::new(&dir.path().join("t.db")).unwrap();
+        let conn = db.conn.lock().unwrap();
+        let plan: String = conn
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT rowid FROM traffic WHERE replay_of = 'x'",
+                [],
+                |r| r.get(3),
+            )
+            .unwrap();
+        assert!(plan.contains("traffic_replay_of"), "{plan}");
     }
 
     #[test]
