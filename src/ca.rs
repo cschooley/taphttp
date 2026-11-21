@@ -27,6 +27,13 @@ impl Ca {
             let cert_pem = std::fs::read_to_string(&cert_path)
                 .context("reading CA cert")?;
             let key = KeyPair::from_pem(&key_pem).context("parsing CA key")?;
+            // Older versions wrote the key world-readable; tighten it.
+            if let Err(e) = restrict_to_owner(&key_path) {
+                tracing::warn!(
+                    "could not make {} owner-only ({e}); run `chmod 600` on it",
+                    key_path.display()
+                );
+            }
             let params = CertificateParams::from_ca_cert_pem(&cert_pem)
                 .context("parsing CA cert params")?;
             let cert = params.self_signed(&key).context("re-signing CA cert")?;
@@ -51,7 +58,7 @@ impl Ca {
         let cert = params.self_signed(&key).context("generating CA cert")?;
 
         std::fs::write(&cert_path, cert.pem()).context("writing CA cert")?;
-        std::fs::write(&key_path, key.serialize_pem()).context("writing CA key")?;
+        write_private(&key_path, key.serialize_pem().as_bytes()).context("writing CA key")?;
 
         tracing::info!("Generated new CA cert at {}", cert_path.display());
         eprintln!(
@@ -105,6 +112,33 @@ impl Ca {
     }
 }
 
+/// Write `contents` to a new file readable only by its owner. The mode is set
+/// at creation, so the key is never briefly world-readable.
+fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)?.write_all(contents)?;
+    // `mode` applies only when the file is created; cover a pre-existing one.
+    restrict_to_owner(path)
+}
+
+fn restrict_to_owner(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
 pub async fn manage(args: CaArgs, data_dir: PathBuf) -> Result<()> {
     match args.action {
         CaAction::Info => {
@@ -149,6 +183,33 @@ mod tests {
         Ca::load_or_create(&path).unwrap();
         assert!(path.join("ca.crt").exists(), "ca.crt should be written");
         assert!(path.join("ca.key").exists(), "ca.key should be written");
+    }
+
+    #[cfg(unix)]
+    fn mode(p: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_ca_key_is_owner_only() {
+        let dir = TempDir::new().unwrap();
+        Ca::load_or_create(dir.path()).unwrap();
+        assert_eq!(mode(&dir.path().join("ca.key")), 0o600, "CA private key must be owner-only");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_world_readable_ca_key_is_tightened_on_load() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        Ca::load_or_create(dir.path()).unwrap();
+        let key = dir.path().join("ca.key");
+        // What older taphttp versions left on disk.
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+        Ca::load_or_create(dir.path()).unwrap();
+        assert_eq!(mode(&key), 0o600);
     }
 
     #[test]
