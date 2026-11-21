@@ -14,11 +14,14 @@ pub use taphttp_types::{Headers, TrafficEntry, SCHEMA_VERSION};
 
 pub struct JsonLinesBackend {
     path: PathBuf,
+    /// Serializes writers. Every proxy connection task records through the
+    /// same backend; unserialized, two lines can interleave (issue #6).
+    write_lock: Mutex<()>,
 }
 
 impl JsonLinesBackend {
     pub fn new(path: &Path) -> Self {
-        Self { path: path.to_path_buf() }
+        Self { path: path.to_path_buf(), write_lock: Mutex::new(()) }
     }
 
     #[cfg(test)]
@@ -27,13 +30,28 @@ impl JsonLinesBackend {
         self.append_line(&line)
     }
 
+    /// Append `line` plus a newline as a single write, under the lock.
+    ///
+    /// `writeln!` on a `File` issues the line and the newline as separate
+    /// syscalls; O_APPEND keeps each atomic but not the pair, so concurrent
+    /// writers produced `{A}{B}\n\n`. One buffer means one O_APPEND write,
+    /// which also keeps lines whole against another process appending
+    /// (e.g. `taphttp replay` on the log a running proxy writes).
+    ///
+    /// The file is reopened per line rather than held open, so a log rotated
+    /// by rename is followed by a fresh file instead of written to under its
+    /// old name.
     pub fn append_line(&self, line: &str) -> Result<()> {
+        let mut buf = Vec::with_capacity(line.len() + 1);
+        buf.extend_from_slice(line.as_bytes());
+        buf.push(b'\n');
+        let _guard = self.write_lock.lock().unwrap_or_else(|p| p.into_inner());
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.path)
             .context("opening traffic log")?;
-        writeln!(f, "{line}")?;
+        f.write_all(&buf).context("writing traffic log")?;
         Ok(())
     }
 }
@@ -228,11 +246,33 @@ pub fn filter_entries(entries: Vec<TrafficEntry>, args: &ShowArgs) -> Vec<Traffi
 /// unparseable lines. Shared by the `show` CLI command and the lever API.
 pub fn load_entries(path: &Path) -> Result<Vec<TrafficEntry>> {
     let content = std::fs::read_to_string(path).context("reading traffic log")?;
-    Ok(content
+    let (entries, skipped) = parse_log(&content);
+    if skipped > 0 {
+        // Corruption must be visible, not silently shrink the history.
+        tracing::warn!(
+            "{}: skipped {skipped} line(s) that are not valid traffic entries",
+            path.display()
+        );
+    }
+    Ok(entries)
+}
+
+/// Parse JSON-lines content into entries, returning how many non-blank lines
+/// failed to parse.
+fn parse_log(content: &str) -> (Vec<TrafficEntry>, usize) {
+    let mut skipped = 0;
+    let entries = content
         .lines()
         .filter(|l| !l.is_empty())
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect())
+        .filter_map(|l| {
+            let parsed = serde_json::from_str(l).ok();
+            if parsed.is_none() {
+                skipped += 1;
+            }
+            parsed
+        })
+        .collect();
+    (entries, skipped)
 }
 
 pub async fn show(args: ShowArgs) -> Result<()> {
@@ -395,6 +435,75 @@ mod tests {
         let entries = load_entries(&path).unwrap();
         let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids, ["a", "b"]);
+    }
+
+    /// Every line parses, and there is exactly one line per entry written.
+    fn assert_log_intact(path: &Path, expected: usize) {
+        let content = std::fs::read_to_string(path).unwrap();
+        let lines: Vec<&str> = content.split_terminator('\n').collect();
+        let blank = lines.iter().filter(|l| l.is_empty()).count();
+        let bad = lines
+            .iter()
+            .filter(|l| !l.is_empty() && serde_json::from_str::<TrafficEntry>(l).is_err())
+            .count();
+        assert_eq!((blank, bad), (0, 0), "{blank} blank and {bad} unparseable (fused) lines");
+        assert_eq!(lines.len(), expected, "one line per entry");
+        assert!(content.ends_with('\n'));
+    }
+
+    fn entry_with_kb_body(id: String) -> TrafficEntry {
+        let mut e = make_entry(&id, "example.com", "POST", 200);
+        e.set_res_body("x".repeat(1024).as_bytes());
+        e
+    }
+
+    #[test]
+    fn concurrent_appends_never_fuse_lines() {
+        // Issue #6: 32 writers x 200 ~1 KB entries on one backend.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("traffic.jsonl");
+        let backend = Arc::new(JsonLinesBackend::new(&path));
+        let threads: Vec<_> = (0..32)
+            .map(|t| {
+                let backend = backend.clone();
+                std::thread::spawn(move || {
+                    for i in 0..200 {
+                        backend.append(&entry_with_kb_body(format!("t{t}-{i}"))).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_log_intact(&path, 32 * 200);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_store_records_never_fuse_lines() {
+        // The real path: every proxy connection task calls Store::record.
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("traffic.jsonl");
+        let store = Store::new(dir.path(), Some(&log), false).unwrap();
+        let tasks: Vec<_> = (0..1000)
+            .map(|i| {
+                let store = store.clone();
+                tokio::spawn(async move { store.record(entry_with_kb_body(format!("r{i}"))) })
+            })
+            .collect();
+        for t in tasks {
+            t.await.unwrap();
+        }
+        assert_log_intact(&log, 1000);
+    }
+
+    #[test]
+    fn parse_log_counts_skipped_lines() {
+        let good = serde_json::to_string(&make_entry("ok", "h", "GET", 200)).unwrap();
+        let content = format!("{good}\n\n{good}{good}\nnot json\n{good}\n");
+        let (entries, skipped) = parse_log(&content);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(skipped, 2, "the fused line and the garbage line; blank lines aren't counted");
     }
 
     #[test]
