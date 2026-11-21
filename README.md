@@ -68,8 +68,23 @@ services:
 - `/ca` (`TAPHTTP_DATA`) holds the CA cert **and private key**. Keep it on its
   own volume. Mount only `/data` (the traffic log, `/data/traffic.jsonl`) into
   consumers.
+- `/token` holds the lever API token (`TAPHTTP_API_TOKEN_FILE=/token/api-token`)
+  when you pass `--api-listen`. Mount it read-only into consumers that call the
+  API.
+- With sqlite on, the database is `/data/traffic.db` (`TAPHTTP_DB`), not on
+  the CA volume.
 - Set `RUST_LOG=info` to see a log line per request on stderr. Without it,
   only errors are shown.
+- To serve the lever API on the compose network only, add
+  `--api-listen 0.0.0.0:8081` to the command and don't publish 8081:
+
+  ```yaml
+      command: [start, --listen, 0.0.0.0:8080, --log-file, /data/traffic.jsonl,
+                --api-listen, 0.0.0.0:8081]
+      volumes: [taphttp-ca:/ca, taphttp-data:/data, taphttp-token:/token]
+  # consumer:
+      volumes: [taphttp-token:/token:ro]   # read /token/api-token
+  ```
 - Arguments after the image name replace the default command
   (`start --listen 0.0.0.0:8080 --log-file /data/traffic.jsonl`). For example:
   `docker run --rm -v taphttp-ca:/ca taphttp ca print`.
@@ -181,10 +196,12 @@ separate pairs.
 |---|---|---|
 | `--listen` | `127.0.0.1:8080` | Address to listen on |
 | `--log-file` | — | Also write traffic to this file |
-| `--sqlite` | off | Also write traffic to SQLite (`traffic.db` in data dir) |
+| `--sqlite` | off | Also write traffic to SQLite (at `--db`). Implied by `--api-listen` |
+| `--db` | `<data-dir>/traffic.db` | SQLite path when sqlite is on. Env `TAPHTTP_DB` |
 | `--filter-host` | — | Only log requests whose host contains this substring |
 | `--intercept-socket` | — | Unix socket path for the intercept hook (pauses each request/response) |
 | `--api-listen` | — | Also serve the [lever API](#lever-api) (HTTP + WebSocket) on this address |
+| `--api-token-file` | — | Read the API token from this file, or create it there (`0600`). Env `TAPHTTP_API_TOKEN_FILE` |
 
 Traffic is always written to stdout as JSON lines. `--log-file` and `--sqlite` are additive.
 
@@ -223,34 +240,81 @@ tools can query traffic and replay requests without shelling out to the CLI.
 taphttp itself stays headless — this is the seam a separate dashboard, an MCP
 server, or an agent consumes (see [docs/findings-architecture.md](docs/findings-architecture.md)).
 
-Enable it with `--api-listen`, alongside `--log-file` so there is history to
-read:
+Enable it with `--api-listen`. History is served from sqlite, so
+`--api-listen` turns sqlite recording on (at `--db`, default
+`<data-dir>/traffic.db`). It only holds traffic recorded since sqlite was
+turned on; an existing `--log-file` isn't imported.
 
 ```bash
-taphttp start --api-listen 127.0.0.1:8081 --log-file ./traffic.jsonl
+taphttp start --api-listen 127.0.0.1:8081 --db ./traffic.db
 ```
 
 ### Authentication
 
-Every endpoint requires a bearer token. On startup taphttp generates one,
-prints it to stderr, and writes it to `<data-dir>/api-token` (mode `0600`).
-Pass it as a header, or — for the WebSocket, which browsers can't send headers
-on — as a `?token=` query parameter:
+Every endpoint requires a bearer token. Pass it as a header, or, for the
+WebSocket (browsers can't send headers on it), as a `?token=` query
+parameter:
 
 ```bash
-TOKEN=$(cat <data-dir>/api-token)
 curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8081/exchanges
 ```
+
+Where the token comes from:
+
+- **`--api-token-file <PATH>`** (or `TAPHTTP_API_TOKEN_FILE`): if the file
+  exists, its contents are the token; otherwise a token is generated and
+  written there with mode `0600`. Keep the file and the token survives
+  restarts. The token isn't printed, only the path. Use this whenever
+  another process or container needs the token: put the file on its own
+  volume and mount it read-only into the consumer.
+- **Without it:** a fresh token every start, printed to stderr and written to
+  `<data-dir>/api-token` (mode `0600`).
 
 ### Endpoints
 
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/schema` | `{ "schema_version": N }` — the traffic-entry contract to pin against |
-| `GET` | `/exchanges` | Captured exchanges; filter with `?host=`, `?method=`, `?status=`, `?limit=` |
+| `GET` | `/exchanges` | History, newest first, paged and filtered (below) |
 | `GET` | `/exchanges/{id}` | A single exchange by `id`, or `404` |
 | `POST` | `/replay` | Replay a captured exchange; records the result linked via `replay_of` |
-| `GET` | `/feed` | WebSocket stream of exchanges as they are recorded |
+| `GET` | `/feed` | WebSocket stream of exchanges as they are recorded; resumable with `?since=` |
+
+Entries are `taphttp_types::TrafficEntry` v3 JSON, the same as log lines.
+
+#### `GET /exchanges`
+
+| Parameter | Meaning |
+|---|---|
+| `limit` | Page size. Default 100, max 500 |
+| `before=<id>` | Only exchanges recorded before `<id>`. Pass the last `id` of a page to get the next one. Unknown id: `404` |
+| `host` | Host contains this (case-insensitive) |
+| `method` | Method equals this (case-insensitive) |
+| `status` | Status code equals this |
+| `q` | URL or host contains this text (case-insensitive) |
+| `since` / `until` | RFC 3339 times; `since` is inclusive, `until` exclusive |
+
+Order is the order taphttp recorded exchanges in, so a `before` cursor stays
+valid while new traffic arrives. Each lookup is an indexed sqlite query, not
+a scan of the log.
+
+#### `GET /feed`
+
+Every text frame is JSON, one of:
+
+- **An exchange:** a `TrafficEntry`, exactly as from `/exchanges`. It never has
+  a `type` key.
+- **A control frame,** which always has a `type` key:
+  - `{"type":"reset","since":"<id>"}`: the `since` id isn't known (the
+    database was reset, say). Nothing was replayed; the feed continues live.
+    Re-sync from `GET /exchanges`.
+  - `{"type":"lagged","skipped":N}`: this client fell behind and missed N
+    exchanges. Reconnect with `?since=<last id received>`.
+
+Without `since`, the feed sends exchanges recorded after you connect. With
+`?since=<id>`, it first sends every exchange recorded after `<id>`, oldest
+first, then switches to live with no gap and no duplicates. To survive
+reconnects, remember the last `id` you received and reconnect with it.
 
 `POST /replay` takes a JSON body — `id` is required, the rest optional:
 
@@ -281,8 +345,8 @@ Override with `--data-dir <path>` or `TAPHTTP_DATA=<path>`.
 
 Files written here:
 - `ca.crt` / `ca.key` — local CA (generated once, keep the key private)
-- `traffic.db` — SQLite traffic log (only with `--sqlite`)
-- `api-token` — bearer token for the lever API, mode `0600` (only with `--api-listen`)
+- `traffic.db` — SQLite traffic log, when sqlite is on and `--db` isn't set
+- `api-token` — bearer token for the lever API, mode `0600` (only with `--api-listen` and no `--api-token-file`)
 
 Traffic JSON lines go to stdout by default. Use `--log-file <path>` to also write to a file anywhere you choose.
 

@@ -28,9 +28,21 @@ struct ProxyConfig {
     intercept_socket: Option<PathBuf>,
 }
 
+/// The sqlite database to record into, if any: with `--sqlite`, or with
+/// `--api-listen`, which serves history from it. `--db` only says where, so
+/// it can be set as an environment default (as the Docker image does).
+fn sqlite_path(args: &StartArgs, data_dir: &std::path::Path) -> Option<PathBuf> {
+    let wanted = args.sqlite || args.api_listen.is_some();
+    wanted.then(|| args.db.clone().unwrap_or_else(|| data_dir.join("traffic.db")))
+}
+
 pub async fn run(args: StartArgs, data_dir: PathBuf) -> Result<()> {
     let ca = Arc::new(Ca::load_or_create(&data_dir)?);
-    let store = Store::new(&data_dir, args.log_file.as_deref(), args.sqlite)?;
+    let db = sqlite_path(&args, &data_dir);
+    if let Some(db) = &db {
+        eprintln!("recording to sqlite at {}", db.display());
+    }
+    let store = Store::new(args.log_file.as_deref(), db.as_deref())?;
     let addr: SocketAddr = args.listen.parse().context("invalid listen address")?;
     let listener = TcpListener::bind(addr).await.context("binding listener")?;
 
@@ -38,15 +50,22 @@ pub async fn run(args: StartArgs, data_dir: PathBuf) -> Result<()> {
     // live Store so its /feed carries real traffic as it is recorded.
     if let Some(api_listen) = &args.api_listen {
         let api_addr: SocketAddr = api_listen.parse().context("invalid api-listen address")?;
-        let token = crate::api::generate_token();
-        let token_path = crate::api::write_token_file(&data_dir, &token)?;
-        eprintln!("lever API token: {token}");
-        eprintln!("  (also written to {}, mode 0600)", token_path.display());
-        let state = Arc::new(crate::api::ApiState {
-            store: store.clone(),
-            log_path: args.log_file.clone(),
-            token,
-        });
+        let token = match &args.api_token_file {
+            // From a file: print only where it is, so it stays out of logs.
+            Some(path) => {
+                let token = crate::api::load_or_create_token_file(path)?;
+                eprintln!("lever API token: in {}", path.display());
+                token
+            }
+            None => {
+                let token = crate::api::generate_token();
+                let token_path = crate::api::write_token_file(&data_dir, &token)?;
+                eprintln!("lever API token: {token}");
+                eprintln!("  (also written to {}, mode 0600)", token_path.display());
+                token
+            }
+        };
+        let state = Arc::new(crate::api::ApiState { store: store.clone(), token });
         tokio::spawn(async move {
             if let Err(e) = crate::api::serve(state, api_addr).await {
                 tracing::error!("lever API exited: {e}");
@@ -757,6 +776,30 @@ mod tests {
         assert_eq!(m["b"], "x");
     }
 
+    fn start_args(sqlite: bool, db: Option<&str>, api: bool) -> StartArgs {
+        StartArgs {
+            listen: "127.0.0.1:0".into(),
+            log_file: None,
+            sqlite,
+            db: db.map(PathBuf::from),
+            filter_host: None,
+            intercept_socket: None,
+            api_listen: api.then(|| "127.0.0.1:0".into()),
+            api_token_file: None,
+        }
+    }
+
+    #[test]
+    fn sqlite_path_is_on_when_asked_for_or_when_the_api_needs_it() {
+        let dd = std::path::Path::new("/dd");
+        assert_eq!(sqlite_path(&start_args(false, None, false), dd), None);
+        assert_eq!(sqlite_path(&start_args(true, None, false), dd), Some(PathBuf::from("/dd/traffic.db")));
+        assert_eq!(sqlite_path(&start_args(false, None, true), dd), Some(PathBuf::from("/dd/traffic.db")));
+        assert_eq!(sqlite_path(&start_args(false, Some("/data/t.db"), false), dd), None, "--db alone only sets the location");
+        assert_eq!(sqlite_path(&start_args(true, Some("/data/t.db"), false), dd), Some(PathBuf::from("/data/t.db")));
+        assert_eq!(sqlite_path(&start_args(true, Some("/data/t.db"), true), dd), Some(PathBuf::from("/data/t.db")));
+    }
+
     #[test]
     fn rebuild_request_strips_proxy_connection_header() {
         let original = Request::builder()
@@ -842,7 +885,7 @@ mod tests {
         intercept_socket: Option<PathBuf>,
     ) -> u16 {
         let ca = Arc::new(Ca::load_or_create(data_dir).unwrap());
-        let store = Store::new(data_dir, Some(log_file), false).unwrap();
+        let store = Store::new(Some(log_file), None).unwrap();
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = proxy_listener.local_addr().unwrap().port();
         tokio::spawn(serve(proxy_listener, ca, store, None, intercept_socket));
@@ -1064,7 +1107,7 @@ mod tests {
         let log_file = dir.path().join("traffic.jsonl");
 
         let ca = Arc::new(Ca::load_or_create(dir.path()).unwrap());
-        let store = Store::new(dir.path(), Some(&log_file), false).unwrap();
+        let store = Store::new(Some(&log_file), None).unwrap();
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_port = proxy_listener.local_addr().unwrap().port();
         tokio::spawn(serve(

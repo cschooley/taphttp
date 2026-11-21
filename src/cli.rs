@@ -35,9 +35,16 @@ pub struct StartArgs {
     #[arg(long)]
     pub log_file: Option<PathBuf>,
 
-    /// Also write traffic log to SQLite in the data directory
+    /// Also write traffic to SQLite (at --db). Implied by --api-listen,
+    /// which serves history from it.
     #[arg(long)]
     pub sqlite: bool,
+
+    /// SQLite database path, used when sqlite is on (--sqlite or
+    /// --api-listen). Default: <data-dir>/traffic.db. Set it to keep the
+    /// database off the volume holding the CA key.
+    #[arg(long, env = "TAPHTTP_DB", value_name = "PATH")]
+    pub db: Option<PathBuf>,
 
     /// Only log requests matching this host (substring)
     #[arg(long)]
@@ -51,6 +58,13 @@ pub struct StartArgs {
     /// e.g. 127.0.0.1:8081. Consumed by the SPA and MCP server.
     #[arg(long)]
     pub api_listen: Option<String>,
+
+    /// Lever API token file. If it exists its contents are the token;
+    /// otherwise a token is generated and written there (mode 0600). The
+    /// token is then not printed. Default: a fresh token each start, printed
+    /// and written to <data-dir>/api-token.
+    #[arg(long, env = "TAPHTTP_API_TOKEN_FILE", value_name = "PATH")]
+    pub api_token_file: Option<PathBuf>,
 }
 
 #[derive(Args)]

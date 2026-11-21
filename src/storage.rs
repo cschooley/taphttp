@@ -57,12 +57,13 @@ impl JsonLinesBackend {
 }
 
 pub struct SqliteBackend {
-    conn: Arc<Mutex<Connection>>,
+    /// Shared with the history reader (`crate::history`).
+    pub(crate) conn: Arc<Mutex<Connection>>,
 }
 
 /// Columns of the `traffic` table, in insert order. v1/v2 databases have
 /// only the first eleven; [`SqliteBackend::new`] adds the rest.
-const SQLITE_COLUMNS: [(&str, &str); 15] = [
+const SQLITE_COLUMNS: [(&str, &str); 16] = [
     ("id", "TEXT PRIMARY KEY"),
     ("ts", "TEXT NOT NULL"),
     ("host", "TEXT NOT NULL"),
@@ -79,12 +80,21 @@ const SQLITE_COLUMNS: [(&str, &str); 15] = [
     ("req_body_encoding", "TEXT"),
     ("res_body_encoding", "TEXT"),
     ("schema_version", "INTEGER"),
+    // `ts` as microseconds since the epoch, for since/until filters. `ts` is
+    // RFC 3339 text with variable fraction digits, which doesn't sort.
+    ("ts_us", "INTEGER"),
 ];
 
 impl SqliteBackend {
-    pub fn new(data_dir: &Path) -> Result<Self> {
-        let conn = Connection::open(data_dir.join("traffic.db"))
-            .context("opening sqlite db")?;
+    pub fn new(db_path: &Path) -> Result<Self> {
+        let conn = Connection::open(db_path)
+            .with_context(|| format!("opening sqlite db {}", db_path.display()))?;
+        // Every proxied exchange is an insert. With the default rollback
+        // journal each one is an fsync'd transaction under the store lock,
+        // which caps the proxy at ~100 req/s. WAL + NORMAL survives a crash
+        // of taphttp; a power cut may lose the last few entries.
+        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")
+            .context("configuring sqlite")?;
         let defs: Vec<String> = SQLITE_COLUMNS.iter().map(|(n, t)| format!("{n} {t}")).collect();
         conn.execute_batch(&format!(
             "CREATE TABLE IF NOT EXISTS traffic ({});",
@@ -102,6 +112,7 @@ impl SqliteBackend {
                     .with_context(|| format!("migrating sqlite: adding column {name}"))?;
             }
         }
+        conn.execute_batch("CREATE INDEX IF NOT EXISTS traffic_ts_us ON traffic (ts_us);")?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -134,6 +145,7 @@ impl SqliteBackend {
                 encoding(e.req_body_encoding),
                 encoding(e.res_body_encoding),
                 SCHEMA_VERSION,
+                e.ts.timestamp_micros(),
             ],
         )?;
         Ok(())
@@ -153,13 +165,11 @@ pub struct Store {
 }
 
 impl Store {
-    pub fn new(data_dir: &Path, log_file: Option<&Path>, use_sqlite: bool) -> Result<Arc<Self>> {
+    /// `db` is the sqlite database to also record into (and serve history
+    /// from), if any.
+    pub fn new(log_file: Option<&Path>, db: Option<&Path>) -> Result<Arc<Self>> {
         let log_file = log_file.map(JsonLinesBackend::new);
-        let sqlite = if use_sqlite {
-            Some(SqliteBackend::new(data_dir)?)
-        } else {
-            None
-        };
+        let sqlite = db.map(SqliteBackend::new).transpose()?;
         let (live, _) = broadcast::channel(LIVE_FEED_CAPACITY);
         Ok(Arc::new(Self { log_file, sqlite, live }))
     }
@@ -168,6 +178,11 @@ impl Store {
     /// receives every entry recorded after it subscribes.
     pub fn subscribe(&self) -> broadcast::Receiver<TrafficEntry> {
         self.live.subscribe()
+    }
+
+    /// The sqlite history, when recording to sqlite.
+    pub fn history(&self) -> Option<&SqliteBackend> {
+        self.sqlite.as_ref()
     }
 
     pub fn record(&self, entry: TrafficEntry) {
@@ -484,7 +499,7 @@ mod tests {
         // The real path: every proxy connection task calls Store::record.
         let dir = TempDir::new().unwrap();
         let log = dir.path().join("traffic.jsonl");
-        let store = Store::new(dir.path(), Some(&log), false).unwrap();
+        let store = Store::new(Some(&log), None).unwrap();
         let tasks: Vec<_> = (0..1000)
             .map(|i| {
                 let store = store.clone();
@@ -530,7 +545,7 @@ mod tests {
     #[test]
     fn sqlite_roundtrip_preserves_all_fields() {
         let dir = TempDir::new().unwrap();
-        let sqlite = SqliteBackend::new(dir.path()).unwrap();
+        let sqlite = SqliteBackend::new(&dir.path().join("traffic.db")).unwrap();
         let jsonl = JsonLinesBackend::new(&dir.path().join("traffic.jsonl"));
         let entry = make_entry("sql-1", "db.example.com", "DELETE", 204);
         sqlite.append(&entry).unwrap();
@@ -559,7 +574,7 @@ mod tests {
     #[test]
     fn sqlite_stores_repeated_headers_encoding_replay_of_and_version() {
         let dir = TempDir::new().unwrap();
-        let sqlite = SqliteBackend::new(dir.path()).unwrap();
+        let sqlite = SqliteBackend::new(&dir.path().join("traffic.db")).unwrap();
         let mut e = make_entry("v3", "h", "GET", 200);
         e.res_headers.append("set-cookie", "a=1");
         e.res_headers.append("set-cookie", "b=2");
@@ -573,6 +588,16 @@ mod tests {
         assert_eq!(enc.as_deref(), Some("base64"));
         assert_eq!(replay_of.as_deref(), Some("orig"));
         assert_eq!(version, Some(SCHEMA_VERSION));
+    }
+
+    #[test]
+    fn sqlite_uses_wal_with_normal_sync() {
+        let dir = TempDir::new().unwrap();
+        let db = SqliteBackend::new(&dir.path().join("traffic.db")).unwrap();
+        let conn = db.conn.lock().unwrap();
+        let mode: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
+        let sync: i64 = conn.query_row("PRAGMA synchronous", [], |r| r.get(0)).unwrap();
+        assert_eq!((mode.as_str(), sync), ("wal", 1), "wal + NORMAL(1)");
     }
 
     #[test]
@@ -591,7 +616,7 @@ mod tests {
             .unwrap();
         }
 
-        let sqlite = SqliteBackend::new(dir.path()).unwrap();
+        let sqlite = SqliteBackend::new(&dir.path().join("traffic.db")).unwrap();
         sqlite.append(&make_entry("new", "h", "GET", 200)).unwrap();
 
         let (h, body, enc, _, version) = sqlite_row(dir.path(), "old");
@@ -624,7 +649,7 @@ mod tests {
     fn record_writes_schema_version_on_every_line() {
         let dir = TempDir::new().unwrap();
         let log = dir.path().join("traffic.jsonl");
-        let store = Store::new(dir.path(), Some(&log), false).unwrap();
+        let store = Store::new(Some(&log), None).unwrap();
         store.record(make_entry("a", "h", "GET", 200));
         store.record(make_entry("b", "h", "GET", 200));
         let content = std::fs::read_to_string(&log).unwrap();
@@ -755,8 +780,7 @@ mod tests {
 
     #[tokio::test]
     async fn record_broadcasts_entry_to_subscriber() {
-        let dir = TempDir::new().unwrap();
-        let store = Store::new(dir.path(), None, false).unwrap();
+        let store = Store::new(None, None).unwrap();
         let mut rx = store.subscribe();
         store.record(make_entry("live-1", "example.com", "GET", 200));
         let got = rx.recv().await.unwrap();
@@ -765,16 +789,14 @@ mod tests {
 
     #[tokio::test]
     async fn record_without_subscribers_does_not_panic() {
-        let dir = TempDir::new().unwrap();
-        let store = Store::new(dir.path(), None, false).unwrap();
+        let store = Store::new(None, None).unwrap();
         // No subscribers: the best-effort send must be a no-op, not a panic.
         store.record(make_entry("no-sub", "example.com", "GET", 200));
     }
 
     #[tokio::test]
     async fn every_subscriber_receives_each_entry() {
-        let dir = TempDir::new().unwrap();
-        let store = Store::new(dir.path(), None, false).unwrap();
+        let store = Store::new(None, None).unwrap();
         let mut rx1 = store.subscribe();
         let mut rx2 = store.subscribe();
         store.record(make_entry("fan-out", "example.com", "GET", 200));
@@ -784,8 +806,7 @@ mod tests {
 
     #[tokio::test]
     async fn subscriber_only_sees_entries_after_it_subscribes() {
-        let dir = TempDir::new().unwrap();
-        let store = Store::new(dir.path(), None, false).unwrap();
+        let store = Store::new(None, None).unwrap();
         store.record(make_entry("before", "example.com", "GET", 200));
         let mut rx = store.subscribe();
         store.record(make_entry("after", "example.com", "GET", 200));

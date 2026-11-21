@@ -3,12 +3,13 @@
 //! endpoint delegates to the same store levers (`query_entries`, `subscribe`)
 //! the CLI and the future in-process MCP handler use.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as PathParam, Query, Request, State};
 use axum::http::header::AUTHORIZATION;
@@ -21,18 +22,15 @@ use serde::Deserialize;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
+use crate::history::{HistoryError, HistoryQuery};
 use crate::replay::{replay_entry, ReplayMods};
-use crate::storage::{
-    load_entries, query_entries, Store, TrafficEntry, TrafficQuery, SCHEMA_VERSION,
-};
+use crate::storage::{SqliteBackend, Store, TrafficEntry, SCHEMA_VERSION};
 
 /// Shared state for the lever API handlers.
 pub struct ApiState {
-    /// Live-feed source; also the process that owns the proxy's runtime state.
+    /// Live-feed source and, via its sqlite backend, the history every
+    /// read endpoint serves. `start --api-listen` always records to sqlite.
     pub store: Arc<Store>,
-    /// JSON-lines history the proxy is writing to, if any. `GET /exchanges`
-    /// reads from here; without it, history is empty (feed-only mode).
-    pub log_path: Option<PathBuf>,
     /// Secret required on every request. The traffic this API exposes and
     /// (soon) replays includes captured credentials, so the surface is
     /// authenticated even on loopback.
@@ -55,6 +53,56 @@ pub fn write_token_file(data_dir: &Path, token: &str) -> Result<PathBuf> {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     }
     Ok(path)
+}
+
+/// Use the token in `path`, or create one there. If the file exists its
+/// contents (trimmed) are the token, so a token kept on a volume survives
+/// restarts. Otherwise a fresh token is written with mode 0600, created that
+/// way so it is never readable by others, even briefly.
+pub fn load_or_create_token_file(path: &Path) -> Result<String> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    match opts.open(path) {
+        Ok(mut f) => {
+            let token = generate_token();
+            f.write_all(token.as_bytes())
+                .with_context(|| format!("writing API token to {}", path.display()))?;
+            Ok(token)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let token = std::fs::read_to_string(path)
+                .with_context(|| format!("reading API token from {}", path.display()))?
+                .trim()
+                .to_string();
+            if token.is_empty() {
+                bail!(
+                    "API token file {} is empty; delete it to have a token generated, or write one into it",
+                    path.display()
+                );
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(path)?.permissions().mode();
+                if mode & 0o077 != 0 {
+                    tracing::warn!(
+                        "API token file {} is readable by group/others (mode {:o}); run `chmod 600` on it",
+                        path.display(),
+                        mode & 0o777
+                    );
+                }
+            }
+            Ok(token)
+        }
+        Err(e) => Err(e).with_context(|| {
+            format!("creating API token file {} (is its directory writable?)", path.display())
+        }),
+    }
 }
 
 /// Build the router. Kept separate from [`serve`] so tests can drive it
@@ -128,30 +176,37 @@ async fn schema() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "schema_version": SCHEMA_VERSION }))
 }
 
-/// `GET /exchanges` — historical traffic, filtered by the query string
-/// (`host`, `method`, `status`, `limit`) via the shared query core.
-async fn exchanges(
-    State(state): State<Arc<ApiState>>,
-    Query(query): Query<TrafficQuery>,
-) -> Json<Vec<TrafficEntry>> {
-    let entries = match &state.log_path {
-        Some(path) => load_entries(path).unwrap_or_default(),
-        None => Vec::new(),
-    };
-    Json(query_entries(entries, &query))
+fn no_history() -> Response {
+    (StatusCode::SERVICE_UNAVAILABLE, "no sqlite history configured").into_response()
 }
 
-/// `GET /exchanges/{id}` — a single captured exchange by id, or 404.
+fn db_error(e: impl std::fmt::Display) -> Response {
+    tracing::warn!("lever API history error: {e}");
+    (StatusCode::INTERNAL_SERVER_ERROR, format!("history error: {e}")).into_response()
+}
+
+/// `GET /exchanges` — history, newest first. Filters: `host`, `method`,
+/// `status`, `q` (URL or host text), `since` / `until` (RFC 3339). Paging:
+/// `limit` (default 100, max 500) and `before=<id>` (the last id of the
+/// previous page). An unknown `before` id is a 404.
+async fn exchanges(State(state): State<Arc<ApiState>>, Query(query): Query<HistoryQuery>) -> Response {
+    let Some(history) = state.store.history() else { return no_history() };
+    match history.query(&query) {
+        Ok(entries) => Json(entries).into_response(),
+        Err(HistoryError::UnknownCursor(id)) => {
+            (StatusCode::NOT_FOUND, format!("unknown cursor: no exchange with id {id}")).into_response()
+        }
+        Err(HistoryError::Db(e)) => db_error(e),
+    }
+}
+
+/// `GET /exchanges/{id}` — a single exchange by id (indexed), or 404.
 async fn exchange(State(state): State<Arc<ApiState>>, PathParam(id): PathParam<String>) -> Response {
-    let found = match &state.log_path {
-        Some(path) => load_entries(path)
-            .ok()
-            .and_then(|entries| entries.into_iter().find(|e| e.id == id)),
-        None => None,
-    };
-    match found {
-        Some(entry) => Json(entry).into_response(),
-        None => (StatusCode::NOT_FOUND, format!("no exchange with id {id}")).into_response(),
+    let Some(history) = state.store.history() else { return no_history() };
+    match history.get(&id) {
+        Ok(Some(entry)) => Json(entry).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, format!("no exchange with id {id}")).into_response(),
+        Err(e) => db_error(e),
     }
 }
 
@@ -171,14 +226,13 @@ struct ReplayRequest {
 /// `POST /replay` — replay a captured exchange by id, record the result as a
 /// new exchange linked via `replay_of`, and return that recorded entry.
 async fn replay(State(state): State<Arc<ApiState>>, Json(req): Json<ReplayRequest>) -> Response {
-    let Some(log_path) = &state.log_path else {
-        return (StatusCode::NOT_FOUND, "no traffic log configured").into_response();
-    };
-    let original = load_entries(log_path)
-        .ok()
-        .and_then(|entries| entries.into_iter().find(|e| e.id == req.id));
-    let Some(original) = original else {
-        return (StatusCode::NOT_FOUND, format!("no exchange with id {}", req.id)).into_response();
+    let Some(history) = state.store.history() else { return no_history() };
+    let original = match history.get(&req.id) {
+        Ok(Some(e)) => e,
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, format!("no exchange with id {}", req.id)).into_response()
+        }
+        Err(e) => return db_error(e),
     };
 
     let mods = ReplayMods {
@@ -192,27 +246,105 @@ async fn replay(State(state): State<Arc<ApiState>>, Json(req): Json<ReplayReques
     }
 }
 
-/// `GET /feed` — WebSocket of entries recorded after the client connects.
-async fn feed(State(state): State<Arc<ApiState>>, ws: WebSocketUpgrade) -> Response {
-    let rx = state.store.subscribe();
-    ws.on_upgrade(move |socket| pump_feed(socket, rx))
+#[derive(Debug, Deserialize)]
+struct FeedParams {
+    /// Resume: first send every entry recorded after this id, then go live.
+    since: Option<String>,
 }
 
-/// Forward each recorded entry to the socket as a JSON text frame. A lagged
-/// subscriber skips the gap rather than stalling the proxy; a closed channel
-/// or a dropped client ends the stream.
-async fn pump_feed(mut socket: WebSocket, mut rx: broadcast::Receiver<TrafficEntry>) {
+/// Backlog page size when replaying `since` history onto the feed.
+const FEED_BACKLOG_PAGE: usize = 500;
+
+/// `GET /feed` — WebSocket of recorded entries.
+///
+/// Every text frame is JSON. A frame is either a [`TrafficEntry`] (the same
+/// JSON as `/exchanges`; it has no `type` key) or a control frame, which
+/// always has a `type`:
+/// - `{"type":"reset","since":"<id>"}`: `since` names no exchange (e.g. the
+///   database was reset). Nothing was replayed; the feed continues live.
+///   Re-sync from `GET /exchanges`.
+/// - `{"type":"lagged","skipped":N}`: this client fell behind and N live
+///   entries were dropped. Reconnect with `?since=<last id received>`.
+///
+/// With `?since=<id>`, entries recorded after `<id>` are sent first, oldest
+/// first, then live entries, with no gap and no duplicates.
+async fn feed(
+    State(state): State<Arc<ApiState>>,
+    Query(params): Query<FeedParams>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    // Subscribe before reading history: anything recorded from here on is
+    // in the channel, and anything recorded earlier is already in sqlite
+    // (record writes sqlite before broadcasting), so nothing falls between.
+    let rx = state.store.subscribe();
+    ws.on_upgrade(move |socket| pump_feed(socket, rx, state, params.since))
+}
+
+async fn send_json(socket: &mut WebSocket, value: &impl serde::Serialize) -> bool {
+    let Ok(text) = serde_json::to_string(value) else { return true };
+    socket.send(Message::Text(text.into())).await.is_ok()
+}
+
+/// Send the `since` backlog, returning the ids sent (so the live phase can
+/// skip entries that arrived in both), or `None` if the client went away.
+async fn send_backlog(socket: &mut WebSocket, history: Option<&SqliteBackend>, since: &str) -> Option<HashSet<String>> {
+    let mut sent = HashSet::new();
+    let start = history.and_then(|h| h.rowid_of(since).ok().flatten());
+    let (Some(history), Some(mut pos)) = (history, start) else {
+        let reset = serde_json::json!({ "type": "reset", "since": since });
+        return send_json(socket, &reset).await.then_some(sent);
+    };
+    loop {
+        let page = match history.after(pos, FEED_BACKLOG_PAGE) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("feed backlog: {e}");
+                return Some(sent);
+            }
+        };
+        if page.is_empty() {
+            return Some(sent);
+        }
+        for (rowid, entry) in page {
+            pos = rowid;
+            if !send_json(socket, &entry).await {
+                return None;
+            }
+            sent.insert(entry.id);
+        }
+    }
+}
+
+async fn pump_feed(
+    mut socket: WebSocket,
+    mut rx: broadcast::Receiver<TrafficEntry>,
+    state: Arc<ApiState>,
+    since: Option<String>,
+) {
+    let mut already_sent = match &since {
+        Some(id) => match send_backlog(&mut socket, state.store.history(), id).await {
+            Some(sent) => sent,
+            None => return,
+        },
+        None => HashSet::new(),
+    };
     loop {
         match rx.recv().await {
             Ok(entry) => {
-                let Ok(text) = serde_json::to_string(&entry) else {
+                // Recorded after subscribing but already sent from history.
+                if already_sent.remove(&entry.id) {
                     continue;
-                };
-                if socket.send(Message::Text(text.into())).await.is_err() {
+                }
+                if !send_json(&mut socket, &entry).await {
                     break;
                 }
             }
-            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                let lagged = serde_json::json!({ "type": "lagged", "skipped": skipped });
+                if !send_json(&mut socket, &lagged).await {
+                    break;
+                }
+            }
             Err(broadcast::error::RecvError::Closed) => break,
         }
     }
@@ -221,7 +353,6 @@ async fn pump_feed(mut socket: WebSocket, mut rx: broadcast::Receiver<TrafficEnt
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::JsonLinesBackend;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use futures_util::StreamExt;
@@ -249,15 +380,18 @@ mod tests {
         }
     }
 
-    fn state_with_log(dir: &TempDir) -> (Arc<ApiState>, PathBuf) {
-        let log = dir.path().join("traffic.jsonl");
-        let store = Store::new(dir.path(), Some(&log), false).unwrap();
-        let state = Arc::new(ApiState {
-            store,
-            log_path: Some(log.clone()),
-            token: TEST_TOKEN.to_string(),
-        });
-        (state, log)
+    /// Writes straight into the API's sqlite history (no stdout/feed).
+    struct Hist(Arc<Store>);
+    impl Hist {
+        fn append(&self, e: &TrafficEntry) -> Result<()> {
+            self.0.history().unwrap().append(e)
+        }
+    }
+
+    fn state_with_db(dir: &TempDir) -> (Arc<ApiState>, Hist) {
+        let store = Store::new(None, Some(&dir.path().join("traffic.db"))).unwrap();
+        let state = Arc::new(ApiState { store: store.clone(), token: TEST_TOKEN.to_string() });
+        (state, Hist(store))
     }
 
     /// A GET request carrying the valid bearer token.
@@ -278,7 +412,7 @@ mod tests {
     #[tokio::test]
     async fn request_without_token_is_unauthorized() {
         let dir = TempDir::new().unwrap();
-        let (state, _) = state_with_log(&dir);
+        let (state, _) = state_with_db(&dir);
         let resp = router(state)
             .oneshot(Request::get("/schema").body(Body::empty()).unwrap())
             .await
@@ -289,7 +423,7 @@ mod tests {
     #[tokio::test]
     async fn request_with_wrong_token_is_unauthorized() {
         let dir = TempDir::new().unwrap();
-        let (state, _) = state_with_log(&dir);
+        let (state, _) = state_with_db(&dir);
         let resp = router(state)
             .oneshot(
                 Request::get("/schema")
@@ -306,7 +440,7 @@ mod tests {
     async fn token_via_query_param_is_accepted() {
         // The WebSocket-compatible path a browser SPA must use.
         let dir = TempDir::new().unwrap();
-        let (state, _) = state_with_log(&dir);
+        let (state, _) = state_with_db(&dir);
         let resp = router(state)
             .oneshot(
                 Request::get(format!("/schema?token={TEST_TOKEN}"))
@@ -358,7 +492,7 @@ mod tests {
     #[tokio::test]
     async fn schema_endpoint_reports_version() {
         let dir = TempDir::new().unwrap();
-        let (state, _) = state_with_log(&dir);
+        let (state, _) = state_with_db(&dir);
         let resp = router(state).oneshot(authed_get("/schema")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let json = body_json(resp).await;
@@ -368,8 +502,8 @@ mod tests {
     #[tokio::test]
     async fn exchanges_returns_filtered_history() {
         let dir = TempDir::new().unwrap();
-        let (state, log) = state_with_log(&dir);
-        let backend = JsonLinesBackend::new(&log);
+        let (state, log) = state_with_db(&dir);
+        let backend = &log;
         backend.append(&entry("a", "api.example.com", "GET", 200)).unwrap();
         backend.append(&entry("b", "api.example.com", "POST", 201)).unwrap();
         backend.append(&entry("c", "other.io", "GET", 404)).unwrap();
@@ -380,14 +514,14 @@ mod tests {
             .unwrap();
         let json = body_json(resp).await;
         let ids: Vec<&str> = json.as_array().unwrap().iter().map(|e| e["id"].as_str().unwrap()).collect();
-        assert_eq!(ids, ["a", "c"]);
+        assert_eq!(ids, ["c", "a"], "newest first");
     }
 
     #[tokio::test]
     async fn exchange_by_id_returns_the_entry() {
         let dir = TempDir::new().unwrap();
-        let (state, log) = state_with_log(&dir);
-        let backend = JsonLinesBackend::new(&log);
+        let (state, log) = state_with_db(&dir);
+        let backend = &log;
         backend.append(&entry("a", "x.com", "GET", 200)).unwrap();
         backend.append(&entry("b", "y.com", "POST", 201)).unwrap();
 
@@ -401,27 +535,138 @@ mod tests {
     #[tokio::test]
     async fn exchange_by_id_unknown_is_not_found() {
         let dir = TempDir::new().unwrap();
-        let (state, log) = state_with_log(&dir);
-        JsonLinesBackend::new(&log).append(&entry("a", "x.com", "GET", 200)).unwrap();
+        let (state, log) = state_with_db(&dir);
+        log.append(&entry("a", "x.com", "GET", 200)).unwrap();
 
         let resp = router(state).oneshot(authed_get("/exchanges/missing")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
-    async fn exchanges_without_log_is_empty() {
+    async fn history_endpoints_without_sqlite_are_unavailable() {
+        let store = Store::new(None, None).unwrap();
+        let state = Arc::new(ApiState { store, token: TEST_TOKEN.to_string() });
+        for path in ["/exchanges", "/exchanges/x"] {
+            let resp = router(state.clone()).oneshot(authed_get(path)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        }
+    }
+
+    // --- history paging / search ---
+
+    #[tokio::test]
+    async fn exchanges_pages_back_with_before_cursor() {
         let dir = TempDir::new().unwrap();
-        let store = Store::new(dir.path(), None, false).unwrap();
-        let state = Arc::new(ApiState { store, log_path: None, token: TEST_TOKEN.to_string() });
-        let resp = router(state).oneshot(authed_get("/exchanges")).await.unwrap();
-        let json = body_json(resp).await;
-        assert_eq!(json.as_array().unwrap().len(), 0);
+        let (state, log) = state_with_db(&dir);
+        for i in 0..7 {
+            log.append(&entry(&format!("e{i}"), "x.com", "GET", 200)).unwrap();
+        }
+        let page = |q: String| {
+            let state = state.clone();
+            async move {
+                let json = body_json(router(state).oneshot(authed_get(&q)).await.unwrap()).await;
+                json.as_array().unwrap().iter().map(|e| e["id"].as_str().unwrap().to_string()).collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(page("/exchanges?limit=3".into()).await, ["e6", "e5", "e4"]);
+        assert_eq!(page("/exchanges?limit=3&before=e4".into()).await, ["e3", "e2", "e1"]);
+        assert_eq!(page("/exchanges?limit=3&before=e1".into()).await, ["e0"]);
+    }
+
+    #[tokio::test]
+    async fn exchanges_unknown_cursor_is_not_found() {
+        let dir = TempDir::new().unwrap();
+        let (state, _) = state_with_db(&dir);
+        let resp = router(state).oneshot(authed_get("/exchanges?before=gone")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn exchanges_text_search_and_time_range() {
+        let dir = TempDir::new().unwrap();
+        let (state, log) = state_with_db(&dir);
+        let mut a = entry("a", "api.example.com", "GET", 200);
+        a.url = "https://api.example.com/login".into();
+        a.ts = "2026-01-01T00:00:00Z".parse().unwrap();
+        let mut b = entry("b", "api.example.com", "GET", 200);
+        b.url = "https://api.example.com/login?next=1".into();
+        b.ts = "2026-06-01T00:00:00Z".parse().unwrap();
+        log.append(&a).unwrap();
+        log.append(&b).unwrap();
+        log.append(&entry("c", "other.io", "GET", 200)).unwrap();
+
+        let json = body_json(router(state.clone()).oneshot(authed_get("/exchanges?q=login")).await.unwrap()).await;
+        assert_eq!(json.as_array().unwrap().len(), 2);
+        let json = body_json(
+            router(state)
+                .oneshot(authed_get("/exchanges?q=login&since=2026-03-01T00:00:00Z"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(json[0]["id"], "b");
+        assert_eq!(json.as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn exchanges_return_v3_entries() {
+        let dir = TempDir::new().unwrap();
+        let (state, log) = state_with_db(&dir);
+        let mut e = entry("v3", "h", "GET", 200);
+        e.res_headers.append("set-cookie", "a=1");
+        e.res_headers.append("set-cookie", "b=2");
+        log.append(&e).unwrap();
+        let json = body_json(router(state).oneshot(authed_get("/exchanges/v3")).await.unwrap()).await;
+        let back: TrafficEntry = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(back, e);
+        assert_eq!(json["schema_version"], SCHEMA_VERSION);
+    }
+
+    // --- token file ---
+
+    #[test]
+    fn token_file_is_created_owner_only_and_reused() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("api-token");
+        let first = load_or_create_token_file(&path).unwrap();
+        assert!(!first.is_empty());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        // A restart with the file kept gets the same token.
+        assert_eq!(load_or_create_token_file(&path).unwrap(), first);
+    }
+
+    #[test]
+    fn token_file_with_contents_is_used_trimmed() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("api-token");
+        std::fs::write(&path, "provisioned-token\n").unwrap();
+        assert_eq!(load_or_create_token_file(&path).unwrap(), "provisioned-token");
+    }
+
+    #[test]
+    fn empty_token_file_is_an_error_that_says_what_to_do() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("api-token");
+        std::fs::write(&path, "  \n").unwrap();
+        let err = load_or_create_token_file(&path).unwrap_err().to_string();
+        assert!(err.contains("empty") && err.contains("delete it"), "{err}");
+    }
+
+    #[test]
+    fn token_file_in_missing_directory_errors() {
+        let dir = TempDir::new().unwrap();
+        assert!(load_or_create_token_file(&dir.path().join("no/such/dir/tok")).is_err());
     }
 
     #[tokio::test]
     async fn feed_streams_entries_recorded_after_connect() {
         let dir = TempDir::new().unwrap();
-        let (state, _) = state_with_log(&dir);
+        let (state, _) = state_with_db(&dir);
         let store = state.store.clone();
 
         // Real server on an ephemeral port.
@@ -459,10 +704,10 @@ mod tests {
         });
 
         let dir = TempDir::new().unwrap();
-        let (state, log) = state_with_log(&dir);
+        let (state, log) = state_with_db(&dir);
         let mut original = entry("orig-99", &format!("127.0.0.1:{uport}"), "GET", 200);
         original.url = format!("http://127.0.0.1:{uport}/");
-        JsonLinesBackend::new(&log).append(&original).unwrap();
+        log.append(&original).unwrap();
 
         let req = Request::post("/replay")
             .header(AUTHORIZATION, format!("Bearer {TEST_TOKEN}"))
@@ -482,7 +727,7 @@ mod tests {
     #[tokio::test]
     async fn replay_endpoint_unknown_id_is_not_found() {
         let dir = TempDir::new().unwrap();
-        let (state, _) = state_with_log(&dir);
+        let (state, _) = state_with_db(&dir);
         let req = Request::post("/replay")
             .header(AUTHORIZATION, format!("Bearer {TEST_TOKEN}"))
             .header("content-type", "application/json")
@@ -495,7 +740,7 @@ mod tests {
     #[tokio::test]
     async fn replay_endpoint_requires_token() {
         let dir = TempDir::new().unwrap();
-        let (state, _) = state_with_log(&dir);
+        let (state, _) = state_with_db(&dir);
         let req = Request::post("/replay")
             .header("content-type", "application/json")
             .body(Body::from(r#"{"id":"orig-99"}"#))
@@ -504,10 +749,115 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
+    /// Serve the router on an ephemeral port; returns its address.
+    async fn serve_test(state: Arc<ApiState>) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
+        addr
+    }
+
+    type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+    async fn next_json(ws: &mut Ws) -> serde_json::Value {
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+            .await
+            .expect("feed frame within 5s")
+            .unwrap()
+            .unwrap();
+        serde_json::from_str(msg.to_text().unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn feed_since_sends_backlog_then_live() {
+        let dir = TempDir::new().unwrap();
+        let (state, _) = state_with_db(&dir);
+        let store = state.store.clone();
+        for i in 0..5 {
+            store.record(entry(&format!("e{i}"), "h", "GET", 200));
+        }
+        let addr = serve_test(state).await;
+        let (mut ws, _) =
+            tokio_tungstenite::connect_async(format!("ws://{addr}/feed?since=e1&token={TEST_TOKEN}"))
+                .await
+                .unwrap();
+        for want in ["e2", "e3", "e4"] {
+            assert_eq!(next_json(&mut ws).await["id"], want);
+        }
+        store.record(entry("e5", "h", "GET", 200));
+        assert_eq!(next_json(&mut ws).await["id"], "e5", "then live");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn feed_since_has_no_gap_and_no_duplicates_while_traffic_arrives() {
+        let dir = TempDir::new().unwrap();
+        let (state, _) = state_with_db(&dir);
+        let store = state.store.clone();
+        for i in 0..1200 {
+            store.record(entry(&format!("old{i}"), "h", "GET", 200));
+        }
+        let addr = serve_test(state).await;
+
+        // Keep recording while the client connects and drains its backlog,
+        // so entries land in both history and the live channel.
+        let recorder = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                for i in 0..400 {
+                    store.record(entry(&format!("new{i}"), "h", "GET", 200));
+                    if i % 20 == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                }
+            })
+        };
+        let (mut ws, _) =
+            tokio_tungstenite::connect_async(format!("ws://{addr}/feed?since=old99&token={TEST_TOKEN}"))
+                .await
+                .unwrap();
+        recorder.await.unwrap();
+        store.record(entry("end", "h", "GET", 200));
+
+        let mut got = Vec::new();
+        loop {
+            let frame = next_json(&mut ws).await;
+            assert!(frame.get("type").is_none(), "unexpected control frame {frame}");
+            let id = frame["id"].as_str().unwrap().to_string();
+            if id == "end" {
+                break;
+            }
+            got.push(id);
+        }
+        let expected: Vec<String> = (100..1200)
+            .map(|i| format!("old{i}"))
+            .chain((0..400).map(|i| format!("new{i}")))
+            .collect();
+        assert_eq!(got.len(), expected.len(), "no gaps and no duplicates");
+        assert_eq!(got, expected, "in record order");
+    }
+
+    #[tokio::test]
+    async fn feed_since_unknown_id_sends_reset_then_live() {
+        let dir = TempDir::new().unwrap();
+        let (state, _) = state_with_db(&dir);
+        let store = state.store.clone();
+        store.record(entry("e0", "h", "GET", 200));
+        let addr = serve_test(state).await;
+        let (mut ws, _) =
+            tokio_tungstenite::connect_async(format!("ws://{addr}/feed?since=wiped&token={TEST_TOKEN}"))
+                .await
+                .unwrap();
+        let reset = next_json(&mut ws).await;
+        assert_eq!(reset["type"], "reset");
+        assert_eq!(reset["since"], "wiped");
+        store.record(entry("e1", "h", "GET", 200));
+        assert_eq!(next_json(&mut ws).await["id"], "e1");
+    }
+
     #[tokio::test]
     async fn feed_rejects_connection_without_token() {
         let dir = TempDir::new().unwrap();
-        let (state, _) = state_with_log(&dir);
+        let (state, _) = state_with_db(&dir);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {

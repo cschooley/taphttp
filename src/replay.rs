@@ -148,7 +148,7 @@ pub async fn run(args: ReplayArgs, data_dir: PathBuf) -> Result<()> {
     eprintln!("Replaying {} {}", original.method, original.url);
 
     // Record the replay into the same JSON-lines log the original came from.
-    let store = Store::new(&data_dir, Some(&log_path), false)?;
+    let store = Store::new(Some(&log_path), None)?;
     let replay = replay_entry(&store, original, &mods).await?;
 
     // Human-readable summary to stderr; the recorded JSON line (emitted by the
@@ -237,7 +237,7 @@ mod tests {
         let port = start_capture_server(hit.clone()).await;
         let dir = TempDir::new().unwrap();
         let log = dir.path().join("traffic.jsonl");
-        let store = Store::new(dir.path(), Some(&log), false).unwrap();
+        let store = Store::new(Some(&log), None).unwrap();
 
         let replay = replay_entry(&store, upstream_entry("orig-1", port, "GET"), &ReplayMods::default())
             .await
@@ -307,7 +307,7 @@ mod tests {
         let port = start_recording_server(seen.clone()).await;
         let dir = TempDir::new().unwrap();
         let log = dir.path().join("traffic.jsonl");
-        let store = Store::new(dir.path(), Some(&log), false).unwrap();
+        let store = Store::new(Some(&log), None).unwrap();
 
         let body: &[u8] = &[0x1f, 0x8b, 0x08, 0x00, 0xff, 0xfe];
         let mut original = upstream_entry("bin-1", port, "POST");
@@ -339,8 +339,7 @@ mod tests {
     async fn replay_header_override_replaces_every_value_for_that_name() {
         let seen: Seen = Default::default();
         let port = start_recording_server(seen.clone()).await;
-        let dir = TempDir::new().unwrap();
-        let store = Store::new(dir.path(), None, false).unwrap();
+        let store = Store::new(None, None).unwrap();
 
         let mut original = upstream_entry("ovr-1", port, "GET");
         original.req_headers.append("cookie", "a=1");
@@ -362,7 +361,7 @@ mod tests {
         let hit = Arc::new(AtomicBool::new(false));
         let port = start_capture_server(hit.clone()).await;
         let dir = TempDir::new().unwrap();
-        let store = Store::new(dir.path(), Some(&dir.path().join("traffic.jsonl")), false).unwrap();
+        let store = Store::new(Some(&dir.path().join("traffic.jsonl")), None).unwrap();
 
         let mods = ReplayMods { method: Some("post".to_string()), ..Default::default() };
         let replay = replay_entry(&store, upstream_entry("orig-2", port, "GET"), &mods)

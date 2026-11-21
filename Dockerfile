@@ -21,14 +21,20 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/* \
  && groupadd --system --gid 10001 taphttp \
  && useradd --system --uid 10001 --gid taphttp --no-create-home taphttp \
- && mkdir -p /data /ca \
- && chown taphttp:taphttp /data /ca
+ && mkdir -p /data /ca /token \
+ && chown taphttp:taphttp /data /ca /token
 COPY --from=build /usr/local/bin/taphttp /usr/local/bin/taphttp
 USER taphttp
 # The CA cert and key live in /ca, on their own volume. Never share it with
 # the traffic log volume (/data): consumers mount that one.
 ENV TAPHTTP_DATA=/ca
-VOLUME ["/ca", "/data"]
+# When sqlite is on (--sqlite / --api-listen), keep the database beside the
+# log rather than beside ca.key.
+ENV TAPHTTP_DB=/data/traffic.db
+# With --api-listen, the lever API token lives on its own volume (/token),
+# which consumers mount read-only. It survives restarts and isn't printed.
+ENV TAPHTTP_API_TOKEN_FILE=/token/api-token
+VOLUME ["/ca", "/data", "/token"]
 EXPOSE 8080
 ENTRYPOINT ["taphttp"]
 CMD ["start", "--listen", "0.0.0.0:8080", "--log-file", "/data/traffic.jsonl"]
