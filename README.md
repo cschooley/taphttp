@@ -36,6 +36,41 @@ cargo build --release
 # binary at ./target/release/taphttp
 ```
 
+### Docker
+
+```sh
+docker build -t taphttp .
+docker run --rm -e RUST_LOG=info \
+  -p 127.0.0.1:8080:8080 \
+  -v taphttp-ca:/ca -v taphttp-data:/data \
+  taphttp
+```
+
+Or from compose, straight from the repo:
+
+```yaml
+services:
+  taphttp:
+    build: https://github.com/cschooley/taphttp.git#<tag>
+    ports: ["127.0.0.1:8080:8080"]
+    environment: { RUST_LOG: info }
+    volumes: [taphttp-ca:/ca, taphttp-data:/data]
+```
+
+- **Publish the port on `127.0.0.1` only** (`-p 127.0.0.1:8080:8080`), never
+  broader. taphttp is an open proxy. It listens on `0.0.0.0` inside the
+  container, and that's safe only because the published port is loopback.
+- The container runs as uid/gid `10001`, so a named volume can be shared with
+  another container running as the same uid.
+- `/ca` (`TAPHTTP_DATA`) holds the CA cert **and private key**. Keep it on its
+  own volume. Mount only `/data` (the traffic log, `/data/traffic.jsonl`) into
+  consumers.
+- Set `RUST_LOG=info` to see a log line per request on stderr. Without it,
+  only errors are shown.
+- Arguments after the image name replace the default command
+  (`start --listen 0.0.0.0:8080 --log-file /data/traffic.jsonl`). For example:
+  `docker run --rm -v taphttp-ca:/ca taphttp ca print`.
+
 ---
 
 ## Quick start
