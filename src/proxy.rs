@@ -81,6 +81,7 @@ fn tls_names(names: &[String], listeners: &[Option<SocketAddr>]) -> Result<Vec<S
 }
 
 pub async fn run(args: StartArgs, data_dir: PathBuf) -> Result<()> {
+    let started_at = Timestamp::now();
     // Decide what may be exposed before binding anything.
     let addr: SocketAddr = args.listen.parse().context("invalid listen address")?;
     let api_addr: Option<SocketAddr> = args
@@ -164,10 +165,26 @@ pub async fn run(args: StartArgs, data_dir: PathBuf) -> Result<()> {
     }
     let store = Store::new(args.log_file.as_deref(), db.as_deref())?;
     let listener = TcpListener::bind(addr).await.context("binding listener")?;
+    let api_listener = match api_addr {
+        Some(a) => Some(TcpListener::bind(a).await.context("binding lever API")?),
+        None => None,
+    };
 
     // Optionally serve the lever API alongside the proxy, sharing the same
     // live Store so its /feed carries real traffic as it is recorded.
-    if let Some(api_addr) = api_addr {
+    if let Some(api_listener) = api_listener {
+        // /info reports where things actually listen (a port of 0 in
+        // --listen becomes the real one).
+        let mut described = info;
+        described.exposure.proxy = Some(listener.local_addr()?);
+        described.exposure.api = Some(api_listener.local_addr()?);
+        let history = deploy::HistoryInfo {
+            sqlite: db.is_some(),
+            log_file: args.log_file.is_some(),
+        };
+        let deployment =
+            deploy::deployment_info(&described, ca.public_info()?, history, started_at)
+                .context("describing the deployment for /info")?;
         let token = match &args.api_token_file {
             // From a file: print only where it is, so it stays out of logs.
             Some(path) => {
@@ -186,6 +203,7 @@ pub async fn run(args: StartArgs, data_dir: PathBuf) -> Result<()> {
         let state = Arc::new(crate::api::ApiState {
             store: store.clone(),
             token,
+            info: deployment,
         });
         let api_tls = if args.api_tls {
             listener_tls.clone()
@@ -193,7 +211,7 @@ pub async fn run(args: StartArgs, data_dir: PathBuf) -> Result<()> {
             None
         };
         tokio::spawn(async move {
-            if let Err(e) = crate::api::serve(state, api_addr, api_tls).await {
+            if let Err(e) = crate::api::serve(state, api_listener, api_tls).await {
                 tracing::error!("lever API exited: {e}");
             }
         });

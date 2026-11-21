@@ -9,6 +9,18 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+/// What anyone may know about the CA: the public certificate's subject,
+/// pin and validity. Nothing derived from the key.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CaPublicInfo {
+    /// The subject DN, e.g. `CN=taphttp local CA, O=taphttp`.
+    pub subject: String,
+    /// [`Ca::fingerprint_sha256`], as the startup banner shows it.
+    pub sha256: String,
+    pub not_before: taphttp_types::Timestamp,
+    pub not_after: taphttp_types::Timestamp,
+}
+
 pub struct Ca {
     /// Signs leaves: the CA's subject and key identifier, read from ca.crt,
     /// plus its private key.
@@ -91,6 +103,25 @@ impl Ca {
             .map(|b| format!("{b:02X}"))
             .collect::<Vec<_>>()
             .join(":")
+    }
+
+    /// The public details of `ca.crt`, read from the certificate itself.
+    pub fn public_info(&self) -> Result<CaPublicInfo> {
+        let (_, cert) = x509_parser::parse_x509_certificate(&self.disk_der)
+            .map_err(|e| anyhow::anyhow!("parsing ca.crt: {e}"))?;
+        let time = |t: x509_parser::time::ASN1Time| {
+            t.timestamp()
+                .checked_mul(1_000_000)
+                .and_then(taphttp_types::Timestamp::from_unix_micros)
+                .context("ca.crt validity is out of range")
+        };
+        let validity = cert.validity();
+        Ok(CaPublicInfo {
+            subject: cert.subject().to_string(),
+            sha256: self.fingerprint_sha256(),
+            not_before: time(validity.not_before)?,
+            not_after: time(validity.not_after)?,
+        })
     }
 
     /// TLS config for taphttp's own listeners (the HTTPS proxy, the lever
@@ -294,6 +325,43 @@ mod tests {
             .unwrap();
         let want = ring::digest::digest(&ring::digest::SHA256, &der);
         assert!(a.starts_with(&format!("{:02X}:", want.as_ref()[0])));
+    }
+
+    #[test]
+    fn public_info_describes_a_generated_ca() {
+        let dir = TempDir::new().unwrap();
+        let ca = Ca::load_or_create(dir.path()).unwrap();
+        let info = ca.public_info().unwrap();
+        assert_eq!(info.subject, "CN=taphttp local CA, O=taphttp");
+        assert_eq!(info.sha256, ca.fingerprint_sha256());
+        assert_eq!(info.not_before.to_string(), "2024-01-01T00:00:00Z");
+        assert_eq!(info.not_after.to_string(), "2035-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn public_info_is_read_from_ca_crt_not_assumed() {
+        // A CA taphttp didn't make: other subject, other dates.
+        let dir = TempDir::new().unwrap();
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::default();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::OrganizationName, "Acme Test");
+        dn.push(DnType::CommonName, "Acme Interception CA");
+        params.distinguished_name = dn;
+        params.not_before = rcgen::date_time_ymd(2025, 3, 4);
+        params.not_after = rcgen::date_time_ymd(2030, 5, 6);
+        let cert = params.self_signed(&key).unwrap();
+        std::fs::write(dir.path().join("ca.crt"), cert.pem()).unwrap();
+        std::fs::write(dir.path().join("ca.key"), key.serialize_pem()).unwrap();
+
+        let ca = Ca::load_or_create(dir.path()).unwrap();
+        let info = ca.public_info().unwrap();
+        assert_eq!(info.subject, "O=Acme Test, CN=Acme Interception CA");
+        assert_eq!(info.not_before.to_string(), "2025-03-04T00:00:00Z");
+        assert_eq!(info.not_after.to_string(), "2030-05-06T00:00:00Z");
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(!json.contains("PRIVATE"), "{json}");
     }
 
     /// A leaf for `name` from `ca`, checked by a client that trusts only

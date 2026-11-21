@@ -296,12 +296,51 @@ Where the token comes from:
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/schema` | `{ "schema_version": N }` — the traffic-entry contract to pin against |
+| `GET` | `/info` | This deployment: version, listeners, auth mode, expiry, CA public details (below) |
 | `GET` | `/exchanges` | History, newest first, paged and filtered (below) |
 | `GET` | `/exchanges/{id}` | A single exchange by `id`, or `404` |
 | `POST` | `/replay` | Replay a captured exchange; records the result linked via `replay_of` |
 | `GET` | `/feed` | WebSocket stream of exchanges as they are recorded; resumable with `?since=` |
 
 Entries are `taphttp_types::TrafficEntry` JSON (current schema), the same as log lines.
+
+#### `GET /info`
+
+What this instance is, for a status view. Public details only: never the CA
+key, the API token, proxy credentials or usernames, or filesystem paths.
+
+```json
+{
+  "taphttp_version": "0.5.0",
+  "schema_version": 5,
+  "started_at": "2026-11-21T20:39:05.908Z",
+  "expires_at": null,
+  "proxy": {
+    "listen": "0.0.0.0:8080",
+    "tls": false,
+    "auth": "none",
+    "allow_open_proxy": true,
+    "allow_client": []
+  },
+  "api": { "listen": "0.0.0.0:8081", "tls": false },
+  "ca": {
+    "subject": "CN=taphttp local CA, O=taphttp",
+    "sha256": "EB:6F:71:…:3A",
+    "not_before": "2024-01-01T00:00:00Z",
+    "not_after": "2035-01-01T00:00:00Z"
+  },
+  "history": { "sqlite": true, "log_file": false }
+}
+```
+
+- `listen` is the address actually bound (a `:0` port is resolved).
+- `proxy.auth` is `"basic"` when `--proxy-auth-file` / `TAPHTTP_PROXY_AUTH`
+  is set, so `source` is authenticated; `"none"` means usernames are
+  unverified labels.
+- `ca.sha256` is the same pin the startup banner prints. The CA fields are
+  read from `ca.crt`.
+- `expires_at` is `--expires`, or `null`.
+- New fields may be added; ignore ones you don't know.
 
 #### `GET /exchanges`
 

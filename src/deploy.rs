@@ -381,6 +381,92 @@ pub fn banner(b: &BannerInfo) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// GET /info
+// ---------------------------------------------------------------------------
+
+/// The lever API's `GET /info`: what this deployment is, for a status view.
+/// Public details only. Never the CA key, the API token, proxy credentials
+/// or usernames, or filesystem paths.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DeploymentInfo {
+    pub taphttp_version: &'static str,
+    pub schema_version: u32,
+    pub started_at: Timestamp,
+    pub expires_at: Option<Timestamp>,
+    pub proxy: ProxyInfo,
+    pub api: ListenerInfo,
+    pub ca: crate::ca::CaPublicInfo,
+    pub history: HistoryInfo,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProxyInfo {
+    pub listen: SocketAddr,
+    pub tls: bool,
+    pub auth: ProxyAuth,
+    pub allow_open_proxy: bool,
+    /// `--allow-client` CIDRs; empty allows everyone.
+    pub allow_client: Vec<String>,
+}
+
+/// Whether `source` is verified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProxyAuth {
+    /// No credentials configured: usernames are unverified labels.
+    None,
+    /// Credentials configured: `source` is the authenticated user.
+    Basic,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ListenerInfo {
+    pub listen: SocketAddr,
+    pub tls: bool,
+}
+
+/// Where traffic is recorded, as booleans (paths are not exposed).
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct HistoryInfo {
+    pub sqlite: bool,
+    pub log_file: bool,
+}
+
+/// `/info` for the deployment `b` describes (the same facts as the
+/// banner). `None` without both a proxy and an API listener.
+pub fn deployment_info(
+    b: &BannerInfo,
+    ca: crate::ca::CaPublicInfo,
+    history: HistoryInfo,
+    started_at: Timestamp,
+) -> Option<DeploymentInfo> {
+    let e = &b.exposure;
+    Some(DeploymentInfo {
+        taphttp_version: env!("CARGO_PKG_VERSION"),
+        schema_version: taphttp_types::SCHEMA_VERSION,
+        started_at,
+        expires_at: b.expires,
+        proxy: ProxyInfo {
+            listen: e.proxy?,
+            tls: e.proxy_tls,
+            auth: if e.proxy_auth {
+                ProxyAuth::Basic
+            } else {
+                ProxyAuth::None
+            },
+            allow_open_proxy: e.allow_open_proxy,
+            allow_client: b.allow_clients.iter().map(ToString::to_string).collect(),
+        },
+        api: ListenerInfo {
+            listen: e.api?,
+            tls: e.api_tls,
+        },
+        ca,
+        history,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -730,5 +816,107 @@ mod tests {
                 && local.contains("expires: never"),
             "{local}"
         );
+    }
+
+    // --- /info ---
+
+    fn ca_info() -> crate::ca::CaPublicInfo {
+        crate::ca::CaPublicInfo {
+            subject: "CN=taphttp local CA, O=taphttp".into(),
+            sha256: "AB:CD".into(),
+            not_before: "2024-01-01T00:00:00Z".parse().unwrap(),
+            not_after: "2035-01-01T00:00:00Z".parse().unwrap(),
+        }
+    }
+
+    #[test]
+    fn deployment_info_reports_listeners_auth_and_history() {
+        let started: Timestamp = "2026-11-21T20:39:05.908Z".parse().unwrap();
+        let b = BannerInfo {
+            exposure: Exposure {
+                proxy: addr("0.0.0.0:8443"),
+                proxy_tls: true,
+                proxy_auth: true,
+                api: addr("10.0.0.5:8081"),
+                api_tls: true,
+                ..Default::default()
+            },
+            allow_clients: vec!["10.0.0.0/8".parse().unwrap(), "::1/128".parse().unwrap()],
+            proxy_users: 2,
+            expires: Some("2026-11-22T08:00:00Z".parse().unwrap()),
+            ca_fingerprint: "AB:CD".into(),
+        };
+        let history = HistoryInfo {
+            sqlite: true,
+            log_file: false,
+        };
+        let info = deployment_info(&b, ca_info(), history, started).unwrap();
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "taphttp_version": env!("CARGO_PKG_VERSION"),
+                "schema_version": taphttp_types::SCHEMA_VERSION,
+                "started_at": "2026-11-21T20:39:05.908Z",
+                "expires_at": "2026-11-22T08:00:00Z",
+                "proxy": {
+                    "listen": "0.0.0.0:8443",
+                    "tls": true,
+                    "auth": "basic",
+                    "allow_open_proxy": false,
+                    "allow_client": ["10.0.0.0/8", "::1/128"],
+                },
+                "api": {"listen": "10.0.0.5:8081", "tls": true},
+                "ca": {
+                    "subject": "CN=taphttp local CA, O=taphttp",
+                    "sha256": "AB:CD",
+                    "not_before": "2024-01-01T00:00:00Z",
+                    "not_after": "2035-01-01T00:00:00Z",
+                },
+                "history": {"sqlite": true, "log_file": false},
+            })
+        );
+    }
+
+    #[test]
+    fn deployment_info_without_credentials_is_auth_none() {
+        let b = BannerInfo {
+            exposure: Exposure {
+                proxy: addr("0.0.0.0:8080"),
+                allow_open_proxy: true,
+                api: addr("127.0.0.1:8081"),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let history = HistoryInfo {
+            sqlite: true,
+            log_file: true,
+        };
+        let json = serde_json::to_value(
+            deployment_info(&b, ca_info(), history, Timestamp::now()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(json["proxy"]["auth"], "none");
+        assert_eq!(json["proxy"]["allow_open_proxy"], true);
+        assert_eq!(json["proxy"]["allow_client"], serde_json::json!([]));
+        assert_eq!(json["expires_at"], serde_json::Value::Null);
+        assert_eq!(json["api"]["tls"], false);
+    }
+
+    #[test]
+    fn deployment_info_needs_both_listeners() {
+        let b = BannerInfo {
+            exposure: Exposure {
+                proxy: addr("127.0.0.1:8080"),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let history = HistoryInfo {
+            sqlite: false,
+            log_file: false,
+        };
+        assert!(deployment_info(&b, ca_info(), history, Timestamp::now()).is_none());
     }
 }

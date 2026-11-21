@@ -5,7 +5,6 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -22,6 +21,7 @@ use serde::Deserialize;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
+use crate::deploy::DeploymentInfo;
 use crate::history::{HistoryError, HistoryQuery};
 use crate::replay::{replay_entry, ReplayError, ReplayMods};
 use crate::storage::{Headers, SqliteBackend, Store, TrafficEntry, SCHEMA_VERSION};
@@ -36,6 +36,8 @@ pub struct ApiState {
     /// (soon) replays includes captured credentials, so the surface is
     /// authenticated even on loopback.
     pub token: String,
+    /// What `GET /info` reports.
+    pub info: DeploymentInfo,
 }
 
 /// Generate a fresh random API token (122 bits from a v4 UUID).
@@ -114,6 +116,7 @@ pub fn load_or_create_token_file(path: &Path) -> Result<String> {
 pub fn router(state: Arc<ApiState>) -> Router {
     Router::new()
         .route("/schema", get(schema))
+        .route("/info", get(info))
         .route("/exchanges", get(exchanges))
         .route("/exchanges/{id}", get(exchange))
         .route("/feed", get(feed))
@@ -167,14 +170,13 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 
-/// Bind `addr` and serve the lever API until the process exits, over TLS
+/// Serve the lever API on `listener` until the process exits, over TLS
 /// when `tls` is given.
 pub async fn serve(
     state: Arc<ApiState>,
-    addr: SocketAddr,
+    listener: tokio::net::TcpListener,
     tls: Option<Arc<rustls::ServerConfig>>,
 ) -> Result<()> {
-    let listener = tokio::net::TcpListener::bind(addr).await?;
     let bound = listener.local_addr()?;
     let scheme = if tls.is_some() { "https" } else { "http" };
     tracing::info!("lever API listening on {scheme}://{bound}");
@@ -225,6 +227,12 @@ async fn serve_tls(
 /// `GET /schema` — the schema contract the SPA and MCP pin against.
 async fn schema() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "schema_version": SCHEMA_VERSION }))
+}
+
+/// `GET /info` — this deployment's version, listeners, auth mode, expiry,
+/// CA public details and history backends. No secrets and no paths.
+async fn info(State(state): State<Arc<ApiState>>) -> Json<DeploymentInfo> {
+    Json(state.info.clone())
 }
 
 fn no_history() -> Response {
@@ -463,6 +471,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use futures_util::StreamExt;
+    use std::net::SocketAddr;
     use tempfile::TempDir;
     use tower::ServiceExt; // for `oneshot`
 
@@ -503,8 +512,59 @@ mod tests {
         let state = Arc::new(ApiState {
             store: store.clone(),
             token: TEST_TOKEN.to_string(),
+            info: test_info(),
         });
         (state, Hist(store))
+    }
+
+    fn test_info() -> DeploymentInfo {
+        let exposure = crate::deploy::Exposure {
+            proxy: "127.0.0.1:8080".parse().ok(),
+            api: "127.0.0.1:8081".parse().ok(),
+            ..Default::default()
+        };
+        let banner = crate::deploy::BannerInfo {
+            exposure,
+            ..Default::default()
+        };
+        let ca = crate::ca::CaPublicInfo {
+            subject: "CN=test".into(),
+            sha256: "AB:CD".into(),
+            not_before: "2024-01-01T00:00:00Z".parse().unwrap(),
+            not_after: "2035-01-01T00:00:00Z".parse().unwrap(),
+        };
+        let history = crate::deploy::HistoryInfo {
+            sqlite: true,
+            log_file: false,
+        };
+        crate::deploy::deployment_info(&banner, ca, history, taphttp_types::Timestamp::now())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn info_endpoint_returns_the_deployment_info() {
+        let dir = TempDir::new().unwrap();
+        let (state, _) = state_with_db(&dir);
+        let resp = router(state.clone())
+            .oneshot(authed_get("/info"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(resp).await,
+            serde_json::to_value(&state.info).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn info_endpoint_requires_token() {
+        let dir = TempDir::new().unwrap();
+        let (state, _) = state_with_db(&dir);
+        let resp = router(state)
+            .oneshot(Request::get("/info").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     /// A GET request carrying the valid bearer token.
@@ -678,6 +738,7 @@ mod tests {
         let state = Arc::new(ApiState {
             store,
             token: TEST_TOKEN.to_string(),
+            info: test_info(),
         });
         for path in ["/exchanges", "/exchanges/x"] {
             let resp = router(state.clone())
