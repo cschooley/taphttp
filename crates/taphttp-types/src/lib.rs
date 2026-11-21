@@ -60,7 +60,11 @@ impl Headers {
     pub fn set(&mut self, name: impl Into<String>, value: impl Into<String>) {
         let name = name.into();
         let value = value.into();
-        match self.0.iter().position(|(k, _)| k.eq_ignore_ascii_case(&name)) {
+        match self
+            .0
+            .iter()
+            .position(|(k, _)| k.eq_ignore_ascii_case(&name))
+        {
             Some(first) => {
                 self.0[first].1 = value;
                 let mut i = 0;
@@ -110,7 +114,11 @@ impl Headers {
 
 impl<K: Into<String>, V: Into<String>> FromIterator<(K, V)> for Headers {
     fn from_iter<I: IntoIterator<Item = (K, V)>>(iter: I) -> Self {
-        Self(iter.into_iter().map(|(k, v)| (k.into(), v.into())).collect())
+        Self(
+            iter.into_iter()
+                .map(|(k, v)| (k.into(), v.into()))
+                .collect(),
+        )
     }
 }
 
@@ -183,7 +191,10 @@ pub fn encode_body(bytes: &[u8]) -> (Option<String>, BodyEncoding) {
 }
 
 /// Recover the captured bytes from a stored body. `None` means no body.
-pub fn decode_body(body: Option<&str>, encoding: BodyEncoding) -> Result<Option<Vec<u8>>, DecodeError> {
+pub fn decode_body(
+    body: Option<&str>,
+    encoding: BodyEncoding,
+) -> Result<Option<Vec<u8>>, DecodeError> {
     match (body, encoding) {
         (None, _) => Ok(None),
         (Some(s), BodyEncoding::Utf8) => Ok(Some(s.as_bytes().to_vec())),
@@ -209,12 +220,24 @@ const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz012
 fn base64_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
         out.push(B64[(n >> 18) as usize & 63] as char);
         out.push(B64[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 { B64[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if chunk.len() > 2 { B64[n as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            B64[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            B64[n as usize & 63] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -392,7 +415,10 @@ mod tests {
         h.append("set-cookie", "a=1; Secure");
         h.append("content-type", "text/html");
         h.append("set-cookie", "b=2; HttpOnly");
-        assert_eq!(h.get_all("set-cookie").collect::<Vec<_>>(), ["a=1; Secure", "b=2; HttpOnly"]);
+        assert_eq!(
+            h.get_all("set-cookie").collect::<Vec<_>>(),
+            ["a=1; Secure", "b=2; HttpOnly"]
+        );
         assert_eq!(h.get("content-type"), Some("text/html"));
         assert_eq!(h.len(), 3);
     }
@@ -429,8 +455,13 @@ mod tests {
 
     #[test]
     fn headers_serialize_as_pairs() {
-        let h: Headers = [("set-cookie", "a"), ("set-cookie", "b")].into_iter().collect();
-        assert_eq!(serde_json::to_string(&h).unwrap(), r#"[["set-cookie","a"],["set-cookie","b"]]"#);
+        let h: Headers = [("set-cookie", "a"), ("set-cookie", "b")]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            serde_json::to_string(&h).unwrap(),
+            r#"[["set-cookie","a"],["set-cookie","b"]]"#
+        );
     }
 
     #[test]
@@ -463,8 +494,13 @@ mod tests {
     #[test]
     fn base64_matches_rfc4648_vectors() {
         let vectors = [
-            ("", ""), ("f", "Zg=="), ("fo", "Zm8="), ("foo", "Zm9v"),
-            ("foob", "Zm9vYg=="), ("fooba", "Zm9vYmE="), ("foobar", "Zm9vYmFy"),
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
         ];
         for (plain, enc) in vectors {
             assert_eq!(base64_encode(plain.as_bytes()), enc);
@@ -476,7 +512,10 @@ mod tests {
     fn base64_roundtrips_every_byte_value() {
         let all: Vec<u8> = (0..=255u8).chain((0..=255u8).rev()).collect();
         for len in 0..all.len() {
-            assert_eq!(base64_decode(&base64_encode(&all[..len])).unwrap(), &all[..len]);
+            assert_eq!(
+                base64_decode(&base64_encode(&all[..len])).unwrap(),
+                &all[..len]
+            );
         }
     }
 
@@ -517,9 +556,22 @@ mod tests {
         assert_eq!(
             keys,
             [
-                "duration_ms", "host", "id", "method", "replay_of", "req_body",
-                "req_body_encoding", "req_headers", "res_body", "res_body_encoding",
-                "res_headers", "schema_version", "source", "status", "ts", "url",
+                "duration_ms",
+                "host",
+                "id",
+                "method",
+                "replay_of",
+                "req_body",
+                "req_body_encoding",
+                "req_headers",
+                "res_body",
+                "res_body_encoding",
+                "res_headers",
+                "schema_version",
+                "source",
+                "status",
+                "ts",
+                "url",
             ]
         );
         assert_eq!(v["schema_version"], 4);
@@ -559,7 +611,10 @@ mod tests {
         let v2 = r#"{"id":"old","ts":"2026-11-20T17:03:04.123456789Z","host":"h","method":"POST","url":"http://h/","req_headers":{"content-type":"text/plain"},"req_body":"hi","status":200,"res_headers":{"set-cookie":"a=1"},"res_body":"ok","duration_ms":4,"replay_of":"x"}"#;
         let e: TrafficEntry = serde_json::from_str(v2).unwrap();
         assert_eq!(e.req_headers.get("content-type"), Some("text/plain"));
-        assert_eq!(e.res_headers.get_all("set-cookie").collect::<Vec<_>>(), ["a=1"]);
+        assert_eq!(
+            e.res_headers.get_all("set-cookie").collect::<Vec<_>>(),
+            ["a=1"]
+        );
         assert_eq!(e.req_body_encoding, BodyEncoding::Utf8);
         assert_eq!(e.req_body_bytes().unwrap().as_deref(), Some(&b"hi"[..]));
         assert_eq!(e.replay_of.as_deref(), Some("x"));

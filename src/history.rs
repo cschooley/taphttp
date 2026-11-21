@@ -62,7 +62,9 @@ impl std::str::FromStr for StatusFilter {
             } else {
                 match term.parse::<u16>() {
                     Ok(c @ 100..=599) => f.codes.push(c),
-                    _ => return Err(format!("status {term:?}: expected a code (404), a class (4xx), or a comma list")),
+                    _ => return Err(format!(
+                        "status {term:?}: expected a code (404), a class (4xx), or a comma list"
+                    )),
                 }
             }
         }
@@ -100,7 +102,9 @@ impl SqliteBackend {
         let mut params: Vec<Box<dyn ToSql>> = Vec::new();
 
         if let Some(id) = &q.before {
-            let rowid = self.rowid_of(id)?.ok_or_else(|| HistoryError::UnknownCursor(id.clone()))?;
+            let rowid = self
+                .rowid_of(id)?
+                .ok_or_else(|| HistoryError::UnknownCursor(id.clone()))?;
             sql.push_str(" AND rowid < ?");
             params.push(Box::new(rowid));
         }
@@ -153,9 +157,11 @@ impl SqliteBackend {
     pub fn get(&self, id: &str) -> Result<Option<TrafficEntry>> {
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
         let found = conn
-            .query_row(&format!("SELECT {COLUMNS} FROM traffic WHERE id = ?1"), [id], |r| {
-                row_to_entry(r).map(|(_, e)| e)
-            })
+            .query_row(
+                &format!("SELECT {COLUMNS} FROM traffic WHERE id = ?1"),
+                [id],
+                |r| row_to_entry(r).map(|(_, e)| e),
+            )
             .optional()?;
         Ok(found)
     }
@@ -163,8 +169,10 @@ impl SqliteBackend {
     /// The record-order position of `id`, if it exists.
     pub fn rowid_of(&self, id: &str) -> rusqlite::Result<Option<i64>> {
         let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
-        conn.query_row("SELECT rowid FROM traffic WHERE id = ?1", [id], |r| r.get(0))
-            .optional()
+        conn.query_row("SELECT rowid FROM traffic WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })
+        .optional()
     }
 
     /// Up to `limit` entries recorded after position `rowid`, oldest first,
@@ -209,7 +217,10 @@ fn row_to_entry(r: &Row) -> rusqlite::Result<(i64, TrafficEntry)> {
         match r.get::<_, Option<String>>(i)?.as_deref() {
             None | Some("utf8") => Ok(BodyEncoding::Utf8),
             Some("base64") => Ok(BodyEncoding::Base64),
-            Some(other) => Err(conversion(i, format!("unknown body encoding {other:?}").into())),
+            Some(other) => Err(conversion(
+                i,
+                format!("unknown body encoding {other:?}").into(),
+            )),
         }
     };
     let ts: String = r.get(2)?;
@@ -266,7 +277,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = SqliteBackend::new(&dir.path().join("t.db")).unwrap();
         for i in 0..n {
-            db.append(&entry(&format!("e{i}"), "api.example.com", "GET", 200, &format!("/item/{i}"))).unwrap();
+            db.append(&entry(
+                &format!("e{i}"),
+                "api.example.com",
+                "GET",
+                200,
+                &format!("/item/{i}"),
+            ))
+            .unwrap();
         }
         (dir, db)
     }
@@ -287,7 +305,10 @@ mod tests {
     #[test]
     fn limit_is_capped() {
         let (_d, db) = db_with(MAX_LIMIT + 20);
-        let q = HistoryQuery { limit: Some(10_000), ..Default::default() };
+        let q = HistoryQuery {
+            limit: Some(10_000),
+            ..Default::default()
+        };
         assert_eq!(db.query(&q).unwrap().len(), MAX_LIMIT);
     }
 
@@ -297,7 +318,11 @@ mod tests {
         let mut seen = Vec::new();
         let mut before = None;
         loop {
-            let q = HistoryQuery { limit: Some(10), before: before.clone(), ..Default::default() };
+            let q = HistoryQuery {
+                limit: Some(10),
+                before: before.clone(),
+                ..Default::default()
+            };
             let page = db.query(&q).unwrap();
             if page.is_empty() {
                 break;
@@ -312,17 +337,29 @@ mod tests {
     #[test]
     fn cursor_is_stable_while_new_entries_arrive() {
         let (_d, db) = db_with(10);
-        let first = db.query(&HistoryQuery { limit: Some(3), ..Default::default() }).unwrap();
+        let first = db
+            .query(&HistoryQuery {
+                limit: Some(3),
+                ..Default::default()
+            })
+            .unwrap();
         assert_eq!(ids(&first), ["e9", "e8", "e7"]);
         db.append(&entry("new", "h", "GET", 200, "/")).unwrap();
-        let q = HistoryQuery { limit: Some(3), before: Some("e7".into()), ..Default::default() };
+        let q = HistoryQuery {
+            limit: Some(3),
+            before: Some("e7".into()),
+            ..Default::default()
+        };
         assert_eq!(ids(&db.query(&q).unwrap()), ["e6", "e5", "e4"]);
     }
 
     #[test]
     fn unknown_cursor_is_an_error() {
         let (_d, db) = db_with(3);
-        let q = HistoryQuery { before: Some("nope".into()), ..Default::default() };
+        let q = HistoryQuery {
+            before: Some("nope".into()),
+            ..Default::default()
+        };
         assert!(matches!(db.query(&q), Err(HistoryError::UnknownCursor(id)) if id == "nope"));
     }
 
@@ -330,22 +367,79 @@ mod tests {
     fn filters_host_method_status_and_text_search() {
         let dir = TempDir::new().unwrap();
         let db = SqliteBackend::new(&dir.path().join("t.db")).unwrap();
-        db.append(&entry("a", "API.example.com", "GET", 200, "/login")).unwrap();
-        db.append(&entry("b", "api.example.com", "POST", 401, "/login")).unwrap();
-        db.append(&entry("c", "cdn.other.io", "GET", 200, "/static/app.js")).unwrap();
-        db.append(&entry("d", "api.example.com", "GET", 404, "/users/50%_off")).unwrap();
+        db.append(&entry("a", "API.example.com", "GET", 200, "/login"))
+            .unwrap();
+        db.append(&entry("b", "api.example.com", "POST", 401, "/login"))
+            .unwrap();
+        db.append(&entry("c", "cdn.other.io", "GET", 200, "/static/app.js"))
+            .unwrap();
+        db.append(&entry("d", "api.example.com", "GET", 404, "/users/50%_off"))
+            .unwrap();
 
-        let run = |q: HistoryQuery| ids(&db.query(&q).unwrap()).into_iter().map(String::from).collect::<Vec<_>>();
-        assert_eq!(run(HistoryQuery { host: Some("example".into()), ..Default::default() }), ["d", "b", "a"]);
-        assert_eq!(run(HistoryQuery { method: Some("post".into()), ..Default::default() }), ["b"]);
-        assert_eq!(run(HistoryQuery { status: Some("200".parse().unwrap()), ..Default::default() }), ["c", "a"]);
-        assert_eq!(run(HistoryQuery { q: Some("LOGIN".into()), ..Default::default() }), ["b", "a"]);
-        assert_eq!(run(HistoryQuery { q: Some("other.io".into()), ..Default::default() }), ["c"], "q matches host too");
-        // LIKE wildcards in the search text are literal.
-        assert_eq!(run(HistoryQuery { q: Some("50%_".into()), ..Default::default() }), ["d"]);
-        assert_eq!(run(HistoryQuery { q: Some("_".into()), ..Default::default() }), ["d"]);
+        let run = |q: HistoryQuery| {
+            ids(&db.query(&q).unwrap())
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>()
+        };
         assert_eq!(
-            run(HistoryQuery { host: Some("example".into()), method: Some("GET".into()), status: Some("200".parse().unwrap()), ..Default::default() }),
+            run(HistoryQuery {
+                host: Some("example".into()),
+                ..Default::default()
+            }),
+            ["d", "b", "a"]
+        );
+        assert_eq!(
+            run(HistoryQuery {
+                method: Some("post".into()),
+                ..Default::default()
+            }),
+            ["b"]
+        );
+        assert_eq!(
+            run(HistoryQuery {
+                status: Some("200".parse().unwrap()),
+                ..Default::default()
+            }),
+            ["c", "a"]
+        );
+        assert_eq!(
+            run(HistoryQuery {
+                q: Some("LOGIN".into()),
+                ..Default::default()
+            }),
+            ["b", "a"]
+        );
+        assert_eq!(
+            run(HistoryQuery {
+                q: Some("other.io".into()),
+                ..Default::default()
+            }),
+            ["c"],
+            "q matches host too"
+        );
+        // LIKE wildcards in the search text are literal.
+        assert_eq!(
+            run(HistoryQuery {
+                q: Some("50%_".into()),
+                ..Default::default()
+            }),
+            ["d"]
+        );
+        assert_eq!(
+            run(HistoryQuery {
+                q: Some("_".into()),
+                ..Default::default()
+            }),
+            ["d"]
+        );
+        assert_eq!(
+            run(HistoryQuery {
+                host: Some("example".into()),
+                method: Some("GET".into()),
+                status: Some("200".parse().unwrap()),
+                ..Default::default()
+            }),
             ["a"]
         );
     }
@@ -354,12 +448,25 @@ mod tests {
     fn status_filter_matches_codes_classes_and_lists() {
         let dir = TempDir::new().unwrap();
         let db = SqliteBackend::new(&dir.path().join("t.db")).unwrap();
-        for (id, code) in [("ok", 200), ("redir", 302), ("unauth", 401), ("forbid", 403), ("missing", 404), ("boom", 503)] {
+        for (id, code) in [
+            ("ok", 200),
+            ("redir", 302),
+            ("unauth", 401),
+            ("forbid", 403),
+            ("missing", 404),
+            ("boom", 503),
+        ] {
             db.append(&entry(id, "h", "GET", code, "/")).unwrap();
         }
         let run = |f: &str| {
-            let q = HistoryQuery { status: Some(f.parse().unwrap()), ..Default::default() };
-            ids(&db.query(&q).unwrap()).into_iter().map(String::from).collect::<Vec<_>>()
+            let q = HistoryQuery {
+                status: Some(f.parse().unwrap()),
+                ..Default::default()
+            };
+            ids(&db.query(&q).unwrap())
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>()
         };
         assert_eq!(run("404"), ["missing"]);
         assert_eq!(run("4xx"), ["missing", "forbid", "unauth"]);
@@ -374,7 +481,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = SqliteBackend::new(&dir.path().join("t.db")).unwrap();
         for i in 0..10 {
-            db.append(&entry(&format!("e{i}"), "h", "GET", if i % 2 == 0 { 404 } else { 200 }, "/")).unwrap();
+            db.append(&entry(
+                &format!("e{i}"),
+                "h",
+                "GET",
+                if i % 2 == 0 { 404 } else { 200 },
+                "/",
+            ))
+            .unwrap();
         }
         let q = |before: Option<&str>| HistoryQuery {
             status: Some("4xx".parse().unwrap()),
@@ -400,14 +514,21 @@ mod tests {
         let mut e = entry("s", "h", "GET", 200, "/");
         e.source = Some("agent.T-3".into());
         db.append(&e).unwrap();
-        assert_eq!(db.get("s").unwrap().unwrap().source.as_deref(), Some("agent.T-3"));
+        assert_eq!(
+            db.get("s").unwrap().unwrap().source.as_deref(),
+            Some("agent.T-3")
+        );
     }
 
     #[test]
     fn since_and_until_filter_on_ts() {
         let dir = TempDir::new().unwrap();
         let db = SqliteBackend::new(&dir.path().join("t.db")).unwrap();
-        for (id, ts) in [("old", "2026-01-01T00:00:00Z"), ("mid", "2026-06-01T00:00:00.5Z"), ("new", "2026-11-01T00:00:00Z")] {
+        for (id, ts) in [
+            ("old", "2026-01-01T00:00:00Z"),
+            ("mid", "2026-06-01T00:00:00.5Z"),
+            ("new", "2026-11-01T00:00:00Z"),
+        ] {
             let mut e = entry(id, "h", "GET", 200, "/");
             e.ts = ts.parse().unwrap();
             db.append(&e).unwrap();
@@ -417,7 +538,11 @@ mod tests {
             until: Some("2026-11-01T00:00:00Z".parse().unwrap()),
             ..Default::default()
         };
-        assert_eq!(ids(&db.query(&q).unwrap()), ["mid"], "since inclusive, until exclusive");
+        assert_eq!(
+            ids(&db.query(&q).unwrap()),
+            ["mid"],
+            "since inclusive, until exclusive"
+        );
     }
 
     #[test]
@@ -434,7 +559,11 @@ mod tests {
         e.ts = "2026-11-20T12:34:56.789012Z".parse().unwrap();
         db.append(&e).unwrap();
 
-        assert_eq!(db.get("full").unwrap(), Some(e), "sqlite round-trip is exact");
+        assert_eq!(
+            db.get("full").unwrap(),
+            Some(e),
+            "sqlite round-trip is exact"
+        );
         assert_eq!(db.get("missing").unwrap(), None);
     }
 
@@ -443,7 +572,10 @@ mod tests {
         let (_d, db) = db_with(5);
         let from = db.rowid_of("e1").unwrap().unwrap();
         let got = db.after(from, 10).unwrap();
-        assert_eq!(got.iter().map(|(_, e)| e.id.as_str()).collect::<Vec<_>>(), ["e2", "e3", "e4"]);
+        assert_eq!(
+            got.iter().map(|(_, e)| e.id.as_str()).collect::<Vec<_>>(),
+            ["e2", "e3", "e4"]
+        );
         assert!(got.windows(2).all(|w| w[0].0 < w[1].0));
         assert_eq!(db.after(from, 2).unwrap().len(), 2, "limit applies");
         assert_eq!(db.rowid_of("nope").unwrap(), None);

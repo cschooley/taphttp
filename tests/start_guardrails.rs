@@ -8,7 +8,12 @@ use std::time::{Duration, Instant};
 fn taphttp(data_dir: &std::path::Path) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_taphttp"));
     c.arg("--data-dir").arg(data_dir);
-    for var in ["TAPHTTP_PROXY_AUTH", "TAPHTTP_DB", "TAPHTTP_API_TOKEN_FILE", "RUST_LOG"] {
+    for var in [
+        "TAPHTTP_PROXY_AUTH",
+        "TAPHTTP_DB",
+        "TAPHTTP_API_TOKEN_FILE",
+        "RUST_LOG",
+    ] {
         c.env_remove(var);
     }
     c.stdout(Stdio::null()).stderr(Stdio::piped());
@@ -18,8 +23,16 @@ fn taphttp(data_dir: &std::path::Path) -> Command {
 /// Run to completion; return (success, stderr).
 fn refused(args: &[&str]) -> (bool, String, tempfile::TempDir) {
     let dir = tempfile::TempDir::new().unwrap();
-    let out = taphttp(dir.path()).arg("start").args(args).output().unwrap();
-    (out.status.success(), String::from_utf8_lossy(&out.stderr).into_owned(), dir)
+    let out = taphttp(dir.path())
+        .arg("start")
+        .args(args)
+        .output()
+        .unwrap();
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        dir,
+    )
 }
 
 /// Spawn, wait until it reports the proxy listening, return the stderr seen.
@@ -64,8 +77,16 @@ fn non_loopback_proxy_without_auth_and_tls_is_refused_before_creating_a_ca() {
     let (ok, err, dir) = refused(&["--listen", "0.0.0.0:0"]);
     assert!(!ok, "must exit non-zero");
     assert!(err.contains("refusing to listen on 0.0.0.0:0"), "{err}");
-    assert!(err.contains("--proxy-auth-file") && err.contains("--proxy-tls") && err.contains("--allow-open-proxy"), "{err}");
-    assert!(!dir.path().join("ca.crt").exists(), "refused before touching the CA");
+    assert!(
+        err.contains("--proxy-auth-file")
+            && err.contains("--proxy-tls")
+            && err.contains("--allow-open-proxy"),
+        "{err}"
+    );
+    assert!(
+        !dir.path().join("ca.crt").exists(),
+        "refused before touching the CA"
+    );
 }
 
 #[test]
@@ -78,20 +99,35 @@ fn non_loopback_proxy_with_auth_but_no_tls_is_refused() {
         .unwrap();
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("--proxy-tls") && !err.contains("--proxy-auth-file"), "{err}");
+    assert!(
+        err.contains("--proxy-tls") && !err.contains("--proxy-auth-file"),
+        "{err}"
+    );
 }
 
 #[test]
 fn non_loopback_api_without_tls_is_refused() {
     let (ok, err, _d) = refused(&["--listen", "127.0.0.1:0", "--api-listen", "0.0.0.0:0"]);
     assert!(!ok);
-    assert!(err.contains("lever API") && err.contains("--api-tls") && err.contains("--api-allow-plaintext"), "{err}");
+    assert!(
+        err.contains("lever API")
+            && err.contains("--api-tls")
+            && err.contains("--api-allow-plaintext"),
+        "{err}"
+    );
 }
 
 #[test]
 fn compose_style_explicit_opt_outs_start() {
     let err = starts(
-        &["--listen", "0.0.0.0:0", "--allow-open-proxy", "--api-listen", "0.0.0.0:0", "--api-allow-plaintext"],
+        &[
+            "--listen",
+            "0.0.0.0:0",
+            "--allow-open-proxy",
+            "--api-listen",
+            "0.0.0.0:0",
+            "--api-allow-plaintext",
+        ],
         &[],
     );
     assert!(err.contains("OPEN (--allow-open-proxy)"), "{err}");
@@ -101,10 +137,22 @@ fn compose_style_explicit_opt_outs_start() {
 #[test]
 fn remote_with_auth_and_tls_starts_and_never_prints_the_password() {
     let err = starts(
-        &["--listen", "0.0.0.0:0", "--proxy-tls", "--tls-name", "proxy.lan", "--api-listen", "0.0.0.0:0", "--api-tls"],
+        &[
+            "--listen",
+            "0.0.0.0:0",
+            "--proxy-tls",
+            "--tls-name",
+            "proxy.lan",
+            "--api-listen",
+            "0.0.0.0:0",
+            "--api-tls",
+        ],
         &[("TAPHTTP_PROXY_AUTH", "agent.T-3:hunter2-secret")],
     );
-    assert!(err.contains("mode: remote") && err.contains("proxy auth (1 user)") && err.contains("TLS"), "{err}");
+    assert!(
+        err.contains("mode: remote") && err.contains("proxy auth (1 user)") && err.contains("TLS"),
+        "{err}"
+    );
     assert!(err.contains("CA SHA-256:"), "{err}");
     assert!(!err.contains("hunter2-secret"), "{err}");
 }
@@ -125,7 +173,12 @@ fn tls_on_a_wildcard_without_a_name_is_refused() {
 fn bad_allow_client_and_past_expiry_are_refused() {
     let (ok, err, _d) = refused(&["--listen", "127.0.0.1:0", "--allow-client", "10.0.0.0/40"]);
     assert!(!ok && err.contains("--allow-client"), "{err}");
-    let (ok, err, _d) = refused(&["--listen", "127.0.0.1:0", "--expires", "2020-01-01T00:00:00Z"]);
+    let (ok, err, _d) = refused(&[
+        "--listen",
+        "127.0.0.1:0",
+        "--expires",
+        "2020-01-01T00:00:00Z",
+    ]);
     assert!(!ok && err.contains("in the past"), "{err}");
 }
 
@@ -143,7 +196,10 @@ fn expiry_makes_the_process_exit_on_its_own() {
             std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut err).unwrap();
             assert!(status.success(), "{err}");
             assert!(err.contains("expired"), "{err}");
-            assert!(err.contains("expires: 20"), "banner states the expiry:\n{err}");
+            assert!(
+                err.contains("expires: 20"),
+                "banner states the expiry:\n{err}"
+            );
             return;
         }
         if Instant::now() > deadline {

@@ -1,3 +1,4 @@
+use crate::cli::ShowArgs;
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -5,7 +6,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
-use crate::cli::ShowArgs;
 
 // The traffic schema lives in the `taphttp-types` crate so consumers can
 // depend on it without the proxy. Re-exported here so the rest of the crate
@@ -21,7 +21,10 @@ pub struct JsonLinesBackend {
 
 impl JsonLinesBackend {
     pub fn new(path: &Path) -> Self {
-        Self { path: path.to_path_buf(), write_lock: Mutex::new(()) }
+        Self {
+            path: path.to_path_buf(),
+            write_lock: Mutex::new(()),
+        }
     }
 
     #[cfg(test)]
@@ -97,7 +100,10 @@ impl SqliteBackend {
         // of taphttp; a power cut may lose the last few entries.
         conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")
             .context("configuring sqlite")?;
-        let defs: Vec<String> = SQLITE_COLUMNS.iter().map(|(n, t)| format!("{n} {t}")).collect();
+        let defs: Vec<String> = SQLITE_COLUMNS
+            .iter()
+            .map(|(n, t)| format!("{n} {t}"))
+            .collect();
         conn.execute_batch(&format!(
             "CREATE TABLE IF NOT EXISTS traffic ({});",
             defs.join(", ")
@@ -123,7 +129,11 @@ impl SqliteBackend {
     pub fn append(&self, e: &TrafficEntry) -> Result<()> {
         let names: Vec<&str> = SQLITE_COLUMNS.iter().map(|(n, _)| *n).collect();
         let slots: Vec<String> = (1..=names.len()).map(|i| format!("?{i}")).collect();
-        let encoding = |enc| serde_json::to_value(enc).ok().and_then(|v| v.as_str().map(str::to_owned));
+        let encoding = |enc| {
+            serde_json::to_value(enc)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_owned))
+        };
         let conn = self.conn.lock().unwrap();
         conn.execute(
             &format!(
@@ -174,7 +184,11 @@ impl Store {
         let log_file = log_file.map(JsonLinesBackend::new);
         let sqlite = db.map(SqliteBackend::new).transpose()?;
         let (live, _) = broadcast::channel(LIVE_FEED_CAPACITY);
-        Ok(Arc::new(Self { log_file, sqlite, live }))
+        Ok(Arc::new(Self {
+            log_file,
+            sqlite,
+            live,
+        }))
     }
 
     /// Subscribe to the live feed of recorded entries. Each subscriber
@@ -338,13 +352,21 @@ pub fn load_entry(path: &Path, id: &str) -> Result<TrafficEntry> {
         .filter(|l| !l.is_empty())
         .find_map(|l| {
             let e: TrafficEntry = serde_json::from_str(l).ok()?;
-            if e.id == id { Some(e) } else { None }
+            if e.id == id {
+                Some(e)
+            } else {
+                None
+            }
         })
         .context(format!("no entry with id {id}"))
 }
 
 fn truncate(s: &str, max: usize) -> &str {
-    if s.len() <= max { s } else { &s[..max] }
+    if s.len() <= max {
+        s
+    } else {
+        &s[..max]
+    }
 }
 
 #[cfg(test)]
@@ -442,8 +464,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("traffic.jsonl");
         let backend = JsonLinesBackend::new(&path);
-        backend.append(&make_entry("a", "x.com", "GET", 200)).unwrap();
-        backend.append(&make_entry("b", "y.com", "POST", 201)).unwrap();
+        backend
+            .append(&make_entry("a", "x.com", "GET", 200))
+            .unwrap();
+        backend
+            .append(&make_entry("b", "y.com", "POST", 201))
+            .unwrap();
         // A stray blank line and a garbage line must be tolerated.
         std::fs::OpenOptions::new()
             .append(true)
@@ -465,7 +491,11 @@ mod tests {
             .iter()
             .filter(|l| !l.is_empty() && serde_json::from_str::<TrafficEntry>(l).is_err())
             .count();
-        assert_eq!((blank, bad), (0, 0), "{blank} blank and {bad} unparseable (fused) lines");
+        assert_eq!(
+            (blank, bad),
+            (0, 0),
+            "{blank} blank and {bad} unparseable (fused) lines"
+        );
         assert_eq!(lines.len(), expected, "one line per entry");
         assert!(content.ends_with('\n'));
     }
@@ -487,7 +517,9 @@ mod tests {
                 let backend = backend.clone();
                 std::thread::spawn(move || {
                     for i in 0..200 {
-                        backend.append(&entry_with_kb_body(format!("t{t}-{i}"))).unwrap();
+                        backend
+                            .append(&entry_with_kb_body(format!("t{t}-{i}")))
+                            .unwrap();
                     }
                 })
             })
@@ -522,7 +554,10 @@ mod tests {
         let content = format!("{good}\n\n{good}{good}\nnot json\n{good}\n");
         let (entries, skipped) = parse_log(&content);
         assert_eq!(entries.len(), 2);
-        assert_eq!(skipped, 2, "the fused line and the garbage line; blank lines aren't counted");
+        assert_eq!(
+            skipped, 2,
+            "the fused line and the garbage line; blank lines aren't counted"
+        );
     }
 
     #[test]
@@ -537,7 +572,9 @@ mod tests {
         let path = dir.path().join("traffic.jsonl");
         let backend = JsonLinesBackend::new(&path);
         for i in 0..5u8 {
-            backend.append(&make_entry(&format!("id-{i}"), "host.com", "GET", 200)).unwrap();
+            backend
+                .append(&make_entry(&format!("id-{i}"), "host.com", "GET", 200))
+                .unwrap();
         }
         for i in 0..5u8 {
             load_entry(&dir.path().join("traffic.jsonl"), &format!("id-{i}")).unwrap();
@@ -562,7 +599,16 @@ mod tests {
     }
 
     /// Read one row back the way a downstream sqlite reader would.
-    fn sqlite_row(dir: &Path, id: &str) -> (Headers, Option<String>, Option<String>, Option<String>, Option<u32>) {
+    fn sqlite_row(
+        dir: &Path,
+        id: &str,
+    ) -> (
+        Headers,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<u32>,
+    ) {
         let conn = Connection::open(dir.join("traffic.db")).unwrap();
         conn.query_row(
             "SELECT res_headers, res_body, res_body_encoding, replay_of, schema_version FROM traffic WHERE id = ?1",
@@ -599,8 +645,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db = SqliteBackend::new(&dir.path().join("traffic.db")).unwrap();
         let conn = db.conn.lock().unwrap();
-        let mode: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
-        let sync: i64 = conn.query_row("PRAGMA synchronous", [], |r| r.get(0)).unwrap();
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        let sync: i64 = conn
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap();
         assert_eq!((mode.as_str(), sync), ("wal", 1), "wal + NORMAL(1)");
     }
 
@@ -624,7 +674,11 @@ mod tests {
         sqlite.append(&make_entry("new", "h", "GET", 200)).unwrap();
 
         let (h, body, enc, _, version) = sqlite_row(dir.path(), "old");
-        assert_eq!(h.get("set-cookie"), Some("a=1"), "v2 header map still reads");
+        assert_eq!(
+            h.get("set-cookie"),
+            Some("a=1"),
+            "v2 header map still reads"
+        );
         assert_eq!(body.as_deref(), Some("ok"));
         assert_eq!(enc, None, "missing encoding means utf8");
         assert_eq!(version, None);
@@ -677,14 +731,20 @@ mod tests {
 
     #[test]
     fn filter_by_host_substring() {
-        let filtered = filter_entries(make_entries(), &show_args(Some("example"), None, None, None));
+        let filtered = filter_entries(
+            make_entries(),
+            &show_args(Some("example"), None, None, None),
+        );
         assert_eq!(filtered.len(), 3);
         assert!(filtered.iter().all(|e| e.host.contains("example")));
     }
 
     #[test]
     fn filter_by_host_is_case_insensitive() {
-        let filtered = filter_entries(make_entries(), &show_args(Some("EXAMPLE"), None, None, None));
+        let filtered = filter_entries(
+            make_entries(),
+            &show_args(Some("EXAMPLE"), None, None, None),
+        );
         assert_eq!(filtered.len(), 3);
     }
 
@@ -710,7 +770,10 @@ mod tests {
 
     #[test]
     fn filter_combined_host_and_method() {
-        let filtered = filter_entries(make_entries(), &show_args(Some("example"), Some("GET"), None, None));
+        let filtered = filter_entries(
+            make_entries(),
+            &show_args(Some("example"), Some("GET"), None, None),
+        );
         assert_eq!(filtered.len(), 2);
     }
 
@@ -733,7 +796,9 @@ mod tests {
         };
         let filtered = query_entries(make_entries(), &q);
         assert_eq!(filtered.len(), 2);
-        assert!(filtered.iter().all(|e| e.host.contains("example") && e.method == "GET"));
+        assert!(filtered
+            .iter()
+            .all(|e| e.host.contains("example") && e.method == "GET"));
     }
 
     #[test]
@@ -744,7 +809,10 @@ mod tests {
 
     #[test]
     fn query_entries_limit_returns_most_recent() {
-        let q = TrafficQuery { limit: Some(2), ..Default::default() };
+        let q = TrafficQuery {
+            limit: Some(2),
+            ..Default::default()
+        };
         let filtered = query_entries(make_entries(), &q);
         let ids: Vec<&str> = filtered.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids, ["4", "5"]);
@@ -757,7 +825,11 @@ mod tests {
         let via_cli = filter_entries(make_entries(), &args);
         let via_core = query_entries(
             make_entries(),
-            &TrafficQuery { host: Some("example".into()), method: Some("GET".into()), ..Default::default() },
+            &TrafficQuery {
+                host: Some("example".into()),
+                method: Some("GET".into()),
+                ..Default::default()
+            },
         );
         let cli_ids: Vec<&str> = via_cli.iter().map(|e| e.id.as_str()).collect();
         let core_ids: Vec<&str> = via_core.iter().map(|e| e.id.as_str()).collect();

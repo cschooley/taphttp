@@ -53,7 +53,11 @@ impl ProxyConfig {
 /// it can be set as an environment default (as the Docker image does).
 fn sqlite_path(args: &StartArgs, data_dir: &std::path::Path) -> Option<PathBuf> {
     let wanted = args.sqlite || args.api_listen.is_some();
-    wanted.then(|| args.db.clone().unwrap_or_else(|| data_dir.join("traffic.db")))
+    wanted.then(|| {
+        args.db
+            .clone()
+            .unwrap_or_else(|| data_dir.join("traffic.db"))
+    })
 }
 
 /// SANs for taphttp's own listener certs: every `--tls-name`, plus each
@@ -84,8 +88,10 @@ pub async fn run(args: StartArgs, data_dir: PathBuf) -> Result<()> {
         .as_deref()
         .map(|a| a.parse().context("invalid api-listen address"))
         .transpose()?;
-    let credentials =
-        ProxyCredentials::load(args.proxy_auth_file.as_deref(), std::env::var("TAPHTTP_PROXY_AUTH").ok())?;
+    let credentials = ProxyCredentials::load(
+        args.proxy_auth_file.as_deref(),
+        std::env::var("TAPHTTP_PROXY_AUTH").ok(),
+    )?;
     let allow_clients = args
         .allow_client
         .iter()
@@ -107,13 +113,23 @@ pub async fn run(args: StartArgs, data_dir: PathBuf) -> Result<()> {
     };
     deploy::check_exposure(&exposure)?;
     let names = if args.proxy_tls || args.api_tls {
-        tls_names(&args.tls_name, &[args.proxy_tls.then_some(addr), api_addr.filter(|_| args.api_tls)])?
+        tls_names(
+            &args.tls_name,
+            &[
+                args.proxy_tls.then_some(addr),
+                api_addr.filter(|_| args.api_tls),
+            ],
+        )?
     } else {
         Vec::new()
     };
 
     let ca = Arc::new(Ca::load_or_create(&data_dir)?);
-    let listener_tls = if names.is_empty() { None } else { Some(ca.listener_tls_config(&names)?) };
+    let listener_tls = if names.is_empty() {
+        None
+    } else {
+        Some(ca.listener_tls_config(&names)?)
+    };
 
     let info = deploy::BannerInfo {
         exposure,
@@ -133,7 +149,10 @@ pub async fn run(args: StartArgs, data_dir: PathBuf) -> Result<()> {
         tokio::spawn(async move {
             let wait = (at - Utc::now()).to_std().unwrap_or_default();
             tokio::time::sleep(wait).await;
-            eprintln!("taphttp: deployment expired at {}; exiting", at.to_rfc3339());
+            eprintln!(
+                "taphttp: deployment expired at {}; exiting",
+                at.to_rfc3339()
+            );
             tracing::warn!("deployment expired at {}; exiting", at.to_rfc3339());
             std::process::exit(0);
         });
@@ -164,8 +183,15 @@ pub async fn run(args: StartArgs, data_dir: PathBuf) -> Result<()> {
                 token
             }
         };
-        let state = Arc::new(crate::api::ApiState { store: store.clone(), token });
-        let api_tls = if args.api_tls { listener_tls.clone() } else { None };
+        let state = Arc::new(crate::api::ApiState {
+            store: store.clone(),
+            token,
+        });
+        let api_tls = if args.api_tls {
+            listener_tls.clone()
+        } else {
+            None
+        };
         tokio::spawn(async move {
             if let Err(e) = crate::api::serve(state, api_addr, api_tls).await {
                 tracing::error!("lever API exited: {e}");
@@ -184,9 +210,18 @@ pub async fn run(args: StartArgs, data_dir: PathBuf) -> Result<()> {
     serve(listener, ca, store, config).await
 }
 
-pub async fn serve(listener: TcpListener, ca: Arc<Ca>, store: Arc<Store>, config: ProxyConfig) -> Result<()> {
+pub async fn serve(
+    listener: TcpListener,
+    ca: Arc<Ca>,
+    store: Arc<Store>,
+    config: ProxyConfig,
+) -> Result<()> {
     let addr = listener.local_addr()?;
-    let scheme = if config.tls.is_some() { "https" } else { "http" };
+    let scheme = if config.tls.is_some() {
+        "https"
+    } else {
+        "http"
+    };
     let acceptor = config.tls.clone().map(TlsAcceptor::from);
     let config = Arc::new(config);
     tracing::info!("taphttp listening on {}", addr);
@@ -220,7 +255,12 @@ pub async fn serve(listener: TcpListener, ca: Arc<Ca>, store: Arc<Store>, config
     }
 }
 
-async fn handle_connection<IO>(stream: IO, ca: Arc<Ca>, store: Arc<Store>, config: Arc<ProxyConfig>) -> Result<()>
+async fn handle_connection<IO>(
+    stream: IO,
+    ca: Arc<Ca>,
+    store: Arc<Store>,
+    config: Arc<ProxyConfig>,
+) -> Result<()>
 where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -251,7 +291,10 @@ async fn dispatch(
     }
     // For HTTPS this is the CONNECT, which is where clients send proxy auth;
     // the source then applies to every request in that tunnel.
-    let header = req.headers().get(hyper::header::PROXY_AUTHORIZATION).map(|v| v.as_bytes());
+    let header = req
+        .headers()
+        .get(hyper::header::PROXY_AUTHORIZATION)
+        .map(|v| v.as_bytes());
     let source = match deploy::authorize(header, config.credentials.as_ref()) {
         Ok(source) => source,
         Err(deploy::AuthRequired) => return proxy_auth_required(),
@@ -266,8 +309,13 @@ async fn dispatch(
 fn proxy_auth_required() -> Result<Response<Full<Bytes>>> {
     Ok(Response::builder()
         .status(407)
-        .header(hyper::header::PROXY_AUTHENTICATE, r#"Basic realm="taphttp""#)
-        .body(Full::new(Bytes::from_static(b"proxy authentication required")))?)
+        .header(
+            hyper::header::PROXY_AUTHENTICATE,
+            r#"Basic realm="taphttp""#,
+        )
+        .body(Full::new(Bytes::from_static(
+            b"proxy authentication required",
+        )))?)
 }
 
 async fn handle_connect(
@@ -292,7 +340,8 @@ async fn handle_connect(
     tokio::task::spawn(async move {
         match hyper::upgrade::on(req).await {
             Ok(upgraded) => {
-                if let Err(e) = mitm_tls(upgraded, host, host_port, source, ca, store, config).await {
+                if let Err(e) = mitm_tls(upgraded, host, host_port, source, ca, store, config).await
+                {
                     tracing::debug!("mitm error: {e}");
                 }
             }
@@ -339,7 +388,10 @@ async fn mitm_tls(
                 async move {
                     // An open tunnel doesn't outlive the deployment.
                     if config.expired() {
-                        return make_drop_response(503, Some("taphttp: this deployment has expired".into()));
+                        return make_drop_response(
+                            503,
+                            Some("taphttp: this deployment has expired".into()),
+                        );
                     }
                     let path = req
                         .uri()
@@ -408,8 +460,7 @@ async fn forward_https(
     }
 
     let start = Instant::now();
-    let upstream_req =
-        build_upstream_request(&method, &url, &req_headers, req_body_bytes.clone())?;
+    let upstream_req = build_upstream_request(&method, &url, &req_headers, req_body_bytes.clone())?;
     let res = send_https(upstream_req).await;
     let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -482,7 +533,10 @@ async fn forward_https(
         "{} {} {} {}ms",
         entry.method,
         entry.url,
-        entry.status.map(|s| s.to_string()).unwrap_or_else(|| "ERR".to_string()),
+        entry
+            .status
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "ERR".to_string()),
         duration_ms
     );
 
@@ -575,8 +629,7 @@ async fn handle_http(
     }
 
     let start = Instant::now();
-    let upstream_req =
-        build_upstream_request(&method, &url, &req_headers, req_body_bytes.clone())?;
+    let upstream_req = build_upstream_request(&method, &url, &req_headers, req_body_bytes.clone())?;
     let res = forward_http_request(upstream_req).await;
     let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -649,7 +702,10 @@ async fn handle_http(
         "{} {} {} {}ms",
         entry.method,
         entry.url,
-        entry.status.map(|s| s.to_string()).unwrap_or_else(|| "ERR".to_string()),
+        entry
+            .status
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "ERR".to_string()),
         duration_ms
     );
 
@@ -710,7 +766,10 @@ fn rebuild_request(
         .method(parts.method.clone())
         .uri(url.parse::<hyper::Uri>()?);
     for (k, v) in &parts.headers {
-        if k != hyper::header::HOST && k != "proxy-connection" && k != hyper::header::PROXY_AUTHORIZATION {
+        if k != hyper::header::HOST
+            && k != "proxy-connection"
+            && k != hyper::header::PROXY_AUTHORIZATION
+        {
             builder = builder.header(k, v);
         }
     }
@@ -724,10 +783,18 @@ fn apply_request_mods(
     body_bytes: &mut Bytes,
     mods: crate::intercept::ForwardDecision,
 ) {
-    if let Some(m) = mods.method { *method = m; }
-    if let Some(u) = mods.url { *url = u; }
-    if let Some(h) = mods.headers { *headers = h.into_iter().collect(); }
-    if let Some(b) = mods.body { *body_bytes = Bytes::from(b.into_bytes()); }
+    if let Some(m) = mods.method {
+        *method = m;
+    }
+    if let Some(u) = mods.url {
+        *url = u;
+    }
+    if let Some(h) = mods.headers {
+        *headers = h.into_iter().collect();
+    }
+    if let Some(b) = mods.body {
+        *body_bytes = Bytes::from(b.into_bytes());
+    }
 }
 
 fn apply_response_mods(
@@ -737,12 +804,16 @@ fn apply_response_mods(
     body_bytes: &mut Bytes,
     mods: crate::intercept::ForwardDecision,
 ) {
-    if let Some(s) = mods.status { *status = Some(s); }
+    if let Some(s) = mods.status {
+        *status = Some(s);
+    }
     if let Some(h) = mods.headers {
         *headers = h.into_iter().collect();
         *raw_headers = to_header_map(headers);
     }
-    if let Some(b) = mods.body { *body_bytes = Bytes::from(b.into_bytes()); }
+    if let Some(b) = mods.body {
+        *body_bytes = Bytes::from(b.into_bytes());
+    }
 }
 
 /// Headers that describe one connection, not the message (RFC 9110 §7.6.1),
@@ -762,7 +833,11 @@ const NOT_FORWARDED: [&str; 9] = [
 /// The response the proxy sends back to its client: upstream's status and
 /// headers (every repeated one, raw bytes) minus hop-by-hop and framing
 /// headers, since the body has been buffered and is re-framed here.
-fn client_response(status: u16, headers: &hyper::HeaderMap, body: Bytes) -> Result<Response<Full<Bytes>>> {
+fn client_response(
+    status: u16,
+    headers: &hyper::HeaderMap,
+    body: Bytes,
+) -> Result<Response<Full<Bytes>>> {
     // Headers named in Connection are hop-by-hop too.
     let named: Vec<String> = headers
         .get_all(hyper::header::CONNECTION)
@@ -774,7 +849,10 @@ fn client_response(status: u16, headers: &hyper::HeaderMap, body: Bytes) -> Resu
     let mut builder = Response::builder().status(status);
     for (k, v) in headers {
         let name = k.as_str();
-        if NOT_FORWARDED.contains(&name) || name == "content-length" || named.iter().any(|n| n == name) {
+        if NOT_FORWARDED.contains(&name)
+            || name == "content-length"
+            || named.iter().any(|n| n == name)
+        {
             continue;
         }
         builder = builder.header(k, v);
@@ -868,10 +946,7 @@ mod tests {
 
     #[test]
     fn maybe_utf8_valid_string() {
-        assert_eq!(
-            maybe_utf8(&Bytes::from("hello")),
-            Some("hello".to_string())
-        );
+        assert_eq!(maybe_utf8(&Bytes::from("hello")), Some("hello".to_string()));
     }
 
     #[test]
@@ -899,22 +974,35 @@ mod tests {
         map.append(hyper::header::SET_COOKIE, "a=1".parse().unwrap());
         map.append(hyper::header::SET_COOKIE, "b=2".parse().unwrap());
         let collected = collect_headers(&map);
-        assert_eq!(collected.get_all("set-cookie").collect::<Vec<_>>(), ["a=1", "b=2"]);
+        assert_eq!(
+            collected.get_all("set-cookie").collect::<Vec<_>>(),
+            ["a=1", "b=2"]
+        );
     }
 
     #[test]
     fn collect_headers_keeps_non_utf8_values() {
         let mut map = hyper::HeaderMap::new();
-        map.insert("x-odd", hyper::header::HeaderValue::from_bytes(b"caf\xe9").unwrap());
+        map.insert(
+            "x-odd",
+            hyper::header::HeaderValue::from_bytes(b"caf\xe9").unwrap(),
+        );
         let v = collect_headers(&map).get("x-odd").unwrap().to_string();
         assert!(v.starts_with("caf") && v.len() > 3, "got {v:?}");
     }
 
     #[test]
     fn build_upstream_request_sends_repeated_headers() {
-        let h: Headers = [("x-multi", "one"), ("host", "h"), ("x-multi", "two")].into_iter().collect();
+        let h: Headers = [("x-multi", "one"), ("host", "h"), ("x-multi", "two")]
+            .into_iter()
+            .collect();
         let req = build_upstream_request("GET", "http://h/", &h, Bytes::new()).unwrap();
-        let vals: Vec<_> = req.headers().get_all("x-multi").iter().map(|v| v.to_str().unwrap()).collect();
+        let vals: Vec<_> = req
+            .headers()
+            .get_all("x-multi")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
         assert_eq!(vals, ["one", "two"]);
         assert!(!req.headers().contains_key("host"));
     }
@@ -952,11 +1040,27 @@ mod tests {
     fn sqlite_path_is_on_when_asked_for_or_when_the_api_needs_it() {
         let dd = std::path::Path::new("/dd");
         assert_eq!(sqlite_path(&start_args(false, None, false), dd), None);
-        assert_eq!(sqlite_path(&start_args(true, None, false), dd), Some(PathBuf::from("/dd/traffic.db")));
-        assert_eq!(sqlite_path(&start_args(false, None, true), dd), Some(PathBuf::from("/dd/traffic.db")));
-        assert_eq!(sqlite_path(&start_args(false, Some("/data/t.db"), false), dd), None, "--db alone only sets the location");
-        assert_eq!(sqlite_path(&start_args(true, Some("/data/t.db"), false), dd), Some(PathBuf::from("/data/t.db")));
-        assert_eq!(sqlite_path(&start_args(true, Some("/data/t.db"), true), dd), Some(PathBuf::from("/data/t.db")));
+        assert_eq!(
+            sqlite_path(&start_args(true, None, false), dd),
+            Some(PathBuf::from("/dd/traffic.db"))
+        );
+        assert_eq!(
+            sqlite_path(&start_args(false, None, true), dd),
+            Some(PathBuf::from("/dd/traffic.db"))
+        );
+        assert_eq!(
+            sqlite_path(&start_args(false, Some("/data/t.db"), false), dd),
+            None,
+            "--db alone only sets the location"
+        );
+        assert_eq!(
+            sqlite_path(&start_args(true, Some("/data/t.db"), false), dd),
+            Some(PathBuf::from("/data/t.db"))
+        );
+        assert_eq!(
+            sqlite_path(&start_args(true, Some("/data/t.db"), true), dd),
+            Some(PathBuf::from("/data/t.db"))
+        );
     }
 
     #[test]
@@ -1043,10 +1147,22 @@ mod tests {
         log_file: &std::path::Path,
         intercept_socket: Option<PathBuf>,
     ) -> u16 {
-        start_proxy_with(data_dir, log_file, ProxyConfig { intercept_socket, ..Default::default() }).await
+        start_proxy_with(
+            data_dir,
+            log_file,
+            ProxyConfig {
+                intercept_socket,
+                ..Default::default()
+            },
+        )
+        .await
     }
 
-    async fn start_proxy_with(data_dir: &std::path::Path, log_file: &std::path::Path, config: ProxyConfig) -> u16 {
+    async fn start_proxy_with(
+        data_dir: &std::path::Path,
+        log_file: &std::path::Path,
+        config: ProxyConfig,
+    ) -> u16 {
         // `main` does this; tests that do TLS need it too.
         let _ = rustls::crypto::ring::default_provider().install_default();
         let ca = Arc::new(Ca::load_or_create(data_dir).unwrap());
@@ -1089,7 +1205,9 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
-            let Ok((mut stream, _)) = listener.accept().await else { return };
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
             let mut buf = vec![0u8; 8192];
             let _ = stream.read(&mut buf).await;
             let mut res: Vec<u8> = b"HTTP/1.1 200 OK\r\n\
@@ -1120,7 +1238,9 @@ mod tests {
         )
         .into_bytes();
         raw.extend_from_slice(req_body);
-        let mut stream = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await.unwrap();
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{proxy_port}"))
+            .await
+            .unwrap();
         stream.write_all(&raw).await.unwrap();
         let mut sink = Vec::new();
         stream.read_to_end(&mut sink).await.unwrap();
@@ -1134,9 +1254,15 @@ mod tests {
             ["session=abc; Secure; HttpOnly", "theme=dark; SameSite=Lax"],
             "every Set-Cookie must be logged, in order"
         );
-        assert_eq!(entry.req_headers.get_all("x-multi").collect::<Vec<_>>(), ["one", "two"]);
+        assert_eq!(
+            entry.req_headers.get_all("x-multi").collect::<Vec<_>>(),
+            ["one", "two"]
+        );
         let odd = entry.res_headers.get("x-odd").unwrap();
-        assert!(odd.starts_with("caf") && odd.len() > 3, "non-UTF-8 value kept, got {odd:?}");
+        assert!(
+            odd.starts_with("caf") && odd.len() > 3,
+            "non-UTF-8 value kept, got {odd:?}"
+        );
         assert_eq!(entry.req_body_bytes().unwrap().as_deref(), Some(req_body));
         assert_eq!(
             entry.res_body_bytes().unwrap().as_deref(),
@@ -1151,7 +1277,9 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
-            let Ok((mut stream, _)) = listener.accept().await else { return };
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
             let mut buf = vec![0u8; 8192];
             let _ = stream.read(&mut buf).await;
             let res = "HTTP/1.1 200 OK\r\n\
@@ -1169,10 +1297,17 @@ mod tests {
 
     /// Send a GET through the proxy and parse the response with hyper, so
     /// framing errors (e.g. a stale transfer-encoding) fail the test.
-    async fn get_through_proxy(proxy_port: u16, target: &str) -> (hyper::http::response::Parts, Bytes) {
-        let stream = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await.unwrap();
+    async fn get_through_proxy(
+        proxy_port: u16,
+        target: &str,
+    ) -> (hyper::http::response::Parts, Bytes) {
+        let stream = TcpStream::connect(format!("127.0.0.1:{proxy_port}"))
+            .await
+            .unwrap();
         let (mut sender, conn) =
-            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream)).await.unwrap();
+            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
+                .await
+                .unwrap();
         tokio::spawn(conn);
         let req = Request::get(target)
             .header("host", "upstream")
@@ -1197,11 +1332,26 @@ mod tests {
         let (parts, body) = get_through_proxy(proxy_port, &format!("http://127.0.0.1:{up}/")).await;
 
         assert_eq!(parts.status, 200);
-        let cookies: Vec<_> = parts.headers.get_all("set-cookie").iter().map(|v| v.to_str().unwrap()).collect();
-        assert_eq!(cookies, ["session=abc; Secure; HttpOnly", "theme=dark"], "browser must get every Set-Cookie");
+        let cookies: Vec<_> = parts
+            .headers
+            .get_all("set-cookie")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            cookies,
+            ["session=abc; Secure; HttpOnly", "theme=dark"],
+            "browser must get every Set-Cookie"
+        );
         assert_eq!(parts.headers["content-type"], "text/html; charset=utf-8");
-        assert!(!parts.headers.contains_key("keep-alive"), "hop-by-hop headers are not forwarded");
-        assert!(!parts.headers.contains_key("transfer-encoding"), "body is re-framed by the proxy");
+        assert!(
+            !parts.headers.contains_key("keep-alive"),
+            "hop-by-hop headers are not forwarded"
+        );
+        assert!(
+            !parts.headers.contains_key("transfer-encoding"),
+            "body is re-framed by the proxy"
+        );
         assert_eq!(body, "hello world");
     }
 
@@ -1219,9 +1369,11 @@ mod tests {
         )
         .await;
         tokio::time::sleep(Duration::from_millis(10)).await;
-        let proxy_port = start_proxy(dir.path(), &dir.path().join("t.jsonl"), Some(socket_path)).await;
+        let proxy_port =
+            start_proxy(dir.path(), &dir.path().join("t.jsonl"), Some(socket_path)).await;
 
-        let (parts, body) = get_through_proxy(proxy_port, &format!("http://127.0.0.1:{echo_port}/")).await;
+        let (parts, body) =
+            get_through_proxy(proxy_port, &format!("http://127.0.0.1:{echo_port}/")).await;
         assert_eq!(parts.headers["x-injected"], "yes");
         assert_eq!(body, "echo-ok");
     }
@@ -1251,7 +1403,9 @@ mod tests {
     fn to_header_map_skips_headers_hyper_rejects() {
         // An intercept hook can send any string; a name with a space can't
         // go on the wire and must not fail the whole response.
-        let h: Headers = [("bad name", "x"), ("ok", "1"), ("ok", "2")].into_iter().collect();
+        let h: Headers = [("bad name", "x"), ("ok", "1"), ("ok", "2")]
+            .into_iter()
+            .collect();
         let map = to_header_map(&h);
         assert_eq!(map.get_all("ok").iter().count(), 2);
         assert_eq!(map.len(), 2);
@@ -1260,7 +1414,10 @@ mod tests {
     #[test]
     fn client_response_forwards_raw_non_utf8_value_bytes() {
         let mut map = hyper::HeaderMap::new();
-        map.insert("x-odd", hyper::header::HeaderValue::from_bytes(b"caf\xe9").unwrap());
+        map.insert(
+            "x-odd",
+            hyper::header::HeaderValue::from_bytes(b"caf\xe9").unwrap(),
+        );
         let res = client_response(200, &map, Bytes::new()).unwrap();
         assert_eq!(res.headers()["x-odd"].as_bytes(), b"caf\xe9");
     }
@@ -1277,7 +1434,9 @@ mod tests {
         let s = seen.clone();
         tokio::spawn(async move {
             loop {
-                let Ok((stream, _)) = listener.accept().await else { return };
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
                 let s = s.clone();
                 tokio::spawn(async move {
                     hyper::server::conn::http1::Builder::new()
@@ -1287,7 +1446,9 @@ mod tests {
                                 let s = s.clone();
                                 async move {
                                     s.lock().await.push(req.headers().clone());
-                                    Ok::<_, anyhow::Error>(Response::new(Full::new(Bytes::from("ok"))))
+                                    Ok::<_, anyhow::Error>(Response::new(Full::new(Bytes::from(
+                                        "ok",
+                                    ))))
                                 }
                             }),
                         )
@@ -1304,21 +1465,37 @@ mod tests {
         const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut out = String::new();
         for c in userpass.as_bytes().chunks(3) {
-            let n = (u32::from(c[0]) << 16) | (u32::from(*c.get(1).unwrap_or(&0)) << 8) | u32::from(*c.get(2).unwrap_or(&0));
+            let n = (u32::from(c[0]) << 16)
+                | (u32::from(*c.get(1).unwrap_or(&0)) << 8)
+                | u32::from(*c.get(2).unwrap_or(&0));
             out.push(A[(n >> 18) as usize & 63] as char);
             out.push(A[(n >> 12) as usize & 63] as char);
-            out.push(if c.len() > 1 { A[(n >> 6) as usize & 63] as char } else { '=' });
-            out.push(if c.len() > 2 { A[n as usize & 63] as char } else { '=' });
+            out.push(if c.len() > 1 {
+                A[(n >> 6) as usize & 63] as char
+            } else {
+                '='
+            });
+            out.push(if c.len() > 2 {
+                A[n as usize & 63] as char
+            } else {
+                '='
+            });
         }
         format!("Basic {out}")
     }
 
     /// One request through the proxy over an already-connected stream.
-    async fn request_over<IO>(io: IO, req: Request<Full<Bytes>>) -> (hyper::http::response::Parts, Bytes)
+    async fn request_over<IO>(
+        io: IO,
+        req: Request<Full<Bytes>>,
+    ) -> (hyper::http::response::Parts, Bytes)
     where
         IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
-        let (mut sender, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(io)).await.unwrap();
+        let (mut sender, conn) =
+            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(io))
+                .await
+                .unwrap();
         tokio::spawn(conn);
         let res = sender.send_request(req).await.unwrap();
         let (parts, body) = res.into_parts();
@@ -1353,26 +1530,44 @@ mod tests {
         let port = start_proxy_with(
             dir.path(),
             &log,
-            ProxyConfig { credentials: creds("agent.T-3:s3cret"), ..Default::default() },
+            ProxyConfig {
+                credentials: creds("agent.T-3:s3cret"),
+                ..Default::default()
+            },
         )
         .await;
         let target = format!("http://127.0.0.1:{up}/x");
         let connect = || TcpStream::connect(format!("127.0.0.1:{port}"));
 
         for bad in [None, Some("agent.T-3:wrong"), Some("someone:s3cret")] {
-            let (parts, _) = request_over(connect().await.unwrap(), proxied_get(&target, bad)).await;
+            let (parts, _) =
+                request_over(connect().await.unwrap(), proxied_get(&target, bad)).await;
             assert_eq!(parts.status, 407, "{bad:?}");
-            assert_eq!(parts.headers["proxy-authenticate"], r#"Basic realm="taphttp""#);
+            assert_eq!(
+                parts.headers["proxy-authenticate"],
+                r#"Basic realm="taphttp""#
+            );
         }
-        assert!(seen.lock().await.is_empty(), "rejected requests never reach upstream");
+        assert!(
+            seen.lock().await.is_empty(),
+            "rejected requests never reach upstream"
+        );
 
-        let (parts, body) = request_over(connect().await.unwrap(), proxied_get(&target, Some("agent.T-3:s3cret"))).await;
+        let (parts, body) = request_over(
+            connect().await.unwrap(),
+            proxied_get(&target, Some("agent.T-3:s3cret")),
+        )
+        .await;
         assert_eq!(parts.status, 200);
         assert_eq!(body, "ok");
         tokio::time::sleep(Duration::from_millis(50)).await;
         let entries = logged(&log);
         assert_eq!(entries.len(), 1, "only the authenticated request is logged");
-        assert_eq!(entries[0].source.as_deref(), Some("agent.T-3"), "verified identity recorded");
+        assert_eq!(
+            entries[0].source.as_deref(),
+            Some("agent.T-3"),
+            "verified identity recorded"
+        );
     }
 
     #[tokio::test]
@@ -1382,17 +1577,34 @@ mod tests {
         let log = dir.path().join("t.jsonl");
         // No credentials configured: the username is a self-reported label.
         let port = start_proxy(dir.path(), &log, None).await;
-        let stream = TcpStream::connect(format!("127.0.0.1:{port}")).await.unwrap();
-        let (parts, _) =
-            request_over(stream, proxied_get(&format!("http://127.0.0.1:{up}/"), Some("agent.T-3:not-a-secret"))).await;
+        let stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        let (parts, _) = request_over(
+            stream,
+            proxied_get(
+                &format!("http://127.0.0.1:{up}/"),
+                Some("agent.T-3:not-a-secret"),
+            ),
+        )
+        .await;
         assert_eq!(parts.status, 200);
 
         let upstream = seen.lock().await;
-        assert!(!upstream[0].contains_key("proxy-authorization"), "credentials must not leak to the target");
+        assert!(
+            !upstream[0].contains_key("proxy-authorization"),
+            "credentials must not leak to the target"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
         let raw = std::fs::read_to_string(&log).unwrap();
-        assert!(!raw.to_ascii_lowercase().contains("proxy-authorization"), "{raw}");
-        assert!(!raw.contains("not-a-secret") && !raw.contains(&basic_header("agent.T-3:not-a-secret")[6..]));
+        assert!(
+            !raw.to_ascii_lowercase().contains("proxy-authorization"),
+            "{raw}"
+        );
+        assert!(
+            !raw.contains("not-a-secret")
+                && !raw.contains(&basic_header("agent.T-3:not-a-secret")[6..])
+        );
         let entries = logged(&log);
         assert_eq!(entries[0].source.as_deref(), Some("agent.T-3"));
     }
@@ -1412,8 +1624,14 @@ mod tests {
         .await;
         tokio::time::sleep(Duration::from_millis(10)).await;
         let port = start_proxy(dir.path(), &dir.path().join("t.jsonl"), Some(socket_path)).await;
-        let stream = TcpStream::connect(format!("127.0.0.1:{port}")).await.unwrap();
-        request_over(stream, proxied_get(&format!("http://127.0.0.1:{up}/"), None)).await;
+        let stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        request_over(
+            stream,
+            proxied_get(&format!("http://127.0.0.1:{up}/"), None),
+        )
+        .await;
         let upstream = seen.lock().await;
         assert_eq!(upstream[0]["x-kept"], "1", "the hook's other headers apply");
         assert!(!upstream[0].contains_key("proxy-authorization"));
@@ -1425,8 +1643,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let log = dir.path().join("t.jsonl");
         let port = start_proxy(dir.path(), &log, None).await;
-        let stream = TcpStream::connect(format!("127.0.0.1:{port}")).await.unwrap();
-        request_over(stream, proxied_get(&format!("http://127.0.0.1:{up}/"), None)).await;
+        let stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        request_over(
+            stream,
+            proxied_get(&format!("http://127.0.0.1:{up}/"), None),
+        )
+        .await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(logged(&log)[0].source, None);
     }
@@ -1440,7 +1664,9 @@ mod tests {
         auth: Option<&str>,
         dir: &std::path::Path,
     ) -> (u16, Option<tokio_rustls::client::TlsStream<TcpStream>>) {
-        let mut stream = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await.unwrap();
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{proxy_port}"))
+            .await
+            .unwrap();
         let mut head = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n");
         if let Some(a) = auth {
             head.push_str(&format!("Proxy-Authorization: {}\r\n", basic_header(a)));
@@ -1461,7 +1687,10 @@ mod tests {
         }
         let host = authority.rsplit_once(':').unwrap().0.to_string();
         let tls = tls_connector(dir)
-            .connect(rustls::pki_types::ServerName::try_from(host).unwrap(), stream)
+            .connect(
+                rustls::pki_types::ServerName::try_from(host).unwrap(),
+                stream,
+            )
             .await
             .unwrap();
         (status, Some(tls))
@@ -1475,7 +1704,9 @@ mod tests {
         for c in rustls_pemfile::certs(&mut pem.as_bytes()) {
             roots.add(c.unwrap()).unwrap();
         }
-        let cfg = ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+        let cfg = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
         tokio_rustls::TlsConnector::from(Arc::new(cfg))
     }
 
@@ -1486,18 +1717,33 @@ mod tests {
         let port = start_proxy_with(
             dir.path(),
             &log,
-            ProxyConfig { credentials: creds("agent.T-3:s3cret"), ..Default::default() },
+            ProxyConfig {
+                credentials: creds("agent.T-3:s3cret"),
+                ..Default::default()
+            },
         )
         .await;
         // Nothing listens on :9 upstream, so the exchange records as a 502;
         // what matters is the auth decision and the recorded source.
         let authority = "localhost:9";
-        assert_eq!(connect_tunnel(port, authority, None, dir.path()).await.0, 407);
-        assert_eq!(connect_tunnel(port, authority, Some("agent.T-3:nope"), dir.path()).await.0, 407);
+        assert_eq!(
+            connect_tunnel(port, authority, None, dir.path()).await.0,
+            407
+        );
+        assert_eq!(
+            connect_tunnel(port, authority, Some("agent.T-3:nope"), dir.path())
+                .await
+                .0,
+            407
+        );
 
-        let (status, tls) = connect_tunnel(port, authority, Some("agent.T-3:s3cret"), dir.path()).await;
+        let (status, tls) =
+            connect_tunnel(port, authority, Some("agent.T-3:s3cret"), dir.path()).await;
         assert_eq!(status, 200);
-        let req = Request::get("/inside").header("host", "localhost").body(Full::new(Bytes::new())).unwrap();
+        let req = Request::get("/inside")
+            .header("host", "localhost")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
         let (parts, _) = request_over(tls.unwrap(), req).await;
         assert_eq!(parts.status, 502);
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1513,13 +1759,26 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let log = dir.path().join("t.jsonl");
         let allow = vec!["10.0.0.0/8".parse().unwrap()];
-        let port = start_proxy_with(dir.path(), &log, ProxyConfig { allow_clients: allow, ..Default::default() }).await;
+        let port = start_proxy_with(
+            dir.path(),
+            &log,
+            ProxyConfig {
+                allow_clients: allow,
+                ..Default::default()
+            },
+        )
+        .await;
 
-        let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).await.unwrap();
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
         let req = format!("GET http://127.0.0.1:{up}/ HTTP/1.1\r\nHost: x\r\n\r\n");
         let _ = stream.write_all(req.as_bytes()).await;
         let mut buf = Vec::new();
-        let n = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut buf)).await.unwrap().unwrap_or(0);
+        let n = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut buf))
+            .await
+            .unwrap()
+            .unwrap_or(0);
         assert_eq!(n, 0, "closed without a response");
         assert!(seen.lock().await.is_empty());
 
@@ -1527,11 +1786,23 @@ mod tests {
         let ok = start_proxy_with(
             dir.path(),
             &log,
-            ProxyConfig { allow_clients: vec!["127.0.0.0/8".parse().unwrap()], ..Default::default() },
+            ProxyConfig {
+                allow_clients: vec!["127.0.0.0/8".parse().unwrap()],
+                ..Default::default()
+            },
         )
         .await;
         let stream = TcpStream::connect(format!("127.0.0.1:{ok}")).await.unwrap();
-        assert_eq!(request_over(stream, proxied_get(&format!("http://127.0.0.1:{up}/"), None)).await.0.status, 200);
+        assert_eq!(
+            request_over(
+                stream,
+                proxied_get(&format!("http://127.0.0.1:{up}/"), None)
+            )
+            .await
+            .0
+            .status,
+            200
+        );
     }
 
     #[tokio::test]
@@ -1540,13 +1811,32 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let log = dir.path().join("t.jsonl");
         let expires = Some(Utc::now() - chrono::Duration::seconds(1));
-        let port = start_proxy_with(dir.path(), &log, ProxyConfig { expires, ..Default::default() }).await;
-        let stream = TcpStream::connect(format!("127.0.0.1:{port}")).await.unwrap();
-        let (parts, body) = request_over(stream, proxied_get(&format!("http://127.0.0.1:{up}/"), None)).await;
+        let port = start_proxy_with(
+            dir.path(),
+            &log,
+            ProxyConfig {
+                expires,
+                ..Default::default()
+            },
+        )
+        .await;
+        let stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        let (parts, body) = request_over(
+            stream,
+            proxied_get(&format!("http://127.0.0.1:{up}/"), None),
+        )
+        .await;
         assert_eq!(parts.status, 503);
         assert!(String::from_utf8_lossy(&body).contains("expired"));
         assert!(seen.lock().await.is_empty());
-        assert_eq!(connect_tunnel(port, "localhost:9", None, dir.path()).await.0, 503);
+        assert_eq!(
+            connect_tunnel(port, "localhost:9", None, dir.path())
+                .await
+                .0,
+            503
+        );
     }
 
     #[tokio::test]
@@ -1559,24 +1849,46 @@ mod tests {
         let port = start_proxy_with(
             dir.path(),
             &log,
-            ProxyConfig { tls, credentials: creds("you:pw"), ..Default::default() },
+            ProxyConfig {
+                tls,
+                credentials: creds("you:pw"),
+                ..Default::default()
+            },
         )
         .await;
 
-        let tcp = TcpStream::connect(format!("127.0.0.1:{port}")).await.unwrap();
+        let tcp = TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
         let name = rustls::pki_types::ServerName::try_from("127.0.0.1").unwrap();
-        let stream = tls_connector(dir.path()).connect(name, tcp).await.expect("listener cert chains to ca.crt");
-        let (parts, body) = request_over(stream, proxied_get(&format!("http://127.0.0.1:{up}/"), Some("you:pw"))).await;
+        let stream = tls_connector(dir.path())
+            .connect(name, tcp)
+            .await
+            .expect("listener cert chains to ca.crt");
+        let (parts, body) = request_over(
+            stream,
+            proxied_get(&format!("http://127.0.0.1:{up}/"), Some("you:pw")),
+        )
+        .await;
         assert_eq!((parts.status.as_u16(), body.as_ref()), (200, &b"ok"[..]));
         assert_eq!(seen.lock().await.len(), 1);
 
         // A plaintext client gets no HTTP response from a TLS listener.
-        let mut plain = TcpStream::connect(format!("127.0.0.1:{port}")).await.unwrap();
-        plain.write_all(format!("GET http://127.0.0.1:{up}/ HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes()).await.unwrap();
+        let mut plain = TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        plain
+            .write_all(format!("GET http://127.0.0.1:{up}/ HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
         let mut buf = Vec::new();
         let _ = tokio::time::timeout(Duration::from_secs(5), plain.read_to_end(&mut buf)).await;
         assert!(!String::from_utf8_lossy(&buf).starts_with("HTTP/1.1 200"));
-        assert_eq!(seen.lock().await.len(), 1, "plaintext request never forwarded");
+        assert_eq!(
+            seen.lock().await.len(),
+            1,
+            "plaintext request never forwarded"
+        );
     }
 
     #[test]
@@ -1584,7 +1896,10 @@ mod tests {
         let a: SocketAddr = "10.0.0.5:8443".parse().unwrap();
         let any: SocketAddr = "0.0.0.0:8443".parse().unwrap();
         assert_eq!(tls_names(&[], &[Some(a)]).unwrap(), ["10.0.0.5"]);
-        assert_eq!(tls_names(&["proxy.lan".into()], &[Some(any), Some(a)]).unwrap(), ["10.0.0.5", "proxy.lan"]);
+        assert_eq!(
+            tls_names(&["proxy.lan".into()], &[Some(any), Some(a)]).unwrap(),
+            ["10.0.0.5", "proxy.lan"]
+        );
         let err = tls_names(&[], &[Some(any), None]).unwrap_err().to_string();
         assert!(err.contains("--tls-name"), "{err}");
     }
@@ -1599,7 +1914,10 @@ mod tests {
         let store = Store::new(Some(&log_file), None).unwrap();
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_port = proxy_listener.local_addr().unwrap().port();
-        let config = ProxyConfig { filter_host: Some("only-this-host.example".to_string()), ..Default::default() };
+        let config = ProxyConfig {
+            filter_host: Some("only-this-host.example".to_string()),
+            ..Default::default()
+        };
         tokio::spawn(serve(proxy_listener, ca, store, config));
         tokio::time::sleep(Duration::from_millis(20)).await;
 
@@ -1621,8 +1939,11 @@ mod tests {
         let socket_path = dir.path().join("intercept.sock");
 
         // Decision: drop the request before it reaches the server
-        start_mock_interceptor(socket_path.clone(), vec![r#"{"action":"drop","status":403}"#])
-            .await;
+        start_mock_interceptor(
+            socket_path.clone(),
+            vec![r#"{"action":"drop","status":403}"#],
+        )
+        .await;
         tokio::time::sleep(Duration::from_millis(10)).await;
 
         let proxy_port = start_proxy(dir.path(), &log_file, Some(socket_path)).await;

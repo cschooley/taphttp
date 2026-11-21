@@ -164,7 +164,9 @@ mod tests {
 
         let listener = UnixListener::bind(&socket_path).unwrap();
         tokio::spawn(async move {
-            let Ok((stream, _)) = listener.accept().await else { return };
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
             let (reader, mut writer) = tokio::io::split(stream);
             let mut reader = BufReader::new(reader);
             let mut line = String::new();
@@ -182,8 +184,7 @@ mod tests {
         });
         pause(&socket_path, &event).await.unwrap();
 
-        let json: serde_json::Value =
-            serde_json::from_str(&received.lock().await).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&received.lock().await).unwrap();
         assert_eq!(json["type"], "response");
         assert_eq!(json["status"], 200);
         assert_eq!(json["request_id"], "req-id");

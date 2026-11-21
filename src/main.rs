@@ -9,8 +9,8 @@ mod replay;
 mod storage;
 
 use anyhow::Result;
-use cli::{Cli, Commands};
 use clap::Parser;
+use cli::{Cli, Commands};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]

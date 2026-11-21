@@ -94,7 +94,9 @@ async fn send_request(
     for (k, v) in req_headers.iter() {
         builder = builder.header(k, v);
     }
-    let req = builder.body(Full::new(Bytes::from(req_body))).context("building request")?;
+    let req = builder
+        .body(Full::new(Bytes::from(req_body)))
+        .context("building request")?;
 
     let scheme = uri.scheme_str().unwrap_or("http");
     let start = Instant::now();
@@ -145,7 +147,8 @@ pub async fn run(args: ReplayArgs, data_dir: PathBuf) -> Result<()> {
     };
     for kv in &args.headers {
         let (k, v) = kv.split_once(':').context("header must be key:value")?;
-        mods.headers.push((k.trim().to_string(), v.trim().to_string()));
+        mods.headers
+            .push((k.trim().to_string(), v.trim().to_string()));
     }
 
     eprintln!("Replaying {} {}", original.method, original.url);
@@ -201,9 +204,9 @@ mod tests {
                             service_fn(move |_req: Request<Incoming>| {
                                 hit.store(true, Ordering::SeqCst);
                                 async move {
-                                    Ok::<_, anyhow::Error>(Response::new(Full::new(
-                                        Bytes::from("replayed"),
-                                    )))
+                                    Ok::<_, anyhow::Error>(Response::new(Full::new(Bytes::from(
+                                        "replayed",
+                                    ))))
                                 }
                             }),
                         )
@@ -243,9 +246,13 @@ mod tests {
         let log = dir.path().join("traffic.jsonl");
         let store = Store::new(Some(&log), None).unwrap();
 
-        let replay = replay_entry(&store, upstream_entry("orig-1", port, "GET"), &ReplayMods::default())
-            .await
-            .unwrap();
+        let replay = replay_entry(
+            &store,
+            upstream_entry("orig-1", port, "GET"),
+            &ReplayMods::default(),
+        )
+        .await
+        .unwrap();
 
         // The returned entry is a distinct, linked exchange with the captured response.
         assert_ne!(replay.id, "orig-1", "replay gets its own id");
@@ -256,7 +263,9 @@ mod tests {
         // And it was persisted to the log, linked to the original.
         let logged = storage::load_entries(&log).unwrap();
         assert!(
-            logged.iter().any(|e| e.replay_of.as_deref() == Some("orig-1") && e.id == replay.id),
+            logged
+                .iter()
+                .any(|e| e.replay_of.as_deref() == Some("orig-1") && e.id == replay.id),
             "replay must be recorded in the traffic log"
         );
     }
@@ -271,7 +280,9 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
-            let Ok((stream, _)) = listener.accept().await else { return };
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
             hyper::server::conn::http1::Builder::new()
                 .serve_connection(
                     hyper_util::rt::TokioIo::new(stream),
@@ -302,7 +313,11 @@ mod tests {
     }
 
     fn values<'a>(headers: &'a [(String, Vec<u8>)], name: &str) -> Vec<&'a [u8]> {
-        headers.iter().filter(|(k, _)| k == name).map(|(_, v)| v.as_slice()).collect()
+        headers
+            .iter()
+            .filter(|(k, _)| k == name)
+            .map(|(_, v)| v.as_slice())
+            .collect()
     }
 
     #[tokio::test]
@@ -321,12 +336,21 @@ mod tests {
         // Go through the log as the CLI would, so base64 is decoded from disk.
         JsonLinesBackend::new(&log).append(&original).unwrap();
         let original = storage::load_entry(&log, "bin-1").unwrap();
-        assert_eq!(original.req_body_encoding, taphttp_types::BodyEncoding::Base64);
+        assert_eq!(
+            original.req_body_encoding,
+            taphttp_types::BodyEncoding::Base64
+        );
 
-        let replay = replay_entry(&store, original, &ReplayMods::default()).await.unwrap();
+        let replay = replay_entry(&store, original, &ReplayMods::default())
+            .await
+            .unwrap();
 
         let (headers, got_body) = seen.lock().await.clone().unwrap();
-        assert_eq!(values(&headers, "x-multi"), [b"one", b"two"], "repeated headers sent as captured");
+        assert_eq!(
+            values(&headers, "x-multi"),
+            [b"one", b"two"],
+            "repeated headers sent as captured"
+        );
         assert_eq!(got_body, body, "base64 body decoded before sending");
 
         // The recorded replay keeps both Set-Cookies and the binary response.
@@ -335,7 +359,10 @@ mod tests {
             logged.res_headers.get_all("set-cookie").collect::<Vec<_>>(),
             ["s=1; Secure", "t=2; HttpOnly"]
         );
-        assert_eq!(logged.res_body_bytes().unwrap().as_deref(), Some(&[0xde, 0xad, 0x00, 0xff][..]));
+        assert_eq!(
+            logged.res_body_bytes().unwrap().as_deref(),
+            Some(&[0xde, 0xad, 0x00, 0xff][..])
+        );
         assert_eq!(logged.req_body_bytes().unwrap().as_deref(), Some(body));
     }
 
@@ -367,12 +394,18 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = Store::new(Some(&dir.path().join("traffic.jsonl")), None).unwrap();
 
-        let mods = ReplayMods { method: Some("post".to_string()), ..Default::default() };
+        let mods = ReplayMods {
+            method: Some("post".to_string()),
+            ..Default::default()
+        };
         let replay = replay_entry(&store, upstream_entry("orig-2", port, "GET"), &mods)
             .await
             .unwrap();
 
-        assert_eq!(replay.method, "POST", "method override is applied and upcased");
+        assert_eq!(
+            replay.method, "POST",
+            "method override is applied and upcased"
+        );
         assert!(hit.load(Ordering::SeqCst));
     }
 
@@ -402,7 +435,9 @@ mod tests {
             source: None,
         };
 
-        JsonLinesBackend::new(&data_dir.join("traffic.jsonl")).append(&entry).unwrap();
+        JsonLinesBackend::new(&data_dir.join("traffic.jsonl"))
+            .append(&entry)
+            .unwrap();
 
         let args = ReplayArgs {
             id: "replay-test-id".to_string(),
@@ -415,7 +450,10 @@ mod tests {
         run(args, data_dir).await.unwrap();
 
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(hit.load(Ordering::SeqCst), "capture server should have been hit by replay");
+        assert!(
+            hit.load(Ordering::SeqCst),
+            "capture server should have been hit by replay"
+        );
     }
 
     #[tokio::test]
@@ -444,7 +482,9 @@ mod tests {
             source: None,
         };
 
-        JsonLinesBackend::new(&data_dir.join("traffic.jsonl")).append(&entry).unwrap();
+        JsonLinesBackend::new(&data_dir.join("traffic.jsonl"))
+            .append(&entry)
+            .unwrap();
 
         let args = ReplayArgs {
             id: "override-id".to_string(),
@@ -467,7 +507,9 @@ mod tests {
         let data_dir = TempDir::new().unwrap();
         let elsewhere = TempDir::new().unwrap();
         let log = elsewhere.path().join("capture.jsonl");
-        JsonLinesBackend::new(&log).append(&upstream_entry("custom-log-id", port, "GET")).unwrap();
+        JsonLinesBackend::new(&log)
+            .append(&upstream_entry("custom-log-id", port, "GET"))
+            .unwrap();
 
         let args = ReplayArgs {
             id: "custom-log-id".to_string(),
@@ -481,7 +523,9 @@ mod tests {
         assert!(hit.load(Ordering::SeqCst), "replay should reach upstream");
         let logged = storage::load_entries(&log).unwrap();
         assert!(
-            logged.iter().any(|e| e.replay_of.as_deref() == Some("custom-log-id")),
+            logged
+                .iter()
+                .any(|e| e.replay_of.as_deref() == Some("custom-log-id")),
             "replay must be recorded in the log it was read from"
         );
         assert!(
@@ -500,9 +544,18 @@ mod tests {
             headers: vec![],
             body: None,
         };
-        let err = format!("{:#}", run(args, data_dir.path().to_path_buf()).await.unwrap_err());
-        assert!(err.contains("traffic.jsonl"), "error should name the path: {err}");
-        assert!(err.contains("--log-file"), "error should point at --log-file: {err}");
+        let err = format!(
+            "{:#}",
+            run(args, data_dir.path().to_path_buf()).await.unwrap_err()
+        );
+        assert!(
+            err.contains("traffic.jsonl"),
+            "error should name the path: {err}"
+        );
+        assert!(
+            err.contains("--log-file"),
+            "error should point at --log-file: {err}"
+        );
     }
 
     #[tokio::test]

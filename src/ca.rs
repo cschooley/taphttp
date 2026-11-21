@@ -1,14 +1,11 @@
+use crate::cli::{CaAction, CaArgs};
 use anyhow::{Context, Result};
-use rcgen::{
-    BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa,
-    KeyPair,
-};
+use rcgen::{BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use std::collections::HashMap;
-use crate::cli::{CaArgs, CaAction};
 
 pub struct Ca {
     cert: rcgen::Certificate,
@@ -25,10 +22,8 @@ impl Ca {
         let key_path = data_dir.join("ca.key");
 
         if cert_path.exists() && key_path.exists() {
-            let key_pem = std::fs::read_to_string(&key_path)
-                .context("reading CA key")?;
-            let cert_pem = std::fs::read_to_string(&cert_path)
-                .context("reading CA cert")?;
+            let key_pem = std::fs::read_to_string(&key_path).context("reading CA key")?;
+            let cert_pem = std::fs::read_to_string(&cert_path).context("reading CA cert")?;
             let key = KeyPair::from_pem(&key_pem).context("parsing CA key")?;
             // Older versions wrote the key world-readable; tighten it.
             if let Err(e) = restrict_to_owner(&key_path) {
@@ -37,8 +32,8 @@ impl Ca {
                     key_path.display()
                 );
             }
-            let params = CertificateParams::from_ca_cert_pem(&cert_pem)
-                .context("parsing CA cert params")?;
+            let params =
+                CertificateParams::from_ca_cert_pem(&cert_pem).context("parsing CA cert params")?;
             let cert = params.self_signed(&key).context("re-signing CA cert")?;
             let disk_der = rustls_pemfile::certs(&mut cert_pem.as_bytes())
                 .next()
@@ -91,7 +86,12 @@ impl Ca {
     /// SHA-256 of the CA certificate, `AB:CD:...`, for pinning.
     pub fn fingerprint_sha256(&self) -> String {
         let digest = ring::digest::digest(&ring::digest::SHA256, &self.disk_der);
-        digest.as_ref().iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(":")
+        digest
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02X}"))
+            .collect::<Vec<_>>()
+            .join(":")
     }
 
     /// TLS config for taphttp's own listeners (the HTTPS proxy, the lever
@@ -109,15 +109,21 @@ impl Ca {
     }
 
     /// The leaf + CA chain and key a listener serves.
-    fn listener_chain(&self, names: &[String]) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+    fn listener_chain(
+        &self,
+        names: &[String],
+    ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
         let key = KeyPair::generate().context("generating listener key")?;
-        let mut params = CertificateParams::new(names.to_vec()).context("building listener cert params")?;
+        let mut params =
+            CertificateParams::new(names.to_vec()).context("building listener cert params")?;
         let mut dn = DistinguishedName::new();
         dn.push(DnType::CommonName, "taphttp listener");
         params.distinguished_name = dn;
         params.not_before = rcgen::date_time_ymd(2024, 1, 1);
         params.not_after = rcgen::date_time_ymd(2035, 1, 1);
-        let leaf = params.signed_by(&key, &self.cert, &self.key).context("signing listener cert")?;
+        let leaf = params
+            .signed_by(&key, &self.cert, &self.key)
+            .context("signing listener cert")?;
         let chain = vec![
             CertificateDer::from(leaf.der().to_vec()),
             CertificateDer::from(self.disk_der.clone()),
@@ -137,8 +143,8 @@ impl Ca {
         }
 
         let key = KeyPair::generate().context("generating leaf key")?;
-        let mut params = CertificateParams::new(vec![host.to_string()])
-            .context("building leaf cert params")?;
+        let mut params =
+            CertificateParams::new(vec![host.to_string()]).context("building leaf cert params")?;
         params.not_before = rcgen::date_time_ymd(2024, 1, 1);
         params.not_after = rcgen::date_time_ymd(2035, 1, 1);
         let leaf = params
@@ -146,9 +152,7 @@ impl Ca {
             .context("signing leaf cert")?;
 
         let cert_der = CertificateDer::from(leaf.der().to_vec());
-        let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-            key.serialize_der(),
-        ));
+        let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
 
         let server_cfg = rustls::ServerConfig::builder()
             .with_no_client_auth()
@@ -245,7 +249,11 @@ mod tests {
     fn new_ca_key_is_owner_only() {
         let dir = TempDir::new().unwrap();
         Ca::load_or_create(dir.path()).unwrap();
-        assert_eq!(mode(&dir.path().join("ca.key")), 0o600, "CA private key must be owner-only");
+        assert_eq!(
+            mode(&dir.path().join("ca.key")),
+            0o600,
+            "CA private key must be owner-only"
+        );
     }
 
     #[cfg(unix)]
@@ -269,7 +277,10 @@ mod tests {
         assert_eq!(a, b, "a pin must survive restarts");
         assert_eq!(a.len(), 32 * 3 - 1);
         let pem = std::fs::read_to_string(dir.path().join("ca.crt")).unwrap();
-        let der = rustls_pemfile::certs(&mut pem.as_bytes()).next().unwrap().unwrap();
+        let der = rustls_pemfile::certs(&mut pem.as_bytes())
+            .next()
+            .unwrap()
+            .unwrap();
         let want = ring::digest::digest(&ring::digest::SHA256, &der);
         assert!(a.starts_with(&format!("{:02X}:", want.as_ref()[0])));
     }
@@ -279,7 +290,9 @@ mod tests {
         install_crypto_provider();
         let dir = TempDir::new().unwrap();
         let ca = Ca::load_or_create(dir.path()).unwrap();
-        let cfg = ca.listener_tls_config(&["proxy.example".into(), "10.0.0.5".into()]).unwrap();
+        let cfg = ca
+            .listener_tls_config(&["proxy.example".into(), "10.0.0.5".into()])
+            .unwrap();
         assert_eq!(cfg.alpn_protocols, vec![b"http/1.1".to_vec()]);
 
         // Verify the served leaf with a client that trusts only ca.crt.
@@ -289,17 +302,33 @@ mod tests {
             roots.add(c.unwrap()).unwrap();
         }
         use rustls::client::danger::ServerCertVerifier;
-        let verifier = rustls::client::WebPkiServerVerifier::builder(Arc::new(roots)).build().unwrap();
-        let (chain, _) = ca.listener_chain(&["proxy.example".into(), "10.0.0.5".into()]).unwrap();
+        let verifier = rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
+            .build()
+            .unwrap();
+        let (chain, _) = ca
+            .listener_chain(&["proxy.example".into(), "10.0.0.5".into()])
+            .unwrap();
         for name in ["proxy.example", "10.0.0.5"] {
             let sn = rustls::pki_types::ServerName::try_from(name).unwrap();
             verifier
-                .verify_server_cert(&chain[0], &chain[1..], &sn, &[], rustls::pki_types::UnixTime::now())
+                .verify_server_cert(
+                    &chain[0],
+                    &chain[1..],
+                    &sn,
+                    &[],
+                    rustls::pki_types::UnixTime::now(),
+                )
                 .unwrap_or_else(|e| panic!("{name}: {e}"));
         }
         let wrong = rustls::pki_types::ServerName::try_from("other.example").unwrap();
         assert!(verifier
-            .verify_server_cert(&chain[0], &chain[1..], &wrong, &[], rustls::pki_types::UnixTime::now())
+            .verify_server_cert(
+                &chain[0],
+                &chain[1..],
+                &wrong,
+                &[],
+                rustls::pki_types::UnixTime::now()
+            )
             .is_err());
     }
 
@@ -318,7 +347,10 @@ mod tests {
             .unwrap()
             .modified()
             .unwrap();
-        assert_eq!(mtime, mtime2, "ca.crt should not be regenerated on second load");
+        assert_eq!(
+            mtime, mtime2,
+            "ca.crt should not be regenerated on second load"
+        );
     }
 
     #[test]
@@ -363,4 +395,3 @@ mod tests {
         assert!(pem.trim_end().ends_with("-----END CERTIFICATE-----"));
     }
 }
-

@@ -100,7 +100,10 @@ pub fn load_or_create_token_file(path: &Path) -> Result<String> {
             Ok(token)
         }
         Err(e) => Err(e).with_context(|| {
-            format!("creating API token file {} (is its directory writable?)", path.display())
+            format!(
+                "creating API token file {} (is its directory writable?)",
+                path.display()
+            )
         }),
     }
 }
@@ -143,7 +146,9 @@ async fn require_token(State(state): State<Arc<ApiState>>, req: Request, next: N
 
 /// Pull `token` out of a `&`-separated query string, if present.
 fn token_from_query(query: &str) -> Option<&str> {
-    query.split('&').find_map(|pair| pair.strip_prefix("token="))
+    query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("token="))
 }
 
 /// Constant-time comparison so token validation does not leak the secret
@@ -163,7 +168,11 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 
 /// Bind `addr` and serve the lever API until the process exits, over TLS
 /// when `tls` is given.
-pub async fn serve(state: Arc<ApiState>, addr: SocketAddr, tls: Option<Arc<rustls::ServerConfig>>) -> Result<()> {
+pub async fn serve(
+    state: Arc<ApiState>,
+    addr: SocketAddr,
+    tls: Option<Arc<rustls::ServerConfig>>,
+) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let bound = listener.local_addr()?;
     let scheme = if tls.is_some() { "https" } else { "http" };
@@ -178,7 +187,11 @@ pub async fn serve(state: Arc<ApiState>, addr: SocketAddr, tls: Option<Arc<rustl
 
 /// Accept TLS connections and serve `app` on each (HTTP/1.1, with upgrades
 /// so the `/feed` WebSocket works).
-async fn serve_tls(listener: tokio::net::TcpListener, app: Router, cfg: Arc<rustls::ServerConfig>) -> Result<()> {
+async fn serve_tls(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    cfg: Arc<rustls::ServerConfig>,
+) -> Result<()> {
     use tower::ServiceExt;
     let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
     loop {
@@ -193,9 +206,10 @@ async fn serve_tls(listener: tokio::net::TcpListener, app: Router, cfg: Arc<rust
                     return;
                 }
             };
-            let svc = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
-                app.clone().oneshot(req)
-            });
+            let svc =
+                hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                    app.clone().oneshot(req)
+                });
             if let Err(e) = hyper::server::conn::http1::Builder::new()
                 .serve_connection(hyper_util::rt::TokioIo::new(tls), svc)
                 .with_upgrades()
@@ -213,32 +227,52 @@ async fn schema() -> Json<serde_json::Value> {
 }
 
 fn no_history() -> Response {
-    (StatusCode::SERVICE_UNAVAILABLE, "no sqlite history configured").into_response()
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        "no sqlite history configured",
+    )
+        .into_response()
 }
 
 fn db_error(e: impl std::fmt::Display) -> Response {
     tracing::warn!("lever API history error: {e}");
-    (StatusCode::INTERNAL_SERVER_ERROR, format!("history error: {e}")).into_response()
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("history error: {e}"),
+    )
+        .into_response()
 }
 
 /// `GET /exchanges` — history, newest first. Filters: `host`, `method`,
 /// `status`, `q` (URL or host text), `since` / `until` (RFC 3339). Paging:
 /// `limit` (default 100, max 500) and `before=<id>` (the last id of the
 /// previous page). An unknown `before` id is a 404.
-async fn exchanges(State(state): State<Arc<ApiState>>, Query(query): Query<HistoryQuery>) -> Response {
-    let Some(history) = state.store.history() else { return no_history() };
+async fn exchanges(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<HistoryQuery>,
+) -> Response {
+    let Some(history) = state.store.history() else {
+        return no_history();
+    };
     match history.query(&query) {
         Ok(entries) => Json(entries).into_response(),
-        Err(HistoryError::UnknownCursor(id)) => {
-            (StatusCode::NOT_FOUND, format!("unknown cursor: no exchange with id {id}")).into_response()
-        }
+        Err(HistoryError::UnknownCursor(id)) => (
+            StatusCode::NOT_FOUND,
+            format!("unknown cursor: no exchange with id {id}"),
+        )
+            .into_response(),
         Err(HistoryError::Db(e)) => db_error(e),
     }
 }
 
 /// `GET /exchanges/{id}` — a single exchange by id (indexed), or 404.
-async fn exchange(State(state): State<Arc<ApiState>>, PathParam(id): PathParam<String>) -> Response {
-    let Some(history) = state.store.history() else { return no_history() };
+async fn exchange(
+    State(state): State<Arc<ApiState>>,
+    PathParam(id): PathParam<String>,
+) -> Response {
+    let Some(history) = state.store.history() else {
+        return no_history();
+    };
     match history.get(&id) {
         Ok(Some(entry)) => Json(entry).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, format!("no exchange with id {id}")).into_response(),
@@ -262,11 +296,17 @@ struct ReplayRequest {
 /// `POST /replay` — replay a captured exchange by id, record the result as a
 /// new exchange linked via `replay_of`, and return that recorded entry.
 async fn replay(State(state): State<Arc<ApiState>>, Json(req): Json<ReplayRequest>) -> Response {
-    let Some(history) = state.store.history() else { return no_history() };
+    let Some(history) = state.store.history() else {
+        return no_history();
+    };
     let original = match history.get(&req.id) {
         Ok(Some(e)) => e,
         Ok(None) => {
-            return (StatusCode::NOT_FOUND, format!("no exchange with id {}", req.id)).into_response()
+            return (
+                StatusCode::NOT_FOUND,
+                format!("no exchange with id {}", req.id),
+            )
+                .into_response()
         }
         Err(e) => return db_error(e),
     };
@@ -317,13 +357,19 @@ async fn feed(
 }
 
 async fn send_json(socket: &mut WebSocket, value: &impl serde::Serialize) -> bool {
-    let Ok(text) = serde_json::to_string(value) else { return true };
+    let Ok(text) = serde_json::to_string(value) else {
+        return true;
+    };
     socket.send(Message::Text(text.into())).await.is_ok()
 }
 
 /// Send the `since` backlog, returning the ids sent (so the live phase can
 /// skip entries that arrived in both), or `None` if the client went away.
-async fn send_backlog(socket: &mut WebSocket, history: Option<&SqliteBackend>, since: &str) -> Option<HashSet<String>> {
+async fn send_backlog(
+    socket: &mut WebSocket,
+    history: Option<&SqliteBackend>,
+    since: &str,
+) -> Option<HashSet<String>> {
     let mut sent = HashSet::new();
     let start = history.and_then(|h| h.rowid_of(since).ok().flatten());
     let (Some(history), Some(mut pos)) = (history, start) else {
@@ -427,7 +473,10 @@ mod tests {
 
     fn state_with_db(dir: &TempDir) -> (Arc<ApiState>, Hist) {
         let store = Store::new(None, Some(&dir.path().join("traffic.db"))).unwrap();
-        let state = Arc::new(ApiState { store: store.clone(), token: TEST_TOKEN.to_string() });
+        let state = Arc::new(ApiState {
+            store: store.clone(),
+            token: TEST_TOKEN.to_string(),
+        });
         (state, Hist(store))
     }
 
@@ -440,7 +489,9 @@ mod tests {
     }
 
     async fn body_json(resp: Response) -> serde_json::Value {
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         serde_json::from_slice(&bytes).unwrap()
     }
 
@@ -541,8 +592,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (state, log) = state_with_db(&dir);
         let backend = &log;
-        backend.append(&entry("a", "api.example.com", "GET", 200)).unwrap();
-        backend.append(&entry("b", "api.example.com", "POST", 201)).unwrap();
+        backend
+            .append(&entry("a", "api.example.com", "GET", 200))
+            .unwrap();
+        backend
+            .append(&entry("b", "api.example.com", "POST", 201))
+            .unwrap();
         backend.append(&entry("c", "other.io", "GET", 404)).unwrap();
 
         let resp = router(state)
@@ -550,7 +605,12 @@ mod tests {
             .await
             .unwrap();
         let json = body_json(resp).await;
-        let ids: Vec<&str> = json.as_array().unwrap().iter().map(|e| e["id"].as_str().unwrap()).collect();
+        let ids: Vec<&str> = json
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["id"].as_str().unwrap())
+            .collect();
         assert_eq!(ids, ["c", "a"], "newest first");
     }
 
@@ -562,7 +622,10 @@ mod tests {
         backend.append(&entry("a", "x.com", "GET", 200)).unwrap();
         backend.append(&entry("b", "y.com", "POST", 201)).unwrap();
 
-        let resp = router(state).oneshot(authed_get("/exchanges/b")).await.unwrap();
+        let resp = router(state)
+            .oneshot(authed_get("/exchanges/b"))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let json = body_json(resp).await;
         assert_eq!(json["id"], "b");
@@ -575,16 +638,25 @@ mod tests {
         let (state, log) = state_with_db(&dir);
         log.append(&entry("a", "x.com", "GET", 200)).unwrap();
 
-        let resp = router(state).oneshot(authed_get("/exchanges/missing")).await.unwrap();
+        let resp = router(state)
+            .oneshot(authed_get("/exchanges/missing"))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
     async fn history_endpoints_without_sqlite_are_unavailable() {
         let store = Store::new(None, None).unwrap();
-        let state = Arc::new(ApiState { store, token: TEST_TOKEN.to_string() });
+        let state = Arc::new(ApiState {
+            store,
+            token: TEST_TOKEN.to_string(),
+        });
         for path in ["/exchanges", "/exchanges/x"] {
-            let resp = router(state.clone()).oneshot(authed_get(path)).await.unwrap();
+            let resp = router(state.clone())
+                .oneshot(authed_get(path))
+                .await
+                .unwrap();
             assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
         }
     }
@@ -596,17 +668,25 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let (state, log) = state_with_db(&dir);
         for i in 0..7 {
-            log.append(&entry(&format!("e{i}"), "x.com", "GET", 200)).unwrap();
+            log.append(&entry(&format!("e{i}"), "x.com", "GET", 200))
+                .unwrap();
         }
         let page = |q: String| {
             let state = state.clone();
             async move {
                 let json = body_json(router(state).oneshot(authed_get(&q)).await.unwrap()).await;
-                json.as_array().unwrap().iter().map(|e| e["id"].as_str().unwrap().to_string()).collect::<Vec<_>>()
+                json.as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|e| e["id"].as_str().unwrap().to_string())
+                    .collect::<Vec<_>>()
             }
         };
         assert_eq!(page("/exchanges?limit=3".into()).await, ["e6", "e5", "e4"]);
-        assert_eq!(page("/exchanges?limit=3&before=e4".into()).await, ["e3", "e2", "e1"]);
+        assert_eq!(
+            page("/exchanges?limit=3&before=e4".into()).await,
+            ["e3", "e2", "e1"]
+        );
         assert_eq!(page("/exchanges?limit=3&before=e1".into()).await, ["e0"]);
     }
 
@@ -614,7 +694,10 @@ mod tests {
     async fn exchanges_unknown_cursor_is_not_found() {
         let dir = TempDir::new().unwrap();
         let (state, _) = state_with_db(&dir);
-        let resp = router(state).oneshot(authed_get("/exchanges?before=gone")).await.unwrap();
+        let resp = router(state)
+            .oneshot(authed_get("/exchanges?before=gone"))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
@@ -632,7 +715,13 @@ mod tests {
         log.append(&b).unwrap();
         log.append(&entry("c", "other.io", "GET", 200)).unwrap();
 
-        let json = body_json(router(state.clone()).oneshot(authed_get("/exchanges?q=login")).await.unwrap()).await;
+        let json = body_json(
+            router(state.clone())
+                .oneshot(authed_get("/exchanges?q=login"))
+                .await
+                .unwrap(),
+        )
+        .await;
         assert_eq!(json.as_array().unwrap().len(), 2);
         let json = body_json(
             router(state)
@@ -653,7 +742,13 @@ mod tests {
         e.res_headers.append("set-cookie", "a=1");
         e.res_headers.append("set-cookie", "b=2");
         log.append(&e).unwrap();
-        let json = body_json(router(state).oneshot(authed_get("/exchanges/v3")).await.unwrap()).await;
+        let json = body_json(
+            router(state)
+                .oneshot(authed_get("/exchanges/v3"))
+                .await
+                .unwrap(),
+        )
+        .await;
         let back: TrafficEntry = serde_json::from_value(json.clone()).unwrap();
         assert_eq!(back, e);
         assert_eq!(json["schema_version"], SCHEMA_VERSION);
@@ -682,7 +777,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("api-token");
         std::fs::write(&path, "provisioned-token\n").unwrap();
-        assert_eq!(load_or_create_token_file(&path).unwrap(), "provisioned-token");
+        assert_eq!(
+            load_or_create_token_file(&path).unwrap(),
+            "provisioned-token"
+        );
     }
 
     #[test]
@@ -794,7 +892,9 @@ mod tests {
         addr
     }
 
-    type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+    type Ws = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
 
     async fn next_json(ws: &mut Ws) -> serde_json::Value {
         let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
@@ -814,10 +914,11 @@ mod tests {
             store.record(entry(&format!("e{i}"), "h", "GET", 200));
         }
         let addr = serve_test(state).await;
-        let (mut ws, _) =
-            tokio_tungstenite::connect_async(format!("ws://{addr}/feed?since=e1&token={TEST_TOKEN}"))
-                .await
-                .unwrap();
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+            "ws://{addr}/feed?since=e1&token={TEST_TOKEN}"
+        ))
+        .await
+        .unwrap();
         for want in ["e2", "e3", "e4"] {
             assert_eq!(next_json(&mut ws).await["id"], want);
         }
@@ -848,17 +949,21 @@ mod tests {
                 }
             })
         };
-        let (mut ws, _) =
-            tokio_tungstenite::connect_async(format!("ws://{addr}/feed?since=old99&token={TEST_TOKEN}"))
-                .await
-                .unwrap();
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+            "ws://{addr}/feed?since=old99&token={TEST_TOKEN}"
+        ))
+        .await
+        .unwrap();
         recorder.await.unwrap();
         store.record(entry("end", "h", "GET", 200));
 
         let mut got = Vec::new();
         loop {
             let frame = next_json(&mut ws).await;
-            assert!(frame.get("type").is_none(), "unexpected control frame {frame}");
+            assert!(
+                frame.get("type").is_none(),
+                "unexpected control frame {frame}"
+            );
             let id = frame["id"].as_str().unwrap().to_string();
             if id == "end" {
                 break;
@@ -880,10 +985,11 @@ mod tests {
         let store = state.store.clone();
         store.record(entry("e0", "h", "GET", 200));
         let addr = serve_test(state).await;
-        let (mut ws, _) =
-            tokio_tungstenite::connect_async(format!("ws://{addr}/feed?since=wiped&token={TEST_TOKEN}"))
-                .await
-                .unwrap();
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+            "ws://{addr}/feed?since=wiped&token={TEST_TOKEN}"
+        ))
+        .await
+        .unwrap();
         let reset = next_json(&mut ws).await;
         assert_eq!(reset["type"], "reset");
         assert_eq!(reset["since"], "wiped");
@@ -899,13 +1005,32 @@ mod tests {
             log.append(&entry(id, "h", "GET", code)).unwrap();
         }
         let ids = |json: serde_json::Value| {
-            json.as_array().unwrap().iter().map(|e| e["id"].as_str().unwrap().to_string()).collect::<Vec<_>>()
+            json.as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e["id"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
         };
-        let json = body_json(router(state.clone()).oneshot(authed_get("/exchanges?status=4xx")).await.unwrap()).await;
+        let json = body_json(
+            router(state.clone())
+                .oneshot(authed_get("/exchanges?status=4xx"))
+                .await
+                .unwrap(),
+        )
+        .await;
         assert_eq!(ids(json), ["c", "b"]);
-        let json = body_json(router(state.clone()).oneshot(authed_get("/exchanges?status=401,5xx")).await.unwrap()).await;
+        let json = body_json(
+            router(state.clone())
+                .oneshot(authed_get("/exchanges?status=401,5xx"))
+                .await
+                .unwrap(),
+        )
+        .await;
         assert_eq!(ids(json), ["d", "b"]);
-        let resp = router(state).oneshot(authed_get("/exchanges?status=9xx")).await.unwrap();
+        let resp = router(state)
+            .oneshot(authed_get("/exchanges?status=9xx"))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
@@ -925,13 +1050,21 @@ mod tests {
         for c in rustls_pemfile::certs(&mut pem.as_bytes()) {
             roots.add(c.unwrap()).unwrap();
         }
-        let client = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+        let client = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         let tls = tokio_rustls::TlsConnector::from(Arc::new(client))
-            .connect(rustls::pki_types::ServerName::try_from("127.0.0.1").unwrap(), tcp)
+            .connect(
+                rustls::pki_types::ServerName::try_from("127.0.0.1").unwrap(),
+                tcp,
+            )
             .await
             .unwrap();
-        let (mut sender, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(tls)).await.unwrap();
+        let (mut sender, conn) =
+            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(tls))
+                .await
+                .unwrap();
         tokio::spawn(conn);
         let req = hyper::Request::get("/schema")
             .header("host", "127.0.0.1")
@@ -940,7 +1073,10 @@ mod tests {
             .unwrap();
         let res = sender.send_request(req).await.unwrap();
         assert_eq!(res.status(), 200);
-        let body = http_body_util::BodyExt::collect(res.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(res.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["schema_version"], SCHEMA_VERSION);
     }

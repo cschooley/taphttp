@@ -86,9 +86,9 @@ impl std::str::FromStr for Cidr {
             Some((a, p)) => (a, Some(p)),
             None => (s, None),
         };
-        let net: IpAddr = addr
-            .parse()
-            .with_context(|| format!("--allow-client {s:?}: not an IP address or CIDR (e.g. 10.0.0.0/8)"))?;
+        let net: IpAddr = addr.parse().with_context(|| {
+            format!("--allow-client {s:?}: not an IP address or CIDR (e.g. 10.0.0.0/8)")
+        })?;
         let max = if net.is_ipv4() { 32 } else { 128 };
         let prefix = match prefix {
             Some(p) => p
@@ -113,11 +113,15 @@ impl Cidr {
         // An IPv4 client on a dual-stack socket shows up as ::ffff:a.b.c.d.
         match (self.net, ip.to_canonical()) {
             (IpAddr::V4(net), IpAddr::V4(ip)) => {
-                let mask = u32::MAX.checked_shl(32 - u32::from(self.prefix)).unwrap_or(0);
+                let mask = u32::MAX
+                    .checked_shl(32 - u32::from(self.prefix))
+                    .unwrap_or(0);
                 u32::from(net) & mask == u32::from(ip) & mask
             }
             (IpAddr::V6(net), IpAddr::V6(ip)) => {
-                let mask = u128::MAX.checked_shl(128 - u32::from(self.prefix)).unwrap_or(0);
+                let mask = u128::MAX
+                    .checked_shl(128 - u32::from(self.prefix))
+                    .unwrap_or(0);
                 u128::from(net) & mask == u128::from(ip) & mask
             }
             _ => false,
@@ -143,7 +147,9 @@ impl std::fmt::Debug for ProxyCredentials {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Never print passwords.
         let names: Vec<&str> = self.users.iter().map(|(u, _)| u.as_str()).collect();
-        f.debug_struct("ProxyCredentials").field("users", &names).finish()
+        f.debug_struct("ProxyCredentials")
+            .field("users", &names)
+            .finish()
     }
 }
 
@@ -162,7 +168,10 @@ impl ProxyCredentials {
                 bail!("proxy credentials line {}: expected user:password", n + 1);
             };
             if user.is_empty() || pass.is_empty() {
-                bail!("proxy credentials line {}: user and password must both be non-empty", n + 1);
+                bail!(
+                    "proxy credentials line {}: user and password must both be non-empty",
+                    n + 1
+                );
             }
             users.push((user.to_string(), pass.to_string()));
         }
@@ -195,9 +204,9 @@ impl ProxyCredentials {
                 .map(Some);
         }
         match env {
-            Some(text) if !text.trim().is_empty() => {
-                Self::parse(&text).context("in TAPHTTP_PROXY_AUTH").map(Some)
-            }
+            Some(text) if !text.trim().is_empty() => Self::parse(&text)
+                .context("in TAPHTTP_PROXY_AUTH")
+                .map(Some),
             _ => Ok(None),
         }
     }
@@ -210,7 +219,8 @@ impl ProxyCredentials {
         // Check every entry so timing doesn't reveal which usernames exist.
         let mut ok = false;
         for (u, p) in &self.users {
-            ok |= constant_time_eq(u.as_bytes(), user.as_bytes()) & constant_time_eq(p.as_bytes(), pass.as_bytes());
+            ok |= constant_time_eq(u.as_bytes(), user.as_bytes())
+                & constant_time_eq(p.as_bytes(), pass.as_bytes());
         }
         ok
     }
@@ -231,7 +241,8 @@ pub fn parse_basic(value: &[u8]) -> Option<(String, String)> {
     if !scheme.eq_ignore_ascii_case("basic") {
         return None;
     }
-    let decoded = taphttp_types::decode_body(Some(b64.trim()), taphttp_types::BodyEncoding::Base64).ok()??;
+    let decoded = taphttp_types::decode_body(Some(b64.trim()), taphttp_types::BodyEncoding::Base64)
+        .ok()??;
     let decoded = String::from_utf8(decoded).ok()?;
     let (user, pass) = decoded.split_once(':').unwrap_or((&decoded, ""));
     Some((user.to_string(), pass.to_string()))
@@ -249,7 +260,10 @@ pub struct AuthRequired;
 ///   authenticated username. Anything else is [`AuthRequired`].
 ///
 /// Only the username is ever returned, never the password.
-pub fn authorize(header: Option<&[u8]>, creds: Option<&ProxyCredentials>) -> Result<Option<String>, AuthRequired> {
+pub fn authorize(
+    header: Option<&[u8]>,
+    creds: Option<&ProxyCredentials>,
+) -> Result<Option<String>, AuthRequired> {
     let parsed = header.and_then(parse_basic);
     match creds {
         None => Ok(parsed.map(|(u, _)| u).filter(|u| !u.is_empty())),
@@ -271,10 +285,9 @@ pub fn parse_expires(s: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>> {
         t.with_timezone(&Utc)
     } else {
         let (num, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
-        let n: i64 = num
-            .parse()
-            .ok()
-            .with_context(|| format!("--expires {s:?}: expected a duration like 8h or an RFC 3339 time"))?;
+        let n: i64 = num.parse().ok().with_context(|| {
+            format!("--expires {s:?}: expected a duration like 8h or an RFC 3339 time")
+        })?;
         let d = match unit {
             "s" => Duration::try_seconds(n),
             "m" => Duration::try_minutes(n),
@@ -307,9 +320,19 @@ pub struct BannerInfo {
 
 pub fn banner(b: &BannerInfo) -> String {
     let e = &b.exposure;
-    let remote = e.proxy.is_some_and(|a| !a.ip().is_loopback()) || e.api.is_some_and(|a| !a.ip().is_loopback());
+    let remote = e.proxy.is_some_and(|a| !a.ip().is_loopback())
+        || e.api.is_some_and(|a| !a.ip().is_loopback());
     let mut out = String::new();
-    let _ = writeln!(out, "taphttp {} mode: {}", env!("CARGO_PKG_VERSION"), if remote { "remote" } else { "local (loopback only)" });
+    let _ = writeln!(
+        out,
+        "taphttp {} mode: {}",
+        env!("CARGO_PKG_VERSION"),
+        if remote {
+            "remote"
+        } else {
+            "local (loopback only)"
+        }
+    );
     if let Some(addr) = e.proxy {
         let mut access = Vec::new();
         if !b.allow_clients.is_empty() {
@@ -317,10 +340,18 @@ pub fn banner(b: &BannerInfo) -> String {
             access.push(format!("clients {}", list.join(", ")));
         }
         if e.proxy_auth {
-            access.push(format!("proxy auth ({} user{})", b.proxy_users, if b.proxy_users == 1 { "" } else { "s" }));
+            access.push(format!(
+                "proxy auth ({} user{})",
+                b.proxy_users,
+                if b.proxy_users == 1 { "" } else { "s" }
+            ));
         }
         if access.is_empty() {
-            access.push(if e.allow_open_proxy { "OPEN (--allow-open-proxy)".into() } else { "none".into() });
+            access.push(if e.allow_open_proxy {
+                "OPEN (--allow-open-proxy)".into()
+            } else {
+                "none".into()
+            });
         }
         let _ = writeln!(
             out,
@@ -361,36 +392,86 @@ mod tests {
 
     #[test]
     fn loopback_needs_nothing() {
-        let e = Exposure { proxy: addr("127.0.0.1:8080"), api: addr("127.0.0.1:8081"), ..Default::default() };
+        let e = Exposure {
+            proxy: addr("127.0.0.1:8080"),
+            api: addr("127.0.0.1:8081"),
+            ..Default::default()
+        };
         check_exposure(&e).unwrap();
-        let e = Exposure { proxy: addr("[::1]:8080"), ..Default::default() };
+        let e = Exposure {
+            proxy: addr("[::1]:8080"),
+            ..Default::default()
+        };
         check_exposure(&e).unwrap();
     }
 
     #[test]
     fn remote_proxy_needs_auth_and_tls() {
-        let base = Exposure { proxy: addr("0.0.0.0:8080"), ..Default::default() };
+        let base = Exposure {
+            proxy: addr("0.0.0.0:8080"),
+            ..Default::default()
+        };
         let err = check_exposure(&base).unwrap_err().to_string();
-        assert!(err.contains("--proxy-auth-file") && err.contains("--proxy-tls") && err.contains("--allow-open-proxy"), "{err}");
+        assert!(
+            err.contains("--proxy-auth-file")
+                && err.contains("--proxy-tls")
+                && err.contains("--allow-open-proxy"),
+            "{err}"
+        );
 
-        let auth_only = Exposure { proxy_auth: true, ..base.clone() };
+        let auth_only = Exposure {
+            proxy_auth: true,
+            ..base.clone()
+        };
         let err = check_exposure(&auth_only).unwrap_err().to_string();
-        assert!(err.contains("--proxy-tls") && !err.contains("--proxy-auth-file"), "{err}");
+        assert!(
+            err.contains("--proxy-tls") && !err.contains("--proxy-auth-file"),
+            "{err}"
+        );
 
-        let tls_only = Exposure { proxy_tls: true, ..base.clone() };
-        assert!(check_exposure(&tls_only).unwrap_err().to_string().contains("--proxy-auth-file"));
+        let tls_only = Exposure {
+            proxy_tls: true,
+            ..base.clone()
+        };
+        assert!(check_exposure(&tls_only)
+            .unwrap_err()
+            .to_string()
+            .contains("--proxy-auth-file"));
 
-        check_exposure(&Exposure { proxy_auth: true, proxy_tls: true, ..base.clone() }).unwrap();
-        check_exposure(&Exposure { allow_open_proxy: true, ..base }).unwrap();
+        check_exposure(&Exposure {
+            proxy_auth: true,
+            proxy_tls: true,
+            ..base.clone()
+        })
+        .unwrap();
+        check_exposure(&Exposure {
+            allow_open_proxy: true,
+            ..base
+        })
+        .unwrap();
     }
 
     #[test]
     fn remote_api_needs_tls_or_explicit_plaintext() {
-        let base = Exposure { api: addr("10.1.2.3:8081"), ..Default::default() };
+        let base = Exposure {
+            api: addr("10.1.2.3:8081"),
+            ..Default::default()
+        };
         let err = check_exposure(&base).unwrap_err().to_string();
-        assert!(err.contains("--api-tls") && err.contains("--api-allow-plaintext"), "{err}");
-        check_exposure(&Exposure { api_tls: true, ..base.clone() }).unwrap();
-        check_exposure(&Exposure { api_allow_plaintext: true, ..base }).unwrap();
+        assert!(
+            err.contains("--api-tls") && err.contains("--api-allow-plaintext"),
+            "{err}"
+        );
+        check_exposure(&Exposure {
+            api_tls: true,
+            ..base.clone()
+        })
+        .unwrap();
+        check_exposure(&Exposure {
+            api_allow_plaintext: true,
+            ..base
+        })
+        .unwrap();
     }
 
     // --- allowlist ---
@@ -400,7 +481,10 @@ mod tests {
         let net: Cidr = "10.0.0.0/8".parse().unwrap();
         assert!(net.contains("10.200.3.4".parse().unwrap()));
         assert!(!net.contains("11.0.0.1".parse().unwrap()));
-        assert!(net.contains("::ffff:10.1.1.1".parse().unwrap()), "v4-mapped client matches");
+        assert!(
+            net.contains("::ffff:10.1.1.1".parse().unwrap()),
+            "v4-mapped client matches"
+        );
         let host: Cidr = "192.168.1.5".parse().unwrap();
         assert!(host.contains("192.168.1.5".parse().unwrap()));
         assert!(!host.contains("192.168.1.6".parse().unwrap()));
@@ -437,20 +521,34 @@ mod tests {
         const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut out = String::new();
         for c in bytes.chunks(3) {
-            let n = (u32::from(c[0]) << 16) | (u32::from(*c.get(1).unwrap_or(&0)) << 8) | u32::from(*c.get(2).unwrap_or(&0));
+            let n = (u32::from(c[0]) << 16)
+                | (u32::from(*c.get(1).unwrap_or(&0)) << 8)
+                | u32::from(*c.get(2).unwrap_or(&0));
             out.push(A[(n >> 18) as usize & 63] as char);
             out.push(A[(n >> 12) as usize & 63] as char);
-            out.push(if c.len() > 1 { A[(n >> 6) as usize & 63] as char } else { '=' });
-            out.push(if c.len() > 2 { A[n as usize & 63] as char } else { '=' });
+            out.push(if c.len() > 1 {
+                A[(n >> 6) as usize & 63] as char
+            } else {
+                '='
+            });
+            out.push(if c.len() > 2 {
+                A[n as usize & 63] as char
+            } else {
+                '='
+            });
         }
         out
     }
 
     #[test]
     fn credentials_parse_and_reject_bad_lines() {
-        let c = ProxyCredentials::parse("# team\nagent.T-3:s3cret\n\nyou:pw:with:colons\n").unwrap();
+        let c =
+            ProxyCredentials::parse("# team\nagent.T-3:s3cret\n\nyou:pw:with:colons\n").unwrap();
         assert_eq!(c.len(), 2);
-        assert!(c.verify("you", "pw:with:colons"), "password may contain ':'");
+        assert!(
+            c.verify("you", "pw:with:colons"),
+            "password may contain ':'"
+        );
         for bad in ["nocolon", ":pw", "user:", "", "# only a comment"] {
             assert!(ProxyCredentials::parse(bad).is_err(), "{bad:?}");
         }
@@ -467,19 +565,44 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let f = dir.path().join("auth");
         std::fs::write(&f, "a:1\n").unwrap();
-        assert_eq!(ProxyCredentials::load(Some(&f), Some("b:2".into())).unwrap().unwrap().len(), 1);
-        assert!(ProxyCredentials::load(None, Some("b:2".into())).unwrap().unwrap().verify("b", "2"));
+        assert_eq!(
+            ProxyCredentials::load(Some(&f), Some("b:2".into()))
+                .unwrap()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(ProxyCredentials::load(None, Some("b:2".into()))
+            .unwrap()
+            .unwrap()
+            .verify("b", "2"));
         assert!(ProxyCredentials::load(None, None).unwrap().is_none());
-        assert!(ProxyCredentials::load(None, Some("  ".into())).unwrap().is_none());
+        assert!(ProxyCredentials::load(None, Some("  ".into()))
+            .unwrap()
+            .is_none());
         assert!(ProxyCredentials::load(Some(&dir.path().join("missing")), None).is_err());
     }
 
     #[test]
     fn parse_basic_extracts_user_and_password() {
-        assert_eq!(parse_basic(&basic("agent.T-3:pw")), Some(("agent.T-3".into(), "pw".into())));
-        assert_eq!(parse_basic(&basic("agent:T-3")), Some(("agent".into(), "T-3".into())), "split on first ':'");
-        assert_eq!(parse_basic(&basic("solo")), Some(("solo".into(), "".into())));
-        assert_eq!(parse_basic(b"basic YTpi"), Some(("a".into(), "b".into())), "scheme is case-insensitive");
+        assert_eq!(
+            parse_basic(&basic("agent.T-3:pw")),
+            Some(("agent.T-3".into(), "pw".into()))
+        );
+        assert_eq!(
+            parse_basic(&basic("agent:T-3")),
+            Some(("agent".into(), "T-3".into())),
+            "split on first ':'"
+        );
+        assert_eq!(
+            parse_basic(&basic("solo")),
+            Some(("solo".into(), "".into()))
+        );
+        assert_eq!(
+            parse_basic(b"basic YTpi"),
+            Some(("a".into(), "b".into())),
+            "scheme is case-insensitive"
+        );
         assert_eq!(parse_basic(b"Bearer abc"), None);
         assert_eq!(parse_basic(b"Basic !!!"), None);
     }
@@ -487,17 +610,33 @@ mod tests {
     #[test]
     fn without_credentials_the_username_is_a_label_and_nothing_is_rejected() {
         assert_eq!(authorize(None, None), Ok(None));
-        assert_eq!(authorize(Some(&basic("agent.T-3:anything")), None), Ok(Some("agent.T-3".into())));
-        assert_eq!(authorize(Some(&basic(":x")), None), Ok(None), "empty username is no source");
+        assert_eq!(
+            authorize(Some(&basic("agent.T-3:anything")), None),
+            Ok(Some("agent.T-3".into()))
+        );
+        assert_eq!(
+            authorize(Some(&basic(":x")), None),
+            Ok(None),
+            "empty username is no source"
+        );
         assert_eq!(authorize(Some(b"garbage"), None), Ok(None));
     }
 
     #[test]
     fn with_credentials_only_a_match_passes_and_source_is_the_user() {
         let c = ProxyCredentials::parse("agent.T-3:s3cret").unwrap();
-        assert_eq!(authorize(Some(&basic("agent.T-3:s3cret")), Some(&c)), Ok(Some("agent.T-3".into())));
-        assert_eq!(authorize(Some(&basic("agent.T-3:wrong")), Some(&c)), Err(AuthRequired));
-        assert_eq!(authorize(Some(&basic("other:s3cret")), Some(&c)), Err(AuthRequired));
+        assert_eq!(
+            authorize(Some(&basic("agent.T-3:s3cret")), Some(&c)),
+            Ok(Some("agent.T-3".into()))
+        );
+        assert_eq!(
+            authorize(Some(&basic("agent.T-3:wrong")), Some(&c)),
+            Err(AuthRequired)
+        );
+        assert_eq!(
+            authorize(Some(&basic("other:s3cret")), Some(&c)),
+            Err(AuthRequired)
+        );
         assert_eq!(authorize(None, Some(&c)), Err(AuthRequired));
         assert_eq!(authorize(Some(b"Bearer x"), Some(&c)), Err(AuthRequired));
     }
@@ -507,8 +646,14 @@ mod tests {
     #[test]
     fn expires_accepts_durations_and_rfc3339() {
         let now: DateTime<Utc> = "2026-11-20T00:00:00Z".parse().unwrap();
-        assert_eq!(parse_expires("90s", now).unwrap(), now + Duration::seconds(90));
-        assert_eq!(parse_expires("30m", now).unwrap(), now + Duration::minutes(30));
+        assert_eq!(
+            parse_expires("90s", now).unwrap(),
+            now + Duration::seconds(90)
+        );
+        assert_eq!(
+            parse_expires("30m", now).unwrap(),
+            now + Duration::minutes(30)
+        );
         assert_eq!(parse_expires("8h", now).unwrap(), now + Duration::hours(8));
         assert_eq!(parse_expires("2d", now).unwrap(), now + Duration::days(2));
         assert_eq!(
@@ -544,10 +689,29 @@ mod tests {
             ca_fingerprint: "AB:CD".into(),
         };
         let text = banner(&b);
-        for want in ["mode: remote", "0.0.0.0:8443 TLS", "clients 10.0.0.0/8", "proxy auth (2 users)", "10.0.0.5:8081 TLS", "expires: 2026-11-21T08:00:00+00:00", "AB:CD"] {
+        for want in [
+            "mode: remote",
+            "0.0.0.0:8443 TLS",
+            "clients 10.0.0.0/8",
+            "proxy auth (2 users)",
+            "10.0.0.5:8081 TLS",
+            "expires: 2026-11-21T08:00:00+00:00",
+            "AB:CD",
+        ] {
             assert!(text.contains(want), "missing {want:?} in\n{text}");
         }
-        let local = banner(&BannerInfo { exposure: Exposure { proxy: addr("127.0.0.1:8080"), ..Default::default() }, ..Default::default() });
-        assert!(local.contains("mode: local") && local.contains("access: none") && local.contains("expires: never"), "{local}");
+        let local = banner(&BannerInfo {
+            exposure: Exposure {
+                proxy: addr("127.0.0.1:8080"),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        assert!(
+            local.contains("mode: local")
+                && local.contains("access: none")
+                && local.contains("expires: never"),
+            "{local}"
+        );
     }
 }
