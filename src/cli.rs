@@ -65,6 +65,47 @@ pub struct StartArgs {
     /// and written to <data-dir>/api-token.
     #[arg(long, env = "TAPHTTP_API_TOKEN_FILE", value_name = "PATH")]
     pub api_token_file: Option<PathBuf>,
+
+    /// Proxy credentials file: one `user:password` per line (mode 0600).
+    /// Clients must then authenticate, and the username is recorded as each
+    /// exchange's `source`. Or set TAPHTTP_PROXY_AUTH to the same text.
+    /// Never accepted as a CLI argument, where `ps` would show it.
+    #[arg(long, value_name = "PATH")]
+    pub proxy_auth_file: Option<PathBuf>,
+
+    /// Only accept proxy clients from this IP or CIDR (repeatable).
+    #[arg(long, value_name = "CIDR")]
+    pub allow_client: Vec<String>,
+
+    /// Serve the proxy listener over TLS (an HTTPS proxy), with a cert from
+    /// taphttp's CA. Required, with proxy auth, for a non-loopback --listen.
+    #[arg(long)]
+    pub proxy_tls: bool,
+
+    /// Serve the lever API over TLS, with a cert from taphttp's CA.
+    /// Required for a non-loopback --api-listen.
+    #[arg(long)]
+    pub api_tls: bool,
+
+    /// Name (DNS or IP) clients use to reach a TLS listener; added to its
+    /// cert (repeatable). Needed when listening on 0.0.0.0 / ::.
+    #[arg(long, value_name = "NAME")]
+    pub tls_name: Vec<String>,
+
+    /// Allow a non-loopback --listen without proxy auth and TLS. Only for a
+    /// port nothing untrusted can reach (e.g. compose, published on 127.0.0.1).
+    #[arg(long)]
+    pub allow_open_proxy: bool,
+
+    /// Allow a non-loopback --api-listen without TLS. Only for a private
+    /// network (e.g. a compose network) or a tunnel interface.
+    #[arg(long)]
+    pub api_allow_plaintext: bool,
+
+    /// Stop after this: a duration (90s, 30m, 8h, 2d) or an RFC 3339 time.
+    /// Requests are refused from then on and taphttp exits.
+    #[arg(long, value_name = "WHEN")]
+    pub expires: Option<String>,
 }
 
 #[derive(Args)]

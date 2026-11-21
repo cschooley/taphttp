@@ -67,6 +67,9 @@ pub async fn replay_entry(
         status: Some(status),
         duration_ms: Some(duration_ms),
         replay_of: Some(original_id),
+        // A replay is sent by whoever ran `replay` / POST /replay, not by
+        // the original's client, so it carries no source.
+        source: None,
         ..original
     };
     replay.set_res_body(&res_body);
@@ -228,6 +231,7 @@ mod tests {
             res_body_encoding: Default::default(),
             duration_ms: Some(5),
             replay_of: None,
+            source: None,
         }
     }
 
@@ -395,6 +399,7 @@ mod tests {
             res_body_encoding: Default::default(),
             duration_ms: Some(5),
             replay_of: None,
+            source: None,
         };
 
         JsonLinesBackend::new(&data_dir.join("traffic.jsonl")).append(&entry).unwrap();
@@ -436,6 +441,7 @@ mod tests {
             res_body_encoding: Default::default(),
             duration_ms: None,
             replay_of: None,
+            source: None,
         };
 
         JsonLinesBackend::new(&data_dir.join("traffic.jsonl")).append(&entry).unwrap();
@@ -519,6 +525,7 @@ mod tests {
                 res_body_encoding: Default::default(),
                 duration_ms: None,
                 replay_of: None,
+                source: None,
             })
             .unwrap();
 

@@ -26,10 +26,12 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 ///   lossily instead of becoming `""`. Bodies are byte-exact: new
 ///   `req_body_encoding` / `res_body_encoding` are `"utf8"` or `"base64"`,
 ///   and non-UTF-8 bodies are base64. Every line carries `schema_version`.
+/// - v4: added `source`, who sent the exchange (the proxy-auth username), or
+///   `null` when the client gave none.
 ///
-/// v1 and v2 lines still deserialize: a header map is read as pairs, and a
-/// missing encoding means `"utf8"`.
-pub const SCHEMA_VERSION: u32 = 3;
+/// v1 to v3 lines still deserialize: a header map is read as pairs, a
+/// missing encoding means `"utf8"`, and a missing `source` means `null`.
+pub const SCHEMA_VERSION: u32 = 4;
 
 // ---------------------------------------------------------------------------
 // Headers
@@ -294,6 +296,12 @@ pub struct TrafficEntry {
     /// If this entry is a replay, the `id` of the original it was replayed from.
     #[serde(default)]
     pub replay_of: Option<String>,
+    /// Who sent this exchange: the username the client gave in
+    /// `Proxy-Authorization` (e.g. `agent.T-3`), never the password. `None`
+    /// when it gave none. Only verified when taphttp has proxy credentials
+    /// configured; otherwise it is a self-reported label for the audit trail.
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 impl TrafficEntry {
@@ -322,7 +330,7 @@ impl Serialize for TrafficEntry {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         // Keep this list in step with the struct; the
         // `serialized_keys_are_exactly_the_v3_schema` test enforces it.
-        let mut st = s.serialize_struct("TrafficEntry", 15)?;
+        let mut st = s.serialize_struct("TrafficEntry", 16)?;
         st.serialize_field("schema_version", &SCHEMA_VERSION)?;
         st.serialize_field("id", &self.id)?;
         st.serialize_field("ts", &self.ts)?;
@@ -338,6 +346,7 @@ impl Serialize for TrafficEntry {
         st.serialize_field("res_body_encoding", &self.res_body_encoding)?;
         st.serialize_field("duration_ms", &self.duration_ms)?;
         st.serialize_field("replay_of", &self.replay_of)?;
+        st.serialize_field("source", &self.source)?;
         st.end()
     }
 }
@@ -371,6 +380,7 @@ mod tests {
             res_body_encoding: BodyEncoding::Utf8,
             duration_ms: Some(3),
             replay_of: None,
+            source: None,
         }
     }
 
@@ -500,7 +510,7 @@ mod tests {
     // --- TrafficEntry wire format ---
 
     #[test]
-    fn serialized_keys_are_exactly_the_v3_schema() {
+    fn serialized_keys_are_exactly_the_v4_schema() {
         let v = serde_json::to_value(entry()).unwrap();
         let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
         keys.sort_unstable();
@@ -509,17 +519,17 @@ mod tests {
             [
                 "duration_ms", "host", "id", "method", "replay_of", "req_body",
                 "req_body_encoding", "req_headers", "res_body", "res_body_encoding",
-                "res_headers", "schema_version", "status", "ts", "url",
+                "res_headers", "schema_version", "source", "status", "ts", "url",
             ]
         );
-        assert_eq!(v["schema_version"], 3);
+        assert_eq!(v["schema_version"], 4);
         assert_eq!(v["req_body_encoding"], "utf8");
     }
 
     #[test]
     fn schema_version_is_the_first_key_on_the_line() {
         let line = serde_json::to_string(&entry()).unwrap();
-        assert!(line.starts_with(r#"{"schema_version":3,"#), "{line}");
+        assert!(line.starts_with(r#"{"schema_version":4,"#), "{line}");
     }
 
     #[test]
@@ -532,8 +542,16 @@ mod tests {
         e.set_req_body(b"text");
         e.set_res_body(&[0xff, 0x00]);
         e.replay_of = Some("orig".into());
+        e.source = Some("agent.T-3".into());
         let back: TrafficEntry = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
         assert_eq!(back, e);
+    }
+
+    #[test]
+    fn v3_line_without_source_parses_as_none() {
+        let v3 = r#"{"schema_version":3,"id":"a","ts":"2026-11-20T00:00:00Z","host":"h","method":"GET","url":"/","req_headers":[],"req_body":null,"req_body_encoding":"utf8","status":200,"res_headers":[],"res_body":null,"res_body_encoding":"utf8","duration_ms":1,"replay_of":null}"#;
+        let e: TrafficEntry = serde_json::from_str(v3).unwrap();
+        assert_eq!(e.source, None);
     }
 
     #[test]

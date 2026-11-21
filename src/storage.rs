@@ -63,7 +63,7 @@ pub struct SqliteBackend {
 
 /// Columns of the `traffic` table, in insert order. v1/v2 databases have
 /// only the first eleven; [`SqliteBackend::new`] adds the rest.
-const SQLITE_COLUMNS: [(&str, &str); 16] = [
+const SQLITE_COLUMNS: [(&str, &str); 17] = [
     ("id", "TEXT PRIMARY KEY"),
     ("ts", "TEXT NOT NULL"),
     ("host", "TEXT NOT NULL"),
@@ -83,6 +83,8 @@ const SQLITE_COLUMNS: [(&str, &str); 16] = [
     // `ts` as microseconds since the epoch, for since/until filters. `ts` is
     // RFC 3339 text with variable fraction digits, which doesn't sort.
     ("ts_us", "INTEGER"),
+    // v4: who sent the exchange (proxy-auth username).
+    ("source", "TEXT"),
 ];
 
 impl SqliteBackend {
@@ -146,6 +148,7 @@ impl SqliteBackend {
                 encoding(e.res_body_encoding),
                 SCHEMA_VERSION,
                 e.ts.timestamp_micros(),
+                e.source,
             ],
         )?;
         Ok(())
@@ -366,6 +369,7 @@ mod tests {
             res_body_encoding: Default::default(),
             duration_ms: Some(10),
             replay_of: None,
+            source: None,
         }
     }
 

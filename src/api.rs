@@ -161,14 +161,50 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 
-/// Bind `addr` and serve the lever API until the process exits.
-pub async fn serve(state: Arc<ApiState>, addr: SocketAddr) -> Result<()> {
+/// Bind `addr` and serve the lever API until the process exits, over TLS
+/// when `tls` is given.
+pub async fn serve(state: Arc<ApiState>, addr: SocketAddr, tls: Option<Arc<rustls::ServerConfig>>) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let bound = listener.local_addr()?;
-    tracing::info!("lever API listening on http://{bound}");
-    eprintln!("lever API listening on http://{bound}");
-    axum::serve(listener, router(state)).await?;
+    let scheme = if tls.is_some() { "https" } else { "http" };
+    tracing::info!("lever API listening on {scheme}://{bound}");
+    eprintln!("lever API listening on {scheme}://{bound}");
+    match tls {
+        None => axum::serve(listener, router(state)).await?,
+        Some(cfg) => serve_tls(listener, router(state), cfg).await?,
+    }
     Ok(())
+}
+
+/// Accept TLS connections and serve `app` on each (HTTP/1.1, with upgrades
+/// so the `/feed` WebSocket works).
+async fn serve_tls(listener: tokio::net::TcpListener, app: Router, cfg: Arc<rustls::ServerConfig>) -> Result<()> {
+    use tower::ServiceExt;
+    let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        let acceptor = acceptor.clone();
+        let app = app.clone();
+        tokio::spawn(async move {
+            let tls = match acceptor.accept(stream).await {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::debug!("lever API TLS handshake from {peer}: {e}");
+                    return;
+                }
+            };
+            let svc = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                app.clone().oneshot(req)
+            });
+            if let Err(e) = hyper::server::conn::http1::Builder::new()
+                .serve_connection(hyper_util::rt::TokioIo::new(tls), svc)
+                .with_upgrades()
+                .await
+            {
+                tracing::debug!("lever API connection from {peer}: {e}");
+            }
+        });
+    }
 }
 
 /// `GET /schema` — the schema contract the SPA and MCP pin against.
@@ -377,6 +413,7 @@ mod tests {
             res_body_encoding: Default::default(),
             duration_ms: Some(1),
             replay_of: None,
+            source: None,
         }
     }
 
@@ -852,6 +889,60 @@ mod tests {
         assert_eq!(reset["since"], "wiped");
         store.record(entry("e1", "h", "GET", 200));
         assert_eq!(next_json(&mut ws).await["id"], "e1");
+    }
+
+    #[tokio::test]
+    async fn exchanges_status_class_filter() {
+        let dir = TempDir::new().unwrap();
+        let (state, log) = state_with_db(&dir);
+        for (id, code) in [("a", 200), ("b", 401), ("c", 403), ("d", 500)] {
+            log.append(&entry(id, "h", "GET", code)).unwrap();
+        }
+        let ids = |json: serde_json::Value| {
+            json.as_array().unwrap().iter().map(|e| e["id"].as_str().unwrap().to_string()).collect::<Vec<_>>()
+        };
+        let json = body_json(router(state.clone()).oneshot(authed_get("/exchanges?status=4xx")).await.unwrap()).await;
+        assert_eq!(ids(json), ["c", "b"]);
+        let json = body_json(router(state.clone()).oneshot(authed_get("/exchanges?status=401,5xx")).await.unwrap()).await;
+        assert_eq!(ids(json), ["d", "b"]);
+        let resp = router(state).oneshot(authed_get("/exchanges?status=9xx")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn api_over_tls_serves_clients_that_trust_the_ca() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = TempDir::new().unwrap();
+        let (state, _) = state_with_db(&dir);
+        let ca = crate::ca::Ca::load_or_create(dir.path()).unwrap();
+        let cfg = ca.listener_tls_config(&["127.0.0.1".into()]).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_tls(listener, router(state), cfg));
+
+        let pem = std::fs::read_to_string(dir.path().join("ca.crt")).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        for c in rustls_pemfile::certs(&mut pem.as_bytes()) {
+            roots.add(c.unwrap()).unwrap();
+        }
+        let client = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let tls = tokio_rustls::TlsConnector::from(Arc::new(client))
+            .connect(rustls::pki_types::ServerName::try_from("127.0.0.1").unwrap(), tcp)
+            .await
+            .unwrap();
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(tls)).await.unwrap();
+        tokio::spawn(conn);
+        let req = hyper::Request::get("/schema")
+            .header("host", "127.0.0.1")
+            .header(AUTHORIZATION, format!("Bearer {TEST_TOKEN}"))
+            .body(http_body_util::Empty::<bytes::Bytes>::new())
+            .unwrap();
+        let res = sender.send_request(req).await.unwrap();
+        assert_eq!(res.status(), 200);
+        let body = http_body_util::BodyExt::collect(res.into_body()).await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["schema_version"], SCHEMA_VERSION);
     }
 
     #[tokio::test]

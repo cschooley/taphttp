@@ -13,6 +13,9 @@ use crate::cli::{CaArgs, CaAction};
 pub struct Ca {
     cert: rcgen::Certificate,
     key: KeyPair,
+    /// `ca.crt` as on disk: what clients trust and pin. (`cert` is re-signed
+    /// at load, and ECDSA signatures differ each time, so its bytes don't.)
+    disk_der: Vec<u8>,
     cert_cache: Mutex<HashMap<String, Arc<rustls::ServerConfig>>>,
 }
 
@@ -37,10 +40,16 @@ impl Ca {
             let params = CertificateParams::from_ca_cert_pem(&cert_pem)
                 .context("parsing CA cert params")?;
             let cert = params.self_signed(&key).context("re-signing CA cert")?;
+            let disk_der = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+                .next()
+                .context("no certificate in ca.crt")?
+                .context("parsing ca.crt")?
+                .to_vec();
             tracing::debug!("Loaded existing CA from {}", data_dir.display());
             return Ok(Self {
                 cert,
                 key,
+                disk_der,
                 cert_cache: Mutex::new(HashMap::new()),
             });
         }
@@ -66,15 +75,55 @@ impl Ca {
             cert_path.display()
         );
 
+        let disk_der = cert.der().to_vec();
         Ok(Self {
             cert,
             key,
+            disk_der,
             cert_cache: Mutex::new(HashMap::new()),
         })
     }
 
     pub fn cert_pem(&self) -> String {
         self.cert.pem()
+    }
+
+    /// SHA-256 of the CA certificate, `AB:CD:...`, for pinning.
+    pub fn fingerprint_sha256(&self) -> String {
+        let digest = ring::digest::digest(&ring::digest::SHA256, &self.disk_der);
+        digest.as_ref().iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(":")
+    }
+
+    /// TLS config for taphttp's own listeners (the HTTPS proxy, the lever
+    /// API): a fresh leaf for `names` (DNS names or IPs), signed by this CA,
+    /// so a client that trusts the CA (as it must, to be intercepted)
+    /// trusts the listener too. HTTP/1.1 only.
+    pub fn listener_tls_config(&self, names: &[String]) -> Result<Arc<rustls::ServerConfig>> {
+        let (chain, key_der) = self.listener_chain(names)?;
+        let mut cfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(chain, key_der)
+            .context("building listener TLS config")?;
+        cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+        Ok(Arc::new(cfg))
+    }
+
+    /// The leaf + CA chain and key a listener serves.
+    fn listener_chain(&self, names: &[String]) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+        let key = KeyPair::generate().context("generating listener key")?;
+        let mut params = CertificateParams::new(names.to_vec()).context("building listener cert params")?;
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, "taphttp listener");
+        params.distinguished_name = dn;
+        params.not_before = rcgen::date_time_ymd(2024, 1, 1);
+        params.not_after = rcgen::date_time_ymd(2035, 1, 1);
+        let leaf = params.signed_by(&key, &self.cert, &self.key).context("signing listener cert")?;
+        let chain = vec![
+            CertificateDer::from(leaf.der().to_vec()),
+            CertificateDer::from(self.disk_der.clone()),
+        ];
+        let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
+        Ok((chain, key_der))
     }
 
     pub fn cert_path(data_dir: &Path) -> PathBuf {
@@ -210,6 +259,48 @@ mod tests {
         std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
         Ca::load_or_create(dir.path()).unwrap();
         assert_eq!(mode(&key), 0o600);
+    }
+
+    #[test]
+    fn fingerprint_is_stable_across_loads_and_matches_ca_crt() {
+        let dir = TempDir::new().unwrap();
+        let a = Ca::load_or_create(dir.path()).unwrap().fingerprint_sha256();
+        let b = Ca::load_or_create(dir.path()).unwrap().fingerprint_sha256();
+        assert_eq!(a, b, "a pin must survive restarts");
+        assert_eq!(a.len(), 32 * 3 - 1);
+        let pem = std::fs::read_to_string(dir.path().join("ca.crt")).unwrap();
+        let der = rustls_pemfile::certs(&mut pem.as_bytes()).next().unwrap().unwrap();
+        let want = ring::digest::digest(&ring::digest::SHA256, &der);
+        assert!(a.starts_with(&format!("{:02X}:", want.as_ref()[0])));
+    }
+
+    #[test]
+    fn listener_tls_config_verifies_against_ca_crt_for_its_names() {
+        install_crypto_provider();
+        let dir = TempDir::new().unwrap();
+        let ca = Ca::load_or_create(dir.path()).unwrap();
+        let cfg = ca.listener_tls_config(&["proxy.example".into(), "10.0.0.5".into()]).unwrap();
+        assert_eq!(cfg.alpn_protocols, vec![b"http/1.1".to_vec()]);
+
+        // Verify the served leaf with a client that trusts only ca.crt.
+        let pem = std::fs::read_to_string(dir.path().join("ca.crt")).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        for c in rustls_pemfile::certs(&mut pem.as_bytes()) {
+            roots.add(c.unwrap()).unwrap();
+        }
+        use rustls::client::danger::ServerCertVerifier;
+        let verifier = rustls::client::WebPkiServerVerifier::builder(Arc::new(roots)).build().unwrap();
+        let (chain, _) = ca.listener_chain(&["proxy.example".into(), "10.0.0.5".into()]).unwrap();
+        for name in ["proxy.example", "10.0.0.5"] {
+            let sn = rustls::pki_types::ServerName::try_from(name).unwrap();
+            verifier
+                .verify_server_cert(&chain[0], &chain[1..], &sn, &[], rustls::pki_types::UnixTime::now())
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
+        let wrong = rustls::pki_types::ServerName::try_from("other.example").unwrap();
+        assert!(verifier
+            .verify_server_cert(&chain[0], &chain[1..], &wrong, &[], rustls::pki_types::UnixTime::now())
+            .is_err());
     }
 
     #[test]

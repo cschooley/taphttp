@@ -44,7 +44,7 @@ Release images are published to GHCR on every `v*` tag:
 docker run --rm -e RUST_LOG=info \
   -p 127.0.0.1:8080:8080 \
   -v taphttp-ca:/ca -v taphttp-data:/data \
-  ghcr.io/cschooley/taphttp:0.3.0
+  ghcr.io/cschooley/taphttp:0.4.0
 ```
 
 Or build it yourself (`docker build -t taphttp .`). From compose, use the image
@@ -53,8 +53,8 @@ or build straight from a tag:
 ```yaml
 services:
   taphttp:
-    image: ghcr.io/cschooley/taphttp:0.3.0
-    # or: build: https://github.com/cschooley/taphttp.git#v0.3.0
+    image: ghcr.io/cschooley/taphttp:0.4.0
+    # or: build: https://github.com/cschooley/taphttp.git#v0.4.0
     ports: ["127.0.0.1:8080:8080"]
     environment: { RUST_LOG: info }
     volumes: [taphttp-ca:/ca, taphttp-data:/data]
@@ -79,14 +79,18 @@ services:
   `--api-listen 0.0.0.0:8081` to the command and don't publish 8081:
 
   ```yaml
-      command: [start, --listen, 0.0.0.0:8080, --log-file, /data/traffic.jsonl,
-                --api-listen, 0.0.0.0:8081]
+      command: [start, --listen, 0.0.0.0:8080, --allow-open-proxy,
+                --log-file, /data/traffic.jsonl,
+                --api-listen, 0.0.0.0:8081, --api-allow-plaintext]
       volumes: [taphttp-ca:/ca, taphttp-data:/data, taphttp-token:/token]
   # consumer:
       volumes: [taphttp-token:/token:ro]   # read /token/api-token
   ```
 - Arguments after the image name replace the default command
-  (`start --listen 0.0.0.0:8080 --log-file /data/traffic.jsonl`). For example:
+  (`start --listen 0.0.0.0:8080 --allow-open-proxy --log-file /data/traffic.jsonl`).
+  If you replace it and keep `0.0.0.0`, keep `--allow-open-proxy` (and
+  `--api-allow-plaintext` for a compose-only API), or taphttp refuses to start.
+  For example:
   `docker run --rm -v taphttp-ca:/ca taphttp ca print`.
 
 ---
@@ -202,8 +206,21 @@ separate pairs.
 | `--intercept-socket` | — | Unix socket path for the intercept hook (pauses each request/response) |
 | `--api-listen` | — | Also serve the [lever API](#lever-api) (HTTP + WebSocket) on this address |
 | `--api-token-file` | — | Read the API token from this file, or create it there (`0600`). Env `TAPHTTP_API_TOKEN_FILE` |
+| `--proxy-auth-file` | — | Require proxy auth: `user:password` per line (`0600`). Or env `TAPHTTP_PROXY_AUTH` with the same text. See [Attribution](#attribution-who-sent-each-exchange) |
+| `--allow-client` | — | Only accept proxy clients from this IP/CIDR (repeatable) |
+| `--proxy-tls` | off | Serve the proxy listener over TLS (an HTTPS proxy) |
+| `--api-tls` | off | Serve the lever API over TLS |
+| `--tls-name` | — | Name or IP clients use for a TLS listener (repeatable); needed on `0.0.0.0` |
+| `--allow-open-proxy` | off | Allow a non-loopback `--listen` without auth + TLS (private networks only) |
+| `--api-allow-plaintext` | off | Allow a non-loopback `--api-listen` without TLS (private networks only) |
+| `--expires` | never | Refuse traffic and exit after this: `8h`, `30m`, `2d`, or an RFC 3339 time |
 
 Traffic is always written to stdout as JSON lines. `--log-file` and `--sqlite` are additive.
+
+On loopback none of the access-control flags are needed: running locally
+works exactly as before, and tailing `--log-file` (or stdout) is still the
+simplest and fastest way for a local tool to consume traffic. Off loopback,
+see [Remote deployment](#remote-deployment).
 
 ### `taphttp show <FILE>`
 
@@ -290,7 +307,7 @@ Entries are `taphttp_types::TrafficEntry` v3 JSON, the same as log lines.
 | `before=<id>` | Only exchanges recorded before `<id>`. Pass the last `id` of a page to get the next one. Unknown id: `404` |
 | `host` | Host contains this (case-insensitive) |
 | `method` | Method equals this (case-insensitive) |
-| `status` | Status code equals this |
+| `status` | Codes and/or classes, comma-separated: `404`, `4xx`, `401,403,5xx` |
 | `q` | URL or host contains this text (case-insensitive) |
 | `since` / `until` | RFC 3339 times; `since` is inclusive, `until` exclusive |
 
@@ -352,13 +369,95 @@ Traffic JSON lines go to stdout by default. Use `--log-file <path>` to also writ
 
 ---
 
+## Remote deployment
+
+taphttp can run away from your laptop (a client jump box, a VPS, inside a
+client network). There it is an intercepting proxy holding captured
+credentials, so it **refuses to start** in an unsafe configuration:
+
+| Listener | Loopback | Non-loopback needs |
+|---|---|---|
+| Proxy (`--listen`) | nothing | proxy auth **and** `--proxy-tls`, or `--allow-open-proxy` |
+| Lever API (`--api-listen`) | nothing | `--api-tls`, or `--api-allow-plaintext` |
+
+A remote setup:
+
+```sh
+printf 'you:%s\nagent.T-3:%s\n' "$(openssl rand -hex 16)" "$(openssl rand -hex 16)" > proxy-auth
+chmod 600 proxy-auth
+taphttp start --listen 0.0.0.0:8443 --proxy-tls --proxy-auth-file proxy-auth \
+  --tls-name proxy.engagement.example --allow-client 10.20.0.0/16 \
+  --api-listen 0.0.0.0:8081 --api-tls --api-token-file /run/taphttp/api-token \
+  --db /srv/taphttp/traffic.db --expires 2026-12-05T18:00:00Z
+```
+
+- **TLS on both listeners** uses a cert from taphttp's CA for the
+  `--tls-name`s (plus the listener's IP, if specific). Clients already trust
+  that CA, since they must for interception, so they trust the listeners too.
+  The startup banner prints the CA's SHA-256 fingerprint. Pin that, not the
+  listener cert, which is reissued on every start.
+- **Proxy clients** use an HTTPS proxy URL, e.g.
+  `curl --proxy https://you:PASS@proxy.engagement.example:8443 --proxy-cacert ca.crt https://target/`.
+  Browsers vary in HTTPS-proxy support; where one can't, reach the proxy
+  through a tunnel (WireGuard, `ssh -L`) to a loopback listener instead.
+  Plain-HTTP proxy auth would send the password in the clear on every
+  request, which is why it isn't allowed off loopback.
+- **A tunnel is also fine for the lever API.** Bind it to the tunnel's
+  interface or to loopback on the far end of `ssh -L`. Loopback needs no flags.
+- **`--allow-client`** closes connections from anywhere else without a byte.
+  It's in addition to auth, not instead of it.
+- **`--expires`** refuses traffic from then on and exits (status 0). A box
+  forgotten on a client network stops working. With a restart policy, use an
+  absolute time: a relative `8h` restarts the clock.
+- **The startup banner** states the mode, bound addresses, TLS, access
+  control and expiry, on stderr and in the `RUST_LOG=info` log, so there's a
+  record of what the deployment was doing.
+- **Compose and other private networks** bind `0.0.0.0` inside a container
+  whose port is published on `127.0.0.1`. That's what `--allow-open-proxy`
+  and `--api-allow-plaintext` are for. The Docker image's default command
+  passes `--allow-open-proxy`.
+
+### Teardown
+
+When an engagement ends, delete what the deployment holds:
+
+- the CA (`ca.crt`, `ca.key` in the data dir / `/ca` volume), and remove
+  `ca.crt` from every client trust store it was installed in;
+- the traffic: the sqlite file (`--db`, plus its `-wal` / `-shm` files) and
+  any `--log-file`;
+- the API token file and the proxy credentials file;
+- for Docker, the volumes: `docker volume rm` the CA, data and token volumes.
+
+## Attribution: who sent each exchange
+
+Every exchange records `source`: the username the client sent in
+`Proxy-Authorization`, never the password or the header. Set it with
+userinfo in the proxy URL:
+
+```sh
+curl --proxy http://agent.T-3@127.0.0.1:8080 http://target/
+```
+
+- Basic auth can't carry `:` in a username (`agent:T-3` would send user
+  `agent`, password `T-3`), so use another separator, e.g. `agent.T-3`.
+- **Without `--proxy-auth-file`** (the local default), `source` is a
+  self-reported label: any local client can claim any name. It's for the
+  audit trail, not access control. Nothing is rejected.
+- **With `--proxy-auth-file`**, clients without matching credentials get
+  `407 Proxy Authentication Required`, and `source` is the authenticated
+  username.
+- `Proxy-Authorization` is removed before anything else sees the request:
+  it isn't sent upstream, logged, or passed to an intercept hook.
+- Untagged traffic and replays have `source: null`. For HTTPS, the source
+  given on `CONNECT` applies to everything in that tunnel.
+
 ## Example traffic log entry
 
 Each line is one exchange (shown pretty-printed here):
 
 ```json
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "id": "3f2a1b4c-8d9e-4a7b-b3c1-2e5f6a7d8e9f",
   "ts": "2026-07-02T14:23:01.123Z",
   "host": "example.com",
@@ -376,12 +475,13 @@ Each line is one exchange (shown pretty-printed here):
   "res_body": "{\"users\":[]}",
   "res_body_encoding": "utf8",
   "duration_ms": 183,
-  "replay_of": null
+  "replay_of": null,
+  "source": "agent.T-3"
 }
 ```
 
 - `schema_version` is on every line, so a tool tailing the log can detect a
-  breaking change. The current version is 3.
+  breaking change. The current version is 4.
 - Headers are `[name, value]` pairs in wire order. Repeated headers (several
   `Set-Cookie`s, say) each get a pair. A value that isn't valid UTF-8 is
   kept with the bad bytes replaced by U+FFFD, not dropped.
@@ -390,6 +490,8 @@ Each line is one exchange (shown pretty-printed here):
   protobuf, undecoded gzip). Replay decodes base64 before sending.
 - `replay_of` is `null` for captured traffic. For an exchange produced by a
   replay, it holds the `id` of the original.
+- `source` is who sent it (see [Attribution](#attribution-who-sent-each-exchange)),
+  or `null`.
 
 To decode base64 bodies with jq: `jq -r 'select(.res_body_encoding=="base64") | .res_body | @base64d'`.
 
@@ -397,13 +499,15 @@ To decode base64 bodies with jq: `jq -r 'select(.res_body_encoding=="base64") | 
 
 | Version | Change |
 |---|---|
+| 4 | `source` (proxy-auth username) |
 | 3 | Headers as ordered pairs; non-UTF-8 header values kept; `req_body_encoding` / `res_body_encoding`; `schema_version` on every line |
 | 2 | `replay_of` |
 | 1 | Initial |
 
-taphttp still reads v1 and v2 logs (`show`, `replay`, the lever API): a
-header map is read as pairs, and a missing encoding means `utf8`. Anything
-taphttp writes or re-emits (`show --json`, `/exchanges`) is v3.
+taphttp still reads v1 to v3 logs (`show`, `replay`, the lever API): a
+header map is read as pairs, a missing encoding means `utf8`, and a missing
+`source` means `null`. Anything taphttp writes or re-emits (`show --json`,
+`/exchanges`) is v4.
 
 ### Using the types from Rust
 
@@ -413,7 +517,7 @@ consumers don't pull in the proxy:
 
 ```toml
 [dependencies]
-taphttp-types = { git = "https://github.com/cschooley/taphttp", tag = "v0.3.0" }
+taphttp-types = { git = "https://github.com/cschooley/taphttp", tag = "v0.4.0" }
 ```
 
 ```rust

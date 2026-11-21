@@ -5,8 +5,9 @@
 #   docker run --rm -p 127.0.0.1:8080:8080 \
 #     -v taphttp-ca:/ca -v taphttp-data:/data taphttp
 #
-# Publish the port on 127.0.0.1 only: taphttp is an open proxy, and binding
-# 0.0.0.0 inside the container is safe only because of that.
+# Publish the port on 127.0.0.1 only: the default command runs an open proxy
+# (--allow-open-proxy), and binding 0.0.0.0 inside the container is safe only
+# because of that.
 
 FROM rust:1.90-slim-bookworm AS build
 WORKDIR /src
@@ -37,4 +38,7 @@ ENV TAPHTTP_API_TOKEN_FILE=/token/api-token
 VOLUME ["/ca", "/data", "/token"]
 EXPOSE 8080
 ENTRYPOINT ["taphttp"]
-CMD ["start", "--listen", "0.0.0.0:8080", "--log-file", "/data/traffic.jsonl"]
+# --allow-open-proxy: the container listens on 0.0.0.0 so the published port
+# works, and the README says to publish it on 127.0.0.1 only. For a remote
+# deployment, replace the command and use --proxy-auth-file + --proxy-tls.
+CMD ["start", "--listen", "0.0.0.0:8080", "--allow-open-proxy", "--log-file", "/data/traffic.jsonl"]

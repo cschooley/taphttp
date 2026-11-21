@@ -26,7 +26,8 @@ pub struct HistoryQuery {
     pub host: Option<String>,
     /// Exact method, case-insensitive.
     pub method: Option<String>,
-    pub status: Option<u16>,
+    /// Status codes and/or classes: `404`, `4xx`, `401,403,5xx`.
+    pub status: Option<StatusFilter>,
     /// Substring of the URL or host, case-insensitive.
     pub q: Option<String>,
     /// Only entries with `ts` at or after this RFC 3339 time.
@@ -37,6 +38,43 @@ pub struct HistoryQuery {
     pub before: Option<String>,
     /// Page size; default [`DEFAULT_LIMIT`], capped at [`MAX_LIMIT`].
     pub limit: Option<usize>,
+}
+
+/// A `status` filter: exact codes and/or classes (`4xx` = 400..=499),
+/// comma-separated. Matches if any term matches.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StatusFilter {
+    pub codes: Vec<u16>,
+    pub classes: Vec<u8>,
+}
+
+impl std::str::FromStr for StatusFilter {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        let mut f = Self::default();
+        for term in s.split(',').map(str::trim) {
+            let lower = term.to_ascii_lowercase();
+            if let Some(d) = lower.strip_suffix("xx").filter(|d| d.len() == 1) {
+                match d.parse::<u8>() {
+                    Ok(c @ 1..=5) => f.classes.push(c),
+                    _ => return Err(format!("status class {term:?}: use 1xx to 5xx")),
+                }
+            } else {
+                match term.parse::<u16>() {
+                    Ok(c @ 100..=599) => f.codes.push(c),
+                    _ => return Err(format!("status {term:?}: expected a code (404), a class (4xx), or a comma list")),
+                }
+            }
+        }
+        Ok(f)
+    }
+}
+
+impl<'de> Deserialize<'de> for StatusFilter {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Debug)]
@@ -53,7 +91,7 @@ impl From<rusqlite::Error> for HistoryError {
 }
 
 const COLUMNS: &str = "rowid, id, ts, host, method, url, req_headers, req_body, \
-    req_body_encoding, status, res_headers, res_body, res_body_encoding, duration_ms, replay_of";
+    req_body_encoding, status, res_headers, res_body, res_body_encoding, duration_ms, replay_of, source";
 
 impl SqliteBackend {
     /// Newest first, filtered, at most `limit` entries.
@@ -74,9 +112,18 @@ impl SqliteBackend {
             sql.push_str(" AND method = ?");
             params.push(Box::new(method.to_uppercase()));
         }
-        if let Some(status) = q.status {
-            sql.push_str(" AND status = ?");
-            params.push(Box::new(status));
+        if let Some(status) = &q.status {
+            let mut terms = Vec::new();
+            for code in &status.codes {
+                terms.push("status = ?");
+                params.push(Box::new(*code));
+            }
+            for class in &status.classes {
+                terms.push("(status >= ? AND status < ?)");
+                params.push(Box::new(u16::from(*class) * 100));
+                params.push(Box::new(u16::from(*class) * 100 + 100));
+            }
+            sql.push_str(&format!(" AND ({})", terms.join(" OR ")));
         }
         if let Some(text) = &q.q {
             sql.push_str(r" AND (url LIKE ? ESCAPE '\' OR host LIKE ? ESCAPE '\')");
@@ -184,6 +231,7 @@ fn row_to_entry(r: &Row) -> rusqlite::Result<(i64, TrafficEntry)> {
         res_body_encoding: encoding(12)?,
         duration_ms: r.get(13)?,
         replay_of: r.get(14)?,
+        source: r.get(15)?,
     };
     Ok((r.get(0)?, entry))
 }
@@ -209,6 +257,7 @@ mod tests {
             res_body_encoding: BodyEncoding::Utf8,
             duration_ms: Some(1),
             replay_of: None,
+            source: None,
         }
     }
 
@@ -289,16 +338,69 @@ mod tests {
         let run = |q: HistoryQuery| ids(&db.query(&q).unwrap()).into_iter().map(String::from).collect::<Vec<_>>();
         assert_eq!(run(HistoryQuery { host: Some("example".into()), ..Default::default() }), ["d", "b", "a"]);
         assert_eq!(run(HistoryQuery { method: Some("post".into()), ..Default::default() }), ["b"]);
-        assert_eq!(run(HistoryQuery { status: Some(200), ..Default::default() }), ["c", "a"]);
+        assert_eq!(run(HistoryQuery { status: Some("200".parse().unwrap()), ..Default::default() }), ["c", "a"]);
         assert_eq!(run(HistoryQuery { q: Some("LOGIN".into()), ..Default::default() }), ["b", "a"]);
         assert_eq!(run(HistoryQuery { q: Some("other.io".into()), ..Default::default() }), ["c"], "q matches host too");
         // LIKE wildcards in the search text are literal.
         assert_eq!(run(HistoryQuery { q: Some("50%_".into()), ..Default::default() }), ["d"]);
         assert_eq!(run(HistoryQuery { q: Some("_".into()), ..Default::default() }), ["d"]);
         assert_eq!(
-            run(HistoryQuery { host: Some("example".into()), method: Some("GET".into()), status: Some(200), ..Default::default() }),
+            run(HistoryQuery { host: Some("example".into()), method: Some("GET".into()), status: Some("200".parse().unwrap()), ..Default::default() }),
             ["a"]
         );
+    }
+
+    #[test]
+    fn status_filter_matches_codes_classes_and_lists() {
+        let dir = TempDir::new().unwrap();
+        let db = SqliteBackend::new(&dir.path().join("t.db")).unwrap();
+        for (id, code) in [("ok", 200), ("redir", 302), ("unauth", 401), ("forbid", 403), ("missing", 404), ("boom", 503)] {
+            db.append(&entry(id, "h", "GET", code, "/")).unwrap();
+        }
+        let run = |f: &str| {
+            let q = HistoryQuery { status: Some(f.parse().unwrap()), ..Default::default() };
+            ids(&db.query(&q).unwrap()).into_iter().map(String::from).collect::<Vec<_>>()
+        };
+        assert_eq!(run("404"), ["missing"]);
+        assert_eq!(run("4xx"), ["missing", "forbid", "unauth"]);
+        assert_eq!(run("4XX"), ["missing", "forbid", "unauth"]);
+        assert_eq!(run("401,403"), ["forbid", "unauth"]);
+        assert_eq!(run("2xx,5xx"), ["boom", "ok"]);
+        assert_eq!(run("302,5xx"), ["boom", "redir"]);
+    }
+
+    #[test]
+    fn status_filter_pages_with_before() {
+        let dir = TempDir::new().unwrap();
+        let db = SqliteBackend::new(&dir.path().join("t.db")).unwrap();
+        for i in 0..10 {
+            db.append(&entry(&format!("e{i}"), "h", "GET", if i % 2 == 0 { 404 } else { 200 }, "/")).unwrap();
+        }
+        let q = |before: Option<&str>| HistoryQuery {
+            status: Some("4xx".parse().unwrap()),
+            limit: Some(2),
+            before: before.map(String::from),
+            ..Default::default()
+        };
+        assert_eq!(ids(&db.query(&q(None)).unwrap()), ["e8", "e6"]);
+        assert_eq!(ids(&db.query(&q(Some("e6"))).unwrap()), ["e4", "e2"]);
+    }
+
+    #[test]
+    fn status_filter_rejects_garbage() {
+        for bad in ["", "4x", "6xx", "0xx", "99", "600", "abc", "4xx,", "40x"] {
+            assert!(bad.parse::<StatusFilter>().is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn source_round_trips_through_sqlite() {
+        let dir = TempDir::new().unwrap();
+        let db = SqliteBackend::new(&dir.path().join("t.db")).unwrap();
+        let mut e = entry("s", "h", "GET", 200, "/");
+        e.source = Some("agent.T-3".into());
+        db.append(&e).unwrap();
+        assert_eq!(db.get("s").unwrap().unwrap().source.as_deref(), Some("agent.T-3"));
     }
 
     #[test]

@@ -12,20 +12,40 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use uuid::Uuid;
 
 use crate::ca::Ca;
 use crate::cli::StartArgs;
+use crate::deploy::{self, Cidr, Exposure, ProxyCredentials};
 use crate::intercept::{self, Decision, InterceptEvent, RequestEvent, ResponseEvent};
 use crate::storage::{Headers, Store, TrafficEntry};
 use taphttp_types::{encode_body, header_value_to_string};
 
-#[derive(Clone)]
-struct ProxyConfig {
-    filter_host: Option<String>,
-    intercept_socket: Option<PathBuf>,
+/// How the proxy listener behaves. `Default` is today's local proxy: no
+/// filter, no intercept, no access control, no expiry, plaintext.
+#[derive(Default)]
+pub struct ProxyConfig {
+    pub filter_host: Option<String>,
+    pub intercept_socket: Option<PathBuf>,
+    /// Source-IP allowlist; empty allows everyone.
+    pub allow_clients: Vec<Cidr>,
+    /// When set, every client must present one of these (Basic), and the
+    /// username becomes each exchange's verified `source`.
+    pub credentials: Option<ProxyCredentials>,
+    /// After this, requests are refused (and `run` exits).
+    pub expires: Option<chrono::DateTime<Utc>>,
+    /// TLS on the proxy listener itself (an HTTPS proxy), so proxy
+    /// credentials aren't cleartext on the network.
+    pub tls: Option<Arc<rustls::ServerConfig>>,
+}
+
+impl ProxyConfig {
+    fn expired(&self) -> bool {
+        self.expires.is_some_and(|t| Utc::now() >= t)
+    }
 }
 
 /// The sqlite database to record into, if any: with `--sqlite`, or with
@@ -36,20 +56,99 @@ fn sqlite_path(args: &StartArgs, data_dir: &std::path::Path) -> Option<PathBuf> 
     wanted.then(|| args.db.clone().unwrap_or_else(|| data_dir.join("traffic.db")))
 }
 
+/// SANs for taphttp's own listener certs: every `--tls-name`, plus each
+/// listener's IP when it's a specific address (not 0.0.0.0 / ::).
+fn tls_names(names: &[String], listeners: &[Option<SocketAddr>]) -> Result<Vec<String>> {
+    let mut out: Vec<String> = names.to_vec();
+    for addr in listeners.iter().flatten() {
+        if !addr.ip().is_unspecified() {
+            out.push(addr.ip().to_string());
+        }
+    }
+    out.sort();
+    out.dedup();
+    if out.is_empty() {
+        anyhow::bail!(
+            "TLS on a wildcard address needs the name clients will connect to: pass \
+             --tls-name <host-or-ip> (repeatable)"
+        );
+    }
+    Ok(out)
+}
+
 pub async fn run(args: StartArgs, data_dir: PathBuf) -> Result<()> {
+    // Decide what may be exposed before binding anything.
+    let addr: SocketAddr = args.listen.parse().context("invalid listen address")?;
+    let api_addr: Option<SocketAddr> = args
+        .api_listen
+        .as_deref()
+        .map(|a| a.parse().context("invalid api-listen address"))
+        .transpose()?;
+    let credentials =
+        ProxyCredentials::load(args.proxy_auth_file.as_deref(), std::env::var("TAPHTTP_PROXY_AUTH").ok())?;
+    let allow_clients = args
+        .allow_client
+        .iter()
+        .map(|c| c.parse())
+        .collect::<Result<Vec<Cidr>>>()?;
+    let expires = args
+        .expires
+        .as_deref()
+        .map(|e| deploy::parse_expires(e, Utc::now()))
+        .transpose()?;
+    let exposure = Exposure {
+        proxy: Some(addr),
+        proxy_tls: args.proxy_tls,
+        proxy_auth: credentials.is_some(),
+        allow_open_proxy: args.allow_open_proxy,
+        api: api_addr,
+        api_tls: args.api_tls,
+        api_allow_plaintext: args.api_allow_plaintext,
+    };
+    deploy::check_exposure(&exposure)?;
+    let names = if args.proxy_tls || args.api_tls {
+        tls_names(&args.tls_name, &[args.proxy_tls.then_some(addr), api_addr.filter(|_| args.api_tls)])?
+    } else {
+        Vec::new()
+    };
+
     let ca = Arc::new(Ca::load_or_create(&data_dir)?);
+    let listener_tls = if names.is_empty() { None } else { Some(ca.listener_tls_config(&names)?) };
+
+    let info = deploy::BannerInfo {
+        exposure,
+        allow_clients: allow_clients.clone(),
+        proxy_users: credentials.as_ref().map_or(0, |c| c.len()),
+        expires,
+        ca_fingerprint: ca.fingerprint_sha256(),
+    };
+    let banner = deploy::banner(&info);
+    eprintln!("{banner}");
+    if !names.is_empty() {
+        eprintln!("  TLS names: {}", names.join(", "));
+    }
+    tracing::info!("{}", banner.replace('\n', " |"));
+
+    if let Some(at) = expires {
+        tokio::spawn(async move {
+            let wait = (at - Utc::now()).to_std().unwrap_or_default();
+            tokio::time::sleep(wait).await;
+            eprintln!("taphttp: deployment expired at {}; exiting", at.to_rfc3339());
+            tracing::warn!("deployment expired at {}; exiting", at.to_rfc3339());
+            std::process::exit(0);
+        });
+    }
+
     let db = sqlite_path(&args, &data_dir);
     if let Some(db) = &db {
         eprintln!("recording to sqlite at {}", db.display());
     }
     let store = Store::new(args.log_file.as_deref(), db.as_deref())?;
-    let addr: SocketAddr = args.listen.parse().context("invalid listen address")?;
     let listener = TcpListener::bind(addr).await.context("binding listener")?;
 
     // Optionally serve the lever API alongside the proxy, sharing the same
     // live Store so its /feed carries real traffic as it is recorded.
-    if let Some(api_listen) = &args.api_listen {
-        let api_addr: SocketAddr = api_listen.parse().context("invalid api-listen address")?;
+    if let Some(api_addr) = api_addr {
         let token = match &args.api_token_file {
             // From a file: print only where it is, so it stays out of logs.
             Some(path) => {
@@ -66,49 +165,65 @@ pub async fn run(args: StartArgs, data_dir: PathBuf) -> Result<()> {
             }
         };
         let state = Arc::new(crate::api::ApiState { store: store.clone(), token });
+        let api_tls = if args.api_tls { listener_tls.clone() } else { None };
         tokio::spawn(async move {
-            if let Err(e) = crate::api::serve(state, api_addr).await {
+            if let Err(e) = crate::api::serve(state, api_addr, api_tls).await {
                 tracing::error!("lever API exited: {e}");
             }
         });
     }
 
-    serve(listener, ca, store, args.filter_host, args.intercept_socket).await
+    let config = ProxyConfig {
+        filter_host: args.filter_host,
+        intercept_socket: args.intercept_socket,
+        allow_clients,
+        credentials,
+        expires,
+        tls: if args.proxy_tls { listener_tls } else { None },
+    };
+    serve(listener, ca, store, config).await
 }
 
-pub async fn serve(
-    listener: TcpListener,
-    ca: Arc<Ca>,
-    store: Arc<Store>,
-    filter_host: Option<String>,
-    intercept_socket: Option<PathBuf>,
-) -> Result<()> {
+pub async fn serve(listener: TcpListener, ca: Arc<Ca>, store: Arc<Store>, config: ProxyConfig) -> Result<()> {
     let addr = listener.local_addr()?;
-    let config = Arc::new(ProxyConfig { filter_host, intercept_socket });
+    let scheme = if config.tls.is_some() { "https" } else { "http" };
+    let acceptor = config.tls.clone().map(TlsAcceptor::from);
+    let config = Arc::new(config);
     tracing::info!("taphttp listening on {}", addr);
     eprintln!("taphttp listening on {addr}");
-    eprintln!("Configure your HTTP client to use proxy http://{addr}");
+    eprintln!("Configure your HTTP client to use proxy {scheme}://{addr}");
 
     loop {
         let (stream, peer) = listener.accept().await?;
+        if !deploy::client_allowed(&config.allow_clients, peer.ip()) {
+            // Close without a byte: a stranger learns nothing.
+            tracing::warn!("refused proxy client {peer}: not in --allow-client");
+            drop(stream);
+            continue;
+        }
         let ca = ca.clone();
         let store = store.clone();
         let config = config.clone();
+        let acceptor = acceptor.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, peer, ca, store, config).await {
-                tracing::debug!("connection error from {peer}: {e}");
+            let result = match acceptor {
+                Some(acceptor) => match acceptor.accept(stream).await {
+                    Ok(tls) => handle_connection(tls, ca, store, config).await,
+                    Err(e) => Err(anyhow::Error::from(e).context("proxy listener TLS handshake")),
+                },
+                None => handle_connection(stream, ca, store, config).await,
+            };
+            if let Err(e) = result {
+                tracing::debug!("connection error from {peer}: {e:#}");
             }
         });
     }
 }
 
-async fn handle_connection(
-    stream: TcpStream,
-    peer: SocketAddr,
-    ca: Arc<Ca>,
-    store: Arc<Store>,
-    config: Arc<ProxyConfig>,
-) -> Result<()> {
+async fn handle_connection<IO>(stream: IO, ca: Arc<Ca>, store: Arc<Store>, config: Arc<ProxyConfig>) -> Result<()>
+where
+    IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let io = hyper_util::rt::TokioIo::new(stream);
     hyper::server::conn::http1::Builder::new()
         .serve_connection(
@@ -117,7 +232,7 @@ async fn handle_connection(
                 let ca = ca.clone();
                 let store = store.clone();
                 let config = config.clone();
-                async move { dispatch(req, peer, ca, store, config).await }
+                async move { dispatch(req, ca, store, config).await }
             }),
         )
         .with_upgrades()
@@ -127,20 +242,37 @@ async fn handle_connection(
 
 async fn dispatch(
     req: Request<Incoming>,
-    _peer: SocketAddr,
     ca: Arc<Ca>,
     store: Arc<Store>,
     config: Arc<ProxyConfig>,
 ) -> Result<Response<Full<Bytes>>> {
-    if req.method() == hyper::Method::CONNECT {
-        handle_connect(req, ca, store, config).await
-    } else {
-        handle_http(req, store, config).await
+    if config.expired() {
+        return make_drop_response(503, Some("taphttp: this deployment has expired".into()));
     }
+    // For HTTPS this is the CONNECT, which is where clients send proxy auth;
+    // the source then applies to every request in that tunnel.
+    let header = req.headers().get(hyper::header::PROXY_AUTHORIZATION).map(|v| v.as_bytes());
+    let source = match deploy::authorize(header, config.credentials.as_ref()) {
+        Ok(source) => source,
+        Err(deploy::AuthRequired) => return proxy_auth_required(),
+    };
+    if req.method() == hyper::Method::CONNECT {
+        handle_connect(req, source, ca, store, config).await
+    } else {
+        handle_http(req, source, store, config).await
+    }
+}
+
+fn proxy_auth_required() -> Result<Response<Full<Bytes>>> {
+    Ok(Response::builder()
+        .status(407)
+        .header(hyper::header::PROXY_AUTHENTICATE, r#"Basic realm="taphttp""#)
+        .body(Full::new(Bytes::from_static(b"proxy authentication required")))?)
 }
 
 async fn handle_connect(
     req: Request<Incoming>,
+    source: Option<String>,
     ca: Arc<Ca>,
     store: Arc<Store>,
     config: Arc<ProxyConfig>,
@@ -160,7 +292,7 @@ async fn handle_connect(
     tokio::task::spawn(async move {
         match hyper::upgrade::on(req).await {
             Ok(upgraded) => {
-                if let Err(e) = mitm_tls(upgraded, host, host_port, ca, store, config).await {
+                if let Err(e) = mitm_tls(upgraded, host, host_port, source, ca, store, config).await {
                     tracing::debug!("mitm error: {e}");
                 }
             }
@@ -175,6 +307,7 @@ async fn mitm_tls(
     upgraded: hyper::upgrade::Upgraded,
     host: String,
     host_port: String,
+    source: Option<String>,
     ca: Arc<Ca>,
     store: Arc<Store>,
     config: Arc<ProxyConfig>,
@@ -200,9 +333,14 @@ async fn mitm_tls(
             service_fn(move |mut req: Request<Incoming>| {
                 let host = host_clone.clone();
                 let host_port = host_port_clone.clone();
+                let source = source.clone();
                 let store = store.clone();
                 let config = config.clone();
                 async move {
+                    // An open tunnel doesn't outlive the deployment.
+                    if config.expired() {
+                        return make_drop_response(503, Some("taphttp: this deployment has expired".into()));
+                    }
                     let path = req
                         .uri()
                         .path_and_query()
@@ -210,7 +348,7 @@ async fn mitm_tls(
                         .unwrap_or("/");
                     let full_url = format!("https://{host_port}{path}");
                     *req.uri_mut() = full_url.parse()?;
-                    forward_https(req, host, store, config).await
+                    forward_https(req, host, source, store, config).await
                 }
             }),
         )
@@ -221,6 +359,7 @@ async fn mitm_tls(
 async fn forward_https(
     req: Request<Incoming>,
     host: String,
+    source: Option<String>,
     store: Arc<Store>,
     config: Arc<ProxyConfig>,
 ) -> Result<Response<Full<Bytes>>> {
@@ -234,6 +373,9 @@ async fn forward_https(
     let mut method = req.method().to_string();
     let mut url = req.uri().to_string();
     let mut req_headers = collect_headers(req.headers());
+    // Proxy credentials are ours: never logged, never shown to an intercept
+    // hook, never sent upstream.
+    req_headers.remove("proxy-authorization");
 
     let (_, body) = req.into_parts();
     let mut req_body_bytes = body.collect().await?.to_bytes();
@@ -333,6 +475,7 @@ async fn forward_https(
         res_body_encoding,
         duration_ms: Some(duration_ms),
         replay_of: None,
+        source: source.clone(),
     };
 
     tracing::info!(
@@ -381,6 +524,7 @@ async fn send_https(req: Request<Full<Bytes>>) -> Result<Response<Incoming>> {
 
 async fn handle_http(
     req: Request<Incoming>,
+    source: Option<String>,
     store: Arc<Store>,
     config: Arc<ProxyConfig>,
 ) -> Result<Response<Full<Bytes>>> {
@@ -396,6 +540,9 @@ async fn handle_http(
     let mut method = req.method().to_string();
     let mut url = req.uri().to_string();
     let mut req_headers = collect_headers(req.headers());
+    // Proxy credentials are ours: never logged, never shown to an intercept
+    // hook, never sent upstream.
+    req_headers.remove("proxy-authorization");
 
     let (_, body) = req.into_parts();
     let mut req_body_bytes = body.collect().await?.to_bytes();
@@ -495,6 +642,7 @@ async fn handle_http(
         res_body_encoding,
         duration_ms: Some(duration_ms),
         replay_of: None,
+        source: source.clone(),
     };
 
     tracing::info!(
@@ -543,7 +691,10 @@ fn build_upstream_request(
         .uri(url.parse::<hyper::Uri>()?);
     // `header` appends, so repeated headers go upstream as captured.
     for (k, v) in headers.iter() {
-        if !k.eq_ignore_ascii_case("host") && !k.eq_ignore_ascii_case("proxy-connection") {
+        if !k.eq_ignore_ascii_case("host")
+            && !k.eq_ignore_ascii_case("proxy-connection")
+            && !k.eq_ignore_ascii_case("proxy-authorization")
+        {
             builder = builder.header(k, v);
         }
     }
@@ -559,7 +710,7 @@ fn rebuild_request(
         .method(parts.method.clone())
         .uri(url.parse::<hyper::Uri>()?);
     for (k, v) in &parts.headers {
-        if k != hyper::header::HOST && k != "proxy-connection" {
+        if k != hyper::header::HOST && k != "proxy-connection" && k != hyper::header::PROXY_AUTHORIZATION {
             builder = builder.header(k, v);
         }
     }
@@ -786,6 +937,14 @@ mod tests {
             intercept_socket: None,
             api_listen: api.then(|| "127.0.0.1:0".into()),
             api_token_file: None,
+            proxy_auth_file: None,
+            allow_client: vec![],
+            proxy_tls: false,
+            api_tls: false,
+            tls_name: vec![],
+            allow_open_proxy: false,
+            api_allow_plaintext: false,
+            expires: None,
         }
     }
 
@@ -884,11 +1043,17 @@ mod tests {
         log_file: &std::path::Path,
         intercept_socket: Option<PathBuf>,
     ) -> u16 {
+        start_proxy_with(data_dir, log_file, ProxyConfig { intercept_socket, ..Default::default() }).await
+    }
+
+    async fn start_proxy_with(data_dir: &std::path::Path, log_file: &std::path::Path, config: ProxyConfig) -> u16 {
+        // `main` does this; tests that do TLS need it too.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let ca = Arc::new(Ca::load_or_create(data_dir).unwrap());
         let store = Store::new(Some(log_file), None).unwrap();
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = proxy_listener.local_addr().unwrap().port();
-        tokio::spawn(serve(proxy_listener, ca, store, None, intercept_socket));
+        tokio::spawn(serve(proxy_listener, ca, store, config));
         tokio::time::sleep(Duration::from_millis(20)).await;
         port
     }
@@ -1100,6 +1265,330 @@ mod tests {
         assert_eq!(res.headers()["x-odd"].as_bytes(), b"caf\xe9");
     }
 
+    // --- access control, attribution, expiry, TLS listener (#8, #9) ---
+
+    type SeenHeaders = Arc<tokio::sync::Mutex<Vec<hyper::HeaderMap>>>;
+
+    /// Upstream that remembers every request's headers and answers 200 "ok".
+    async fn start_header_capture_upstream() -> (u16, SeenHeaders) {
+        let seen: SeenHeaders = Default::default();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let s = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { return };
+                let s = s.clone();
+                tokio::spawn(async move {
+                    hyper::server::conn::http1::Builder::new()
+                        .serve_connection(
+                            hyper_util::rt::TokioIo::new(stream),
+                            service_fn(move |req: Request<Incoming>| {
+                                let s = s.clone();
+                                async move {
+                                    s.lock().await.push(req.headers().clone());
+                                    Ok::<_, anyhow::Error>(Response::new(Full::new(Bytes::from("ok"))))
+                                }
+                            }),
+                        )
+                        .await
+                        .ok();
+                });
+            }
+        });
+        (port, seen)
+    }
+
+    /// `Basic <base64(user:pass)>`, encoded test-side.
+    fn basic_header(userpass: &str) -> String {
+        const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for c in userpass.as_bytes().chunks(3) {
+            let n = (u32::from(c[0]) << 16) | (u32::from(*c.get(1).unwrap_or(&0)) << 8) | u32::from(*c.get(2).unwrap_or(&0));
+            out.push(A[(n >> 18) as usize & 63] as char);
+            out.push(A[(n >> 12) as usize & 63] as char);
+            out.push(if c.len() > 1 { A[(n >> 6) as usize & 63] as char } else { '=' });
+            out.push(if c.len() > 2 { A[n as usize & 63] as char } else { '=' });
+        }
+        format!("Basic {out}")
+    }
+
+    /// One request through the proxy over an already-connected stream.
+    async fn request_over<IO>(io: IO, req: Request<Full<Bytes>>) -> (hyper::http::response::Parts, Bytes)
+    where
+        IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(io)).await.unwrap();
+        tokio::spawn(conn);
+        let res = sender.send_request(req).await.unwrap();
+        let (parts, body) = res.into_parts();
+        (parts, body.collect().await.unwrap().to_bytes())
+    }
+
+    fn proxied_get(target: &str, auth: Option<&str>) -> Request<Full<Bytes>> {
+        let mut b = Request::get(target).header("host", "upstream");
+        if let Some(a) = auth {
+            b = b.header("proxy-authorization", basic_header(a));
+        }
+        b.body(Full::new(Bytes::new())).unwrap()
+    }
+
+    fn creds(text: &str) -> Option<ProxyCredentials> {
+        Some(ProxyCredentials::parse(text).unwrap())
+    }
+
+    fn logged(log: &std::path::Path) -> Vec<TrafficEntry> {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn proxy_auth_required_when_credentials_configured() {
+        let (up, seen) = start_header_capture_upstream().await;
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("t.jsonl");
+        let port = start_proxy_with(
+            dir.path(),
+            &log,
+            ProxyConfig { credentials: creds("agent.T-3:s3cret"), ..Default::default() },
+        )
+        .await;
+        let target = format!("http://127.0.0.1:{up}/x");
+        let connect = || TcpStream::connect(format!("127.0.0.1:{port}"));
+
+        for bad in [None, Some("agent.T-3:wrong"), Some("someone:s3cret")] {
+            let (parts, _) = request_over(connect().await.unwrap(), proxied_get(&target, bad)).await;
+            assert_eq!(parts.status, 407, "{bad:?}");
+            assert_eq!(parts.headers["proxy-authenticate"], r#"Basic realm="taphttp""#);
+        }
+        assert!(seen.lock().await.is_empty(), "rejected requests never reach upstream");
+
+        let (parts, body) = request_over(connect().await.unwrap(), proxied_get(&target, Some("agent.T-3:s3cret"))).await;
+        assert_eq!(parts.status, 200);
+        assert_eq!(body, "ok");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let entries = logged(&log);
+        assert_eq!(entries.len(), 1, "only the authenticated request is logged");
+        assert_eq!(entries[0].source.as_deref(), Some("agent.T-3"), "verified identity recorded");
+    }
+
+    #[tokio::test]
+    async fn proxy_authorization_never_reaches_upstream_or_the_log() {
+        let (up, seen) = start_header_capture_upstream().await;
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("t.jsonl");
+        // No credentials configured: the username is a self-reported label.
+        let port = start_proxy(dir.path(), &log, None).await;
+        let stream = TcpStream::connect(format!("127.0.0.1:{port}")).await.unwrap();
+        let (parts, _) =
+            request_over(stream, proxied_get(&format!("http://127.0.0.1:{up}/"), Some("agent.T-3:not-a-secret"))).await;
+        assert_eq!(parts.status, 200);
+
+        let upstream = seen.lock().await;
+        assert!(!upstream[0].contains_key("proxy-authorization"), "credentials must not leak to the target");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let raw = std::fs::read_to_string(&log).unwrap();
+        assert!(!raw.to_ascii_lowercase().contains("proxy-authorization"), "{raw}");
+        assert!(!raw.contains("not-a-secret") && !raw.contains(&basic_header("agent.T-3:not-a-secret")[6..]));
+        let entries = logged(&log);
+        assert_eq!(entries[0].source.as_deref(), Some("agent.T-3"));
+    }
+
+    #[tokio::test]
+    async fn intercept_hook_cannot_send_proxy_authorization_upstream() {
+        let (up, seen) = start_header_capture_upstream().await;
+        let dir = TempDir::new().unwrap();
+        let socket_path = dir.path().join("intercept.sock");
+        start_mock_interceptor(
+            socket_path.clone(),
+            vec![
+                r#"{"action":"forward","headers":{"proxy-authorization":"Basic eDp5","x-kept":"1"}}"#,
+                r#"{"action":"forward"}"#,
+            ],
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let port = start_proxy(dir.path(), &dir.path().join("t.jsonl"), Some(socket_path)).await;
+        let stream = TcpStream::connect(format!("127.0.0.1:{port}")).await.unwrap();
+        request_over(stream, proxied_get(&format!("http://127.0.0.1:{up}/"), None)).await;
+        let upstream = seen.lock().await;
+        assert_eq!(upstream[0]["x-kept"], "1", "the hook's other headers apply");
+        assert!(!upstream[0].contains_key("proxy-authorization"));
+    }
+
+    #[tokio::test]
+    async fn untagged_traffic_has_no_source() {
+        let (up, _) = start_header_capture_upstream().await;
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("t.jsonl");
+        let port = start_proxy(dir.path(), &log, None).await;
+        let stream = TcpStream::connect(format!("127.0.0.1:{port}")).await.unwrap();
+        request_over(stream, proxied_get(&format!("http://127.0.0.1:{up}/"), None)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(logged(&log)[0].source, None);
+    }
+
+    /// Open a CONNECT tunnel through the proxy, then TLS to taphttp's MITM
+    /// cert for `host` (trusting the CA in `dir`). Returns the CONNECT status
+    /// and, if it was 200, the TLS stream.
+    async fn connect_tunnel(
+        proxy_port: u16,
+        authority: &str,
+        auth: Option<&str>,
+        dir: &std::path::Path,
+    ) -> (u16, Option<tokio_rustls::client::TlsStream<TcpStream>>) {
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await.unwrap();
+        let mut head = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n");
+        if let Some(a) = auth {
+            head.push_str(&format!("Proxy-Authorization: {}\r\n", basic_header(a)));
+        }
+        head.push_str("\r\n");
+        stream.write_all(head.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        let mut byte = [0u8; 1];
+        while !buf.ends_with(b"\r\n\r\n") {
+            if stream.read(&mut byte).await.unwrap() == 0 {
+                break;
+            }
+            buf.push(byte[0]);
+        }
+        let status: u16 = String::from_utf8_lossy(&buf)[9..12].parse().unwrap();
+        if status != 200 {
+            return (status, None);
+        }
+        let host = authority.rsplit_once(':').unwrap().0.to_string();
+        let tls = tls_connector(dir)
+            .connect(rustls::pki_types::ServerName::try_from(host).unwrap(), stream)
+            .await
+            .unwrap();
+        (status, Some(tls))
+    }
+
+    /// A TLS client that trusts only taphttp's CA in `dir`.
+    fn tls_connector(dir: &std::path::Path) -> tokio_rustls::TlsConnector {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let pem = std::fs::read_to_string(dir.join("ca.crt")).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        for c in rustls_pemfile::certs(&mut pem.as_bytes()) {
+            roots.add(c.unwrap()).unwrap();
+        }
+        let cfg = ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+        tokio_rustls::TlsConnector::from(Arc::new(cfg))
+    }
+
+    #[tokio::test]
+    async fn connect_is_authenticated_and_its_source_covers_the_tunnel() {
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("t.jsonl");
+        let port = start_proxy_with(
+            dir.path(),
+            &log,
+            ProxyConfig { credentials: creds("agent.T-3:s3cret"), ..Default::default() },
+        )
+        .await;
+        // Nothing listens on :9 upstream, so the exchange records as a 502;
+        // what matters is the auth decision and the recorded source.
+        let authority = "localhost:9";
+        assert_eq!(connect_tunnel(port, authority, None, dir.path()).await.0, 407);
+        assert_eq!(connect_tunnel(port, authority, Some("agent.T-3:nope"), dir.path()).await.0, 407);
+
+        let (status, tls) = connect_tunnel(port, authority, Some("agent.T-3:s3cret"), dir.path()).await;
+        assert_eq!(status, 200);
+        let req = Request::get("/inside").header("host", "localhost").body(Full::new(Bytes::new())).unwrap();
+        let (parts, _) = request_over(tls.unwrap(), req).await;
+        assert_eq!(parts.status, 502);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let entries = logged(&log);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].url.ends_with("/inside"));
+        assert_eq!(entries[0].source.as_deref(), Some("agent.T-3"));
+    }
+
+    #[tokio::test]
+    async fn client_outside_allowlist_is_disconnected() {
+        let (up, seen) = start_header_capture_upstream().await;
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("t.jsonl");
+        let allow = vec!["10.0.0.0/8".parse().unwrap()];
+        let port = start_proxy_with(dir.path(), &log, ProxyConfig { allow_clients: allow, ..Default::default() }).await;
+
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).await.unwrap();
+        let req = format!("GET http://127.0.0.1:{up}/ HTTP/1.1\r\nHost: x\r\n\r\n");
+        let _ = stream.write_all(req.as_bytes()).await;
+        let mut buf = Vec::new();
+        let n = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut buf)).await.unwrap().unwrap_or(0);
+        assert_eq!(n, 0, "closed without a response");
+        assert!(seen.lock().await.is_empty());
+
+        // 127.0.0.1 allowed: works.
+        let ok = start_proxy_with(
+            dir.path(),
+            &log,
+            ProxyConfig { allow_clients: vec!["127.0.0.0/8".parse().unwrap()], ..Default::default() },
+        )
+        .await;
+        let stream = TcpStream::connect(format!("127.0.0.1:{ok}")).await.unwrap();
+        assert_eq!(request_over(stream, proxied_get(&format!("http://127.0.0.1:{up}/"), None)).await.0.status, 200);
+    }
+
+    #[tokio::test]
+    async fn requests_after_expiry_are_refused() {
+        let (up, seen) = start_header_capture_upstream().await;
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("t.jsonl");
+        let expires = Some(Utc::now() - chrono::Duration::seconds(1));
+        let port = start_proxy_with(dir.path(), &log, ProxyConfig { expires, ..Default::default() }).await;
+        let stream = TcpStream::connect(format!("127.0.0.1:{port}")).await.unwrap();
+        let (parts, body) = request_over(stream, proxied_get(&format!("http://127.0.0.1:{up}/"), None)).await;
+        assert_eq!(parts.status, 503);
+        assert!(String::from_utf8_lossy(&body).contains("expired"));
+        assert!(seen.lock().await.is_empty());
+        assert_eq!(connect_tunnel(port, "localhost:9", None, dir.path()).await.0, 503);
+    }
+
+    #[tokio::test]
+    async fn tls_proxy_listener_serves_trusting_clients_and_rejects_plaintext() {
+        let (up, seen) = start_header_capture_upstream().await;
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("t.jsonl");
+        let ca = Ca::load_or_create(dir.path()).unwrap();
+        let tls = Some(ca.listener_tls_config(&["127.0.0.1".into()]).unwrap());
+        let port = start_proxy_with(
+            dir.path(),
+            &log,
+            ProxyConfig { tls, credentials: creds("you:pw"), ..Default::default() },
+        )
+        .await;
+
+        let tcp = TcpStream::connect(format!("127.0.0.1:{port}")).await.unwrap();
+        let name = rustls::pki_types::ServerName::try_from("127.0.0.1").unwrap();
+        let stream = tls_connector(dir.path()).connect(name, tcp).await.expect("listener cert chains to ca.crt");
+        let (parts, body) = request_over(stream, proxied_get(&format!("http://127.0.0.1:{up}/"), Some("you:pw"))).await;
+        assert_eq!((parts.status.as_u16(), body.as_ref()), (200, &b"ok"[..]));
+        assert_eq!(seen.lock().await.len(), 1);
+
+        // A plaintext client gets no HTTP response from a TLS listener.
+        let mut plain = TcpStream::connect(format!("127.0.0.1:{port}")).await.unwrap();
+        plain.write_all(format!("GET http://127.0.0.1:{up}/ HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), plain.read_to_end(&mut buf)).await;
+        assert!(!String::from_utf8_lossy(&buf).starts_with("HTTP/1.1 200"));
+        assert_eq!(seen.lock().await.len(), 1, "plaintext request never forwarded");
+    }
+
+    #[test]
+    fn tls_names_include_specific_listener_ips_and_require_one_for_wildcards() {
+        let a: SocketAddr = "10.0.0.5:8443".parse().unwrap();
+        let any: SocketAddr = "0.0.0.0:8443".parse().unwrap();
+        assert_eq!(tls_names(&[], &[Some(a)]).unwrap(), ["10.0.0.5"]);
+        assert_eq!(tls_names(&["proxy.lan".into()], &[Some(any), Some(a)]).unwrap(), ["10.0.0.5", "proxy.lan"]);
+        let err = tls_names(&[], &[Some(any), None]).unwrap_err().to_string();
+        assert!(err.contains("--tls-name"), "{err}");
+    }
+
     #[tokio::test]
     async fn http_proxy_filter_host_skips_unmatched() {
         let echo_port = start_echo_server().await;
@@ -1110,13 +1599,8 @@ mod tests {
         let store = Store::new(Some(&log_file), None).unwrap();
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_port = proxy_listener.local_addr().unwrap().port();
-        tokio::spawn(serve(
-            proxy_listener,
-            ca,
-            store,
-            Some("only-this-host.example".to_string()),
-            None,
-        ));
+        let config = ProxyConfig { filter_host: Some("only-this-host.example".to_string()), ..Default::default() };
+        tokio::spawn(serve(proxy_listener, ca, store, config));
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         send_http_through_proxy(proxy_port, echo_port, "/nolog").await;

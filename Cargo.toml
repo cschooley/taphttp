@@ -1,6 +1,6 @@
 [package]
 name = "taphttp"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "Headless TLS-terminating MITM proxy for HTTP traffic inspection"
 license = "MIT"
@@ -15,7 +15,7 @@ name = "taphttp"
 path = "src/main.rs"
 
 [dependencies]
-taphttp-types = { path = "crates/taphttp-types", version = "0.2.0" }
+taphttp-types = { path = "crates/taphttp-types", version = "0.3.0" }
 tokio = { version = "1", features = ["full"] }
 hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
 hyper-util = { version = "0.1", features = ["tokio", "client", "client-legacy", "http1", "http2"] }
@@ -40,12 +40,13 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dirs = "5"
 axum = { version = "0.8.9", features = ["ws"] }
+ring = "0.17"
+tower = { version = "0.5.3", features = ["util"] }
 
 [dev-dependencies]
 futures-util = "0.3.34"
 tempfile = "3"
 tokio-tungstenite = "0.30.0"
-tower = { version = "0.5.3", features = ["util"] }
 
 [profile.release]
 opt-level = 3

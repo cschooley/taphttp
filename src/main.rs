@@ -1,6 +1,7 @@
 mod api;
 mod ca;
 mod cli;
+mod deploy;
 mod history;
 mod intercept;
 mod proxy;
