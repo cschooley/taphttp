@@ -1,6 +1,8 @@
 use crate::cli::{CaAction, CaArgs};
 use anyhow::{Context, Result};
-use rcgen::{BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair};
+use rcgen::{
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, Issuer, KeyPair,
+};
 use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -8,10 +10,11 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 pub struct Ca {
-    cert: rcgen::Certificate,
-    key: KeyPair,
-    /// `ca.crt` as on disk: what clients trust and pin. (`cert` is re-signed
-    /// at load, and ECDSA signatures differ each time, so its bytes don't.)
+    /// Signs leaves: the CA's subject and key identifier, read from ca.crt,
+    /// plus its private key.
+    issuer: Issuer<'static, KeyPair>,
+    /// `ca.crt` as on disk: what clients trust and pin.
+    disk_pem: String,
     disk_der: Vec<u8>,
     cert_cache: Mutex<HashMap<String, Arc<rustls::ServerConfig>>>,
 }
@@ -32,19 +35,16 @@ impl Ca {
                     key_path.display()
                 );
             }
-            let params =
-                CertificateParams::from_ca_cert_pem(&cert_pem).context("parsing CA cert params")?;
-            let cert = params.self_signed(&key).context("re-signing CA cert")?;
             let disk_der = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
                 .next()
                 .context("no certificate in ca.crt")?
-                .context("parsing ca.crt")?
-                .to_vec();
+                .context("parsing ca.crt")?;
+            let issuer = Issuer::from_ca_cert_der(&disk_der, key).context("parsing CA cert")?;
             tracing::debug!("Loaded existing CA from {}", data_dir.display());
             return Ok(Self {
-                cert,
-                key,
-                disk_der,
+                issuer,
+                disk_pem: cert_pem,
+                disk_der: disk_der.to_vec(),
                 cert_cache: Mutex::new(HashMap::new()),
             });
         }
@@ -70,17 +70,16 @@ impl Ca {
             cert_path.display()
         );
 
-        let disk_der = cert.der().to_vec();
         Ok(Self {
-            cert,
-            key,
-            disk_der,
+            disk_pem: cert.pem(),
+            disk_der: cert.der().to_vec(),
+            issuer: Issuer::new(params, key),
             cert_cache: Mutex::new(HashMap::new()),
         })
     }
 
     pub fn cert_pem(&self) -> String {
-        self.cert.pem()
+        self.disk_pem.clone()
     }
 
     /// SHA-256 of the CA certificate, `AB:CD:...`, for pinning.
@@ -122,7 +121,7 @@ impl Ca {
         params.not_before = rcgen::date_time_ymd(2024, 1, 1);
         params.not_after = rcgen::date_time_ymd(2035, 1, 1);
         let leaf = params
-            .signed_by(&key, &self.cert, &self.key)
+            .signed_by(&key, &self.issuer)
             .context("signing listener cert")?;
         let chain = vec![
             CertificateDer::from(leaf.der().to_vec()),
@@ -148,7 +147,7 @@ impl Ca {
         params.not_before = rcgen::date_time_ymd(2024, 1, 1);
         params.not_after = rcgen::date_time_ymd(2035, 1, 1);
         let leaf = params
-            .signed_by(&key, &self.cert, &self.key)
+            .signed_by(&key, &self.issuer)
             .context("signing leaf cert")?;
 
         let cert_der = CertificateDer::from(leaf.der().to_vec());
@@ -238,6 +237,18 @@ mod tests {
         assert!(path.join("ca.key").exists(), "ca.key should be written");
     }
 
+    /// `taphttp ca print` must emit the certificate clients actually trust
+    /// (ca.crt), byte for byte, so its fingerprint matches the banner's.
+    #[test]
+    fn printed_ca_cert_is_exactly_ca_crt_on_create_and_on_reload() {
+        let dir = TempDir::new().unwrap();
+        let on_disk = || std::fs::read_to_string(dir.path().join("ca.crt")).unwrap();
+        let created = Ca::load_or_create(dir.path()).unwrap();
+        assert_eq!(created.cert_pem(), on_disk());
+        let reloaded = Ca::load_or_create(dir.path()).unwrap();
+        assert_eq!(reloaded.cert_pem(), on_disk());
+    }
+
     #[cfg(unix)]
     fn mode(p: &Path) -> u32 {
         use std::os::unix::fs::PermissionsExt;
@@ -283,6 +294,53 @@ mod tests {
             .unwrap();
         let want = ring::digest::digest(&ring::digest::SHA256, &der);
         assert!(a.starts_with(&format!("{:02X}:", want.as_ref()[0])));
+    }
+
+    /// A leaf for `name` from `ca`, checked by a client that trusts only
+    /// the ca.crt in `dir`.
+    fn verify_leaf_against_ca_crt(ca: &Ca, dir: &Path, name: &str) -> Result<(), rustls::Error> {
+        let pem = std::fs::read_to_string(dir.join("ca.crt")).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        for c in CertificateDer::pem_slice_iter(pem.as_bytes()) {
+            roots.add(c.unwrap()).unwrap();
+        }
+        use rustls::client::danger::ServerCertVerifier;
+        let verifier = rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
+            .build()
+            .unwrap();
+        let (chain, _) = ca.listener_chain(&[name.to_string()]).unwrap();
+        verifier
+            .verify_server_cert(
+                &chain[0],
+                &chain[1..],
+                &rustls::pki_types::ServerName::try_from(name.to_string()).unwrap(),
+                &[],
+                rustls::pki_types::UnixTime::now(),
+            )
+            .map(|_| ())
+    }
+
+    /// Existing installs reload their CA from disk: leaves signed after a
+    /// reload must still chain to the ca.crt clients already trust.
+    #[test]
+    fn leaves_signed_by_a_reloaded_ca_verify_against_ca_crt() {
+        install_crypto_provider();
+        let dir = TempDir::new().unwrap();
+        drop(Ca::load_or_create(dir.path()).unwrap());
+        let reloaded = Ca::load_or_create(dir.path()).unwrap();
+        verify_leaf_against_ca_crt(&reloaded, dir.path(), "app.example")
+            .unwrap_or_else(|e| panic!("reloaded CA leaf rejected: {e}"));
+    }
+
+    /// And a different CA's leaves must not verify (the check has teeth).
+    #[test]
+    fn leaves_from_another_ca_do_not_verify() {
+        install_crypto_provider();
+        let ours = TempDir::new().unwrap();
+        let theirs = TempDir::new().unwrap();
+        Ca::load_or_create(ours.path()).unwrap();
+        let other = Ca::load_or_create(theirs.path()).unwrap();
+        assert!(verify_leaf_against_ca_crt(&other, ours.path(), "app.example").is_err());
     }
 
     #[test]
