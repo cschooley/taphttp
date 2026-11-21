@@ -252,16 +252,17 @@ async fn forward_https(
     let res = send_https(upstream_req).await;
     let duration_ms = start.elapsed().as_millis() as u64;
 
-    let (mut status, mut res_headers, mut res_body_bytes) = match res {
+    let (mut status, mut res_headers, mut res_raw_headers, mut res_body_bytes) = match res {
         Ok(r) => {
             let s = r.status().as_u16();
             let h = collect_headers(r.headers());
+            let raw = r.headers().clone();
             let b = r.into_body().collect().await?.to_bytes();
-            (Some(s), h, b)
+            (Some(s), h, raw, b)
         }
         Err(e) => {
             tracing::debug!("upstream error: {e}");
-            (None, Headers::new(), Bytes::new())
+            (None, Headers::new(), hyper::HeaderMap::new(), Bytes::new())
         }
     };
 
@@ -277,7 +278,13 @@ async fn forward_https(
             });
             match intercept::pause(socket, &event).await {
                 Ok(Decision::Forward(mods)) => {
-                    apply_response_mods(&mut status, &mut res_headers, &mut res_body_bytes, mods);
+                    apply_response_mods(
+                        &mut status,
+                        &mut res_headers,
+                        &mut res_raw_headers,
+                        &mut res_body_bytes,
+                        mods,
+                    );
                 }
                 Ok(Decision::Drop(d)) => {
                     return make_drop_response(d.status.unwrap_or(502), d.body);
@@ -319,11 +326,10 @@ async fn forward_https(
 
     store.record(entry);
 
-    let status = status.unwrap_or(502);
-    Ok(Response::builder()
-        .status(status)
-        .body(Full::new(res_body_bytes))
-        .unwrap())
+    match status {
+        Some(s) => client_response(s, &res_raw_headers, res_body_bytes),
+        None => make_drop_response(502, None),
+    }
 }
 
 async fn passthrough_https(req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
@@ -332,14 +338,10 @@ async fn passthrough_https(req: Request<Incoming>) -> Result<Response<Full<Bytes
     let body_bytes = body.collect().await?.to_bytes();
     let upstream = rebuild_request(&parts, body_bytes, &url)?;
     let res = send_https(upstream).await?;
-    let status = res.status();
+    let status = res.status().as_u16();
     let headers = res.headers().clone();
     let body = res.into_body().collect().await?.to_bytes();
-    let mut builder = Response::builder().status(status);
-    for (k, v) in &headers {
-        builder = builder.header(k, v);
-    }
-    Ok(builder.body(Full::new(body)).unwrap())
+    client_response(status, &headers, body)
 }
 
 async fn send_https(req: Request<Full<Bytes>>) -> Result<Response<Incoming>> {
@@ -412,16 +414,17 @@ async fn handle_http(
     let res = forward_http_request(upstream_req).await;
     let duration_ms = start.elapsed().as_millis() as u64;
 
-    let (mut status, mut res_headers, mut res_body_bytes) = match res {
+    let (mut status, mut res_headers, mut res_raw_headers, mut res_body_bytes) = match res {
         Ok(r) => {
             let s = r.status().as_u16();
             let h = collect_headers(r.headers());
+            let raw = r.headers().clone();
             let b = r.into_body().collect().await?.to_bytes();
-            (Some(s), h, b)
+            (Some(s), h, raw, b)
         }
         Err(e) => {
             tracing::debug!("http upstream error: {e}");
-            (None, Headers::new(), Bytes::new())
+            (None, Headers::new(), hyper::HeaderMap::new(), Bytes::new())
         }
     };
 
@@ -437,7 +440,13 @@ async fn handle_http(
             });
             match intercept::pause(socket, &event).await {
                 Ok(Decision::Forward(mods)) => {
-                    apply_response_mods(&mut status, &mut res_headers, &mut res_body_bytes, mods);
+                    apply_response_mods(
+                        &mut status,
+                        &mut res_headers,
+                        &mut res_raw_headers,
+                        &mut res_body_bytes,
+                        mods,
+                    );
                 }
                 Ok(Decision::Drop(d)) => {
                     return make_drop_response(d.status.unwrap_or(502), d.body);
@@ -479,11 +488,10 @@ async fn handle_http(
 
     store.record(entry);
 
-    let status = status.unwrap_or(502);
-    Ok(Response::builder()
-        .status(status)
-        .body(Full::new(res_body_bytes))
-        .unwrap())
+    match status {
+        Some(s) => client_response(s, &res_raw_headers, res_body_bytes),
+        None => make_drop_response(502, None),
+    }
 }
 
 async fn forward_http_raw(req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
@@ -492,14 +500,10 @@ async fn forward_http_raw(req: Request<Incoming>) -> Result<Response<Full<Bytes>
     let body_bytes = body.collect().await?.to_bytes();
     let upstream = rebuild_request(&parts, body_bytes, &url)?;
     let res = forward_http_request(upstream).await?;
-    let status = res.status();
+    let status = res.status().as_u16();
     let headers = res.headers().clone();
     let body = res.into_body().collect().await?.to_bytes();
-    let mut builder = Response::builder().status(status);
-    for (k, v) in &headers {
-        builder = builder.header(k, v);
-    }
-    Ok(builder.body(Full::new(body)).unwrap())
+    client_response(status, &headers, body)
 }
 
 async fn forward_http_request(req: Request<Full<Bytes>>) -> Result<Response<Incoming>> {
@@ -559,12 +563,70 @@ fn apply_request_mods(
 fn apply_response_mods(
     status: &mut Option<u16>,
     headers: &mut Headers,
+    raw_headers: &mut hyper::HeaderMap,
     body_bytes: &mut Bytes,
     mods: crate::intercept::ForwardDecision,
 ) {
     if let Some(s) = mods.status { *status = Some(s); }
-    if let Some(h) = mods.headers { *headers = h.into_iter().collect(); }
+    if let Some(h) = mods.headers {
+        *headers = h.into_iter().collect();
+        *raw_headers = to_header_map(headers);
+    }
     if let Some(b) = mods.body { *body_bytes = Bytes::from(b.into_bytes()); }
+}
+
+/// Headers that describe one connection, not the message (RFC 9110 §7.6.1),
+/// plus content-length, which hyper recomputes from the buffered body.
+const NOT_FORWARDED: [&str; 9] = [
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
+
+/// The response the proxy sends back to its client: upstream's status and
+/// headers (every repeated one, raw bytes) minus hop-by-hop and framing
+/// headers, since the body has been buffered and is re-framed here.
+fn client_response(status: u16, headers: &hyper::HeaderMap, body: Bytes) -> Result<Response<Full<Bytes>>> {
+    // Headers named in Connection are hop-by-hop too.
+    let named: Vec<String> = headers
+        .get_all(hyper::header::CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(|t| t.trim().to_ascii_lowercase())
+        .collect();
+    let mut builder = Response::builder().status(status);
+    for (k, v) in headers {
+        let name = k.as_str();
+        if NOT_FORWARDED.contains(&name) || name == "content-length" || named.iter().any(|n| n == name) {
+            continue;
+        }
+        builder = builder.header(k, v);
+    }
+    Ok(builder.body(Full::new(body))?)
+}
+
+/// Build a sendable header map from string headers (an intercept hook's
+/// override). Names or values hyper can't send are skipped, not fatal.
+fn to_header_map(headers: &Headers) -> hyper::HeaderMap {
+    let mut map = hyper::HeaderMap::new();
+    for (k, v) in headers.iter() {
+        let (Ok(name), Ok(value)) = (
+            hyper::header::HeaderName::from_bytes(k.as_bytes()),
+            hyper::header::HeaderValue::from_str(v),
+        ) else {
+            tracing::debug!("skipping unsendable header {k:?}");
+            continue;
+        };
+        map.append(name, value);
+    }
+    map
 }
 
 fn make_drop_response(status: u16, body: Option<String>) -> Result<Response<Full<Bytes>>> {
@@ -873,6 +935,126 @@ mod tests {
             Some(&[0x89, b'P', b'N', b'G', 0x00, 0xff][..]),
             "binary response body must be byte-exact"
         );
+    }
+
+    /// Upstream that answers with a chunked body, two Set-Cookies and hop-by-hop
+    /// headers, as a browser-facing app server would.
+    async fn start_cookie_upstream() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else { return };
+            let mut buf = vec![0u8; 8192];
+            let _ = stream.read(&mut buf).await;
+            let res = "HTTP/1.1 200 OK\r\n\
+                content-type: text/html; charset=utf-8\r\n\
+                set-cookie: session=abc; Secure; HttpOnly\r\n\
+                set-cookie: theme=dark\r\n\
+                keep-alive: timeout=5\r\n\
+                transfer-encoding: chunked\r\n\
+                connection: close\r\n\r\n\
+                5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+            stream.write_all(res.as_bytes()).await.ok();
+        });
+        port
+    }
+
+    /// Send a GET through the proxy and parse the response with hyper, so
+    /// framing errors (e.g. a stale transfer-encoding) fail the test.
+    async fn get_through_proxy(proxy_port: u16, target: &str) -> (hyper::http::response::Parts, Bytes) {
+        let stream = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await.unwrap();
+        let (mut sender, conn) =
+            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream)).await.unwrap();
+        tokio::spawn(conn);
+        let req = Request::get(target)
+            .header("host", "upstream")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let res = sender.send_request(req).await.unwrap();
+        let (parts, body) = res.into_parts();
+        let body = tokio::time::timeout(Duration::from_secs(5), body.collect())
+            .await
+            .expect("body must be framed so the client can finish reading it")
+            .unwrap()
+            .to_bytes();
+        (parts, body)
+    }
+
+    #[tokio::test]
+    async fn http_proxy_forwards_response_headers_to_client() {
+        let up = start_cookie_upstream().await;
+        let dir = TempDir::new().unwrap();
+        let proxy_port = start_proxy(dir.path(), &dir.path().join("t.jsonl"), None).await;
+
+        let (parts, body) = get_through_proxy(proxy_port, &format!("http://127.0.0.1:{up}/")).await;
+
+        assert_eq!(parts.status, 200);
+        let cookies: Vec<_> = parts.headers.get_all("set-cookie").iter().map(|v| v.to_str().unwrap()).collect();
+        assert_eq!(cookies, ["session=abc; Secure; HttpOnly", "theme=dark"], "browser must get every Set-Cookie");
+        assert_eq!(parts.headers["content-type"], "text/html; charset=utf-8");
+        assert!(!parts.headers.contains_key("keep-alive"), "hop-by-hop headers are not forwarded");
+        assert!(!parts.headers.contains_key("transfer-encoding"), "body is re-framed by the proxy");
+        assert_eq!(body, "hello world");
+    }
+
+    #[tokio::test]
+    async fn intercept_response_header_override_reaches_client() {
+        let echo_port = start_echo_server().await;
+        let dir = TempDir::new().unwrap();
+        let socket_path = dir.path().join("intercept.sock");
+        start_mock_interceptor(
+            socket_path.clone(),
+            vec![
+                r#"{"action":"forward"}"#,
+                r#"{"action":"forward","headers":{"x-injected":"yes"}}"#,
+            ],
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let proxy_port = start_proxy(dir.path(), &dir.path().join("t.jsonl"), Some(socket_path)).await;
+
+        let (parts, body) = get_through_proxy(proxy_port, &format!("http://127.0.0.1:{echo_port}/")).await;
+        assert_eq!(parts.headers["x-injected"], "yes");
+        assert_eq!(body, "echo-ok");
+    }
+
+    #[test]
+    fn client_response_drops_hop_by_hop_and_length_headers() {
+        let h: Headers = [
+            ("connection", "keep-alive, x-private"),
+            ("x-private", "1"),
+            ("keep-alive", "timeout=5"),
+            ("Transfer-Encoding", "chunked"),
+            ("content-length", "999"),
+            ("upgrade", "h2c"),
+            ("set-cookie", "a=1"),
+            ("set-cookie", "b=2"),
+            ("content-encoding", "gzip"),
+        ]
+        .into_iter()
+        .collect();
+        let res = client_response(200, &to_header_map(&h), Bytes::from_static(b"abc")).unwrap();
+        let names: Vec<_> = res.headers().keys().map(|k| k.as_str()).collect();
+        assert_eq!(names, ["set-cookie", "content-encoding"]);
+        assert_eq!(res.headers().get_all("set-cookie").iter().count(), 2);
+    }
+
+    #[test]
+    fn to_header_map_skips_headers_hyper_rejects() {
+        // An intercept hook can send any string; a name with a space can't
+        // go on the wire and must not fail the whole response.
+        let h: Headers = [("bad name", "x"), ("ok", "1"), ("ok", "2")].into_iter().collect();
+        let map = to_header_map(&h);
+        assert_eq!(map.get_all("ok").iter().count(), 2);
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn client_response_forwards_raw_non_utf8_value_bytes() {
+        let mut map = hyper::HeaderMap::new();
+        map.insert("x-odd", hyper::header::HeaderValue::from_bytes(b"caf\xe9").unwrap());
+        let res = client_response(200, &map, Bytes::new()).unwrap();
+        assert_eq!(res.headers()["x-odd"].as_bytes(), b"caf\xe9");
     }
 
     #[tokio::test]
