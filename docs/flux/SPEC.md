@@ -1,10 +1,10 @@
-# flux: a SARIF 2.1.0 profile for the cschooley security toolkit
+# flux: a SARIF 2.1.0 profile for Kudzu
 
 Status: draft v0.3 (Nov 2026)
 
 ## What flux is (and isn't)
 
-flux is **not a new schema**. It is a profile of [SARIF 2.1.0](https://docs.oasis-open.org/sarif/sarif/v2.1.0/sarif-v2.1.0.html) (OASIS): a set of conventions on which fields are required, how fingerprints are computed, and which property-bag keys the toolkit uses. A flux document is a valid SARIF document. Any SARIF consumer can read it; flux-aware tools get extra guarantees.
+flux is **not a new schema**. It is a profile of [SARIF 2.1.0](https://docs.oasis-open.org/sarif/sarif/v2.1.0/sarif-v2.1.0.html) (OASIS): a set of conventions on which fields are required, how fingerprints are computed, and which property-bag keys the Kudzu tools use. A flux document is a valid SARIF document. Any SARIF consumer can read it; flux-aware tools get extra guarantees.
 
 Producers and consumers:
 
@@ -15,7 +15,7 @@ Producers and consumers:
 | taphttp (Rust MITM proxy) | none directly; supplies traffic and replay IDs that spall cites as evidence |
 | sarifview (VS Code) | consumes / merges |
 | sec-actions, ghas-actions | produce / gate on |
-| Kudzu | consumes (system of record), produces (retest requests, known findings) |
+| Kudzu platform | consumes (system of record), produces (retest requests, known findings) |
 
 Kudzu may use any internal model it likes. flux is the interchange format, not a database schema.
 
@@ -132,9 +132,9 @@ Rules:
 
 ## The flux crate
 
-flux is also a Rust library, so every Rust tool in the suite shares one set of finding types instead of each defining its own.
+flux is also a Rust library, so every Rust tool in Kudzu shares one set of finding types instead of each defining its own.
 
-- **One `Finding` type for the suite.** spall and scurf (and Kudzu, if it is Rust) depend on `flux`; none define their own `Finding`, `Severity`, or `Evidence`.
+- **One `Finding` type for Kudzu.** spall and scurf (and the Kudzu platform, if it is Rust) depend on `flux`; none define their own `Finding`, `Severity`, or `Evidence`.
 - **Types model this profile, not all of SARIF.** Fields map to the table above; `flux/` properties are typed fields, not a loose map.
 - **SARIF is the wire format.** `Finding` <-> SARIF `result`, `Report` <-> SARIF `log`, via serde. Evaluate building on an existing SARIF types crate (e.g. `serde-sarif`) rather than hand-writing the full SARIF object model.
 - **Fingerprint functions live here** (`flux/dast/v1`, `flux/sast/v1`), so every producer computes them identically.
