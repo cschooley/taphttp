@@ -1,6 +1,6 @@
 # flux: a SARIF 2.1.0 profile for the cschooley security toolkit
 
-Status: draft v0.1 (Nov 2026)
+Status: draft v0.3 (Nov 2026)
 
 ## What flux is (and isn't)
 
@@ -11,7 +11,8 @@ Producers and consumers:
 | Tool | Role |
 |---|---|
 | scurf (Rust SAST) | produces |
-| tap-http (Rust DAST / MITM proxy) | produces and consumes |
+| spall (Rust DAST; SPA + MCP assessment workbench on top of taphttp) | produces and consumes |
+| taphttp (Rust MITM proxy) | none directly; supplies traffic and replay IDs that spall cites as evidence |
 | sarifview (VS Code) | consumes / merges |
 | sec-actions, ghas-actions | produce / gate on |
 | Kudzu | consumes (system of record), produces (retest requests, known findings) |
@@ -50,11 +51,12 @@ Kudzu may use any internal model it likes. flux is the interchange format, not a
 | Key | Type | Meaning |
 |---|---|---|
 | `flux/status` | `candidate` \| `suspected` \| `confirmed` \| `fixed` | Verification state (orthogonal to suppression) |
-| `flux/confirmedBy` | string[] | Tools that confirmed, e.g. `["scurf", "tap-http"]` |
-| `flux/replayIds` | string[] | tap-http replay API IDs backing the evidence |
+| `flux/confirmedBy` | string[] | Tools that confirmed, e.g. `["scurf", "spall"]` |
+| `flux/replayIds` | string[] | taphttp exchange IDs (captured and replayed traffic) backing the evidence |
 | `flux/redacted` | boolean | Evidence has been scrubbed (see Redaction) |
-| `flux/hypothesisFor` | string | On tap-http output: `correlationGuid` of the ingested finding it tested |
+| `flux/hypothesisFor` | string | On spall output: `correlationGuid` of the ingested finding it tested |
 | `flux/fingerprintVersion` | string | Fingerprint algorithm version |
+| `flux/traceId` | string | OpenTelemetry trace ID linking a DAST request to runtime code locations |
 
 `flux/status` is about whether the issue is real. `suppressions` is about what a human decided to do with it. A finding can be `confirmed` and suppressed (accepted risk).
 
@@ -85,13 +87,60 @@ Required before any flux document leaves the producing tool's local store (expor
 
 ## Flows
 
-**Promotion (tap-http to Kudzu):** results with `flux/status` in `suspected` / `confirmed`, unsuppressed, redacted.
+**Promotion (spall to Kudzu):** results with `flux/status` in `suspected` / `confirmed`, unsuppressed, redacted.
 
-**Hypotheses (scurf to tap-http):** SAST results with `flux/status: suspected`. tap-http tests them and emits a result with the same `correlationGuid`, `flux/hypothesisFor` set, the SAST location moved to `relatedLocations`, and status `confirmed` or left `suspected` with a note in `result.message`.
+**Hypotheses (scurf to spall):** SAST results with `flux/status: suspected`. spall tests them and emits a result with the same `correlationGuid`, `flux/hypothesisFor` set, the SAST location moved to `relatedLocations`, and status `confirmed` or left `suspected` with a note in `result.message`.
 
-**Retest (Kudzu to tap-http):** open findings out, results back with `baselineState` (`unchanged` = still vulnerable, `absent` = not reproduced) and `flux/status: fixed` where appropriate.
+**Retest (Kudzu to spall):** open findings out, results back with `baselineState` (`unchanged` = still vulnerable, `absent` = not reproduced) and `flux/status: fixed` where appropriate.
 
 **Known findings / suppressions (Kudzu to tools):** consumed so producers can badge results as tracked (`workItemUris`) or previously rejected (`suppressions`) instead of re-raising them.
+
+## Route maps (source maps for the backend)
+
+A **route map** links HTTP endpoints to the code that serves them, the way a browser source map links minified JavaScript to its source. scurf produces it from source; spall consumes it to put source locations on DAST findings and to find untested routes.
+
+**Format: OpenAPI 3.1** (so any OpenAPI tool can read it), with flux extensions:
+
+```yaml
+openapi: 3.1.0
+info: { title: shop-api route map, version: "a91f03c" }
+x-flux-source:
+  repo: github.com/example/shop-api
+  commit: a91f03c2e4...          # full SHA the map was built from
+  generated-by: scurf 0.1.0
+  generated-at: 2026-11-21T09:00:00Z
+paths:
+  /api/v2/session:
+    post:
+      operationId: create_session
+      x-flux-source:
+        file: src/auth/session.py
+        line: 88
+        function: create_session
+        framework: fastapi
+        auth: none                # what the route declares, if detectable
+```
+
+Rules:
+- **Commit-pinned.** Every map records the exact commit. Consumers compare it to what's deployed when they can and warn on mismatch ("map is from a91f03c; staging runs 7d2e19b").
+- **Path templates, not examples:** `/v1/cart/{id}`, matching the framework's own route definition.
+- **Locations, not code.** The map carries `file`, `line`, `function`. Code snippets are fetched locally by the consumer when needed and are never part of the map or of flux export by default.
+
+**How DAST results use it:** when a DAST result's endpoint matches a route, the source location goes in `result.relatedLocations[]` with a `message` of `"handler"`, the same slot used when DAST confirms a SAST hypothesis. A finding confirmed at runtime via tracing (see below) may also add `"reached"` locations.
+
+**Optional runtime evidence:** where the target runs OpenTelemetry and the tester has access to its traces, a request carrying a `traceparent` header can be matched to spans whose `code.filepath` / `code.lineno` / `code.function` attributes show exactly which code the payload reached. Those locations are added as `relatedLocations` with message `"reached"`, plus `properties["flux/traceId"]`.
+
+## The flux crate
+
+flux is also a Rust library, so every Rust tool in the suite shares one set of finding types instead of each defining its own.
+
+- **One `Finding` type for the suite.** spall and scurf (and Kudzu, if it is Rust) depend on `flux`; none define their own `Finding`, `Severity`, or `Evidence`.
+- **Types model this profile, not all of SARIF.** Fields map to the table above; `flux/` properties are typed fields, not a loose map.
+- **SARIF is the wire format.** `Finding` <-> SARIF `result`, `Report` <-> SARIF `log`, via serde. Evaluate building on an existing SARIF types crate (e.g. `serde-sarif`) rather than hand-writing the full SARIF object model.
+- **Fingerprint functions live here** (`flux/dast/v1`, `flux/sast/v1`), so every producer computes them identically.
+- **Redaction lives here**, so no producer can export without it.
+- **Validation lives here**: SARIF schema + flux rules, exposed as a function and a small CLI.
+- **Adapter traits** for converting to and from other formats. Core stays dependency-light; format-specific adapters (OCSF export, third-party SARIF from Semgrep/Trivy/etc., later STIX / VEX / CycloneDX) are separate crates or feature flags, never core dependencies.
 
 ## Optional exporters
 

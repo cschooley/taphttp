@@ -46,7 +46,7 @@ it rather than building it.
 ## Findings, SPA, MCP: not here
 
 The SPA dashboard, MCP server, and findings/triage belong to a
-separate companion tool. Before touching storage, replay, or anything
+separate tool, spall (github.com/cschooley/spall). Before touching storage, replay, or anything
 a downstream tool consumes, read `docs/findings-architecture.md`. It
 lists what taphttp owes that tool (stable IDs, recorded replays,
 programmatic access, raw storage). Findings anywhere in this suite
