@@ -1,7 +1,7 @@
 use crate::cli::{CaAction, CaArgs};
 use anyhow::{Context, Result};
 use rcgen::{BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -35,7 +35,7 @@ impl Ca {
             let params =
                 CertificateParams::from_ca_cert_pem(&cert_pem).context("parsing CA cert params")?;
             let cert = params.self_signed(&key).context("re-signing CA cert")?;
-            let disk_der = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+            let disk_der = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
                 .next()
                 .context("no certificate in ca.crt")?
                 .context("parsing ca.crt")?
@@ -277,7 +277,7 @@ mod tests {
         assert_eq!(a, b, "a pin must survive restarts");
         assert_eq!(a.len(), 32 * 3 - 1);
         let pem = std::fs::read_to_string(dir.path().join("ca.crt")).unwrap();
-        let der = rustls_pemfile::certs(&mut pem.as_bytes())
+        let der = CertificateDer::pem_slice_iter(pem.as_bytes())
             .next()
             .unwrap()
             .unwrap();
@@ -298,7 +298,7 @@ mod tests {
         // Verify the served leaf with a client that trusts only ca.crt.
         let pem = std::fs::read_to_string(dir.path().join("ca.crt")).unwrap();
         let mut roots = rustls::RootCertStore::empty();
-        for c in rustls_pemfile::certs(&mut pem.as_bytes()) {
+        for c in CertificateDer::pem_slice_iter(pem.as_bytes()) {
             roots.add(c.unwrap()).unwrap();
         }
         use rustls::client::danger::ServerCertVerifier;

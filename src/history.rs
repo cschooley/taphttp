@@ -62,9 +62,11 @@ impl std::str::FromStr for StatusFilter {
             } else {
                 match term.parse::<u16>() {
                     Ok(c @ 100..=599) => f.codes.push(c),
-                    _ => return Err(format!(
+                    _ => {
+                        return Err(format!(
                         "status {term:?}: expected a code (404), a class (4xx), or a comma list"
-                    )),
+                    ))
+                    }
                 }
             }
         }
@@ -240,7 +242,9 @@ fn row_to_entry(r: &Row) -> rusqlite::Result<(i64, TrafficEntry)> {
         res_headers: headers(10)?,
         res_body: r.get(11)?,
         res_body_encoding: encoding(12)?,
-        duration_ms: r.get(13)?,
+        duration_ms: r
+            .get::<_, Option<i64>>(13)?
+            .and_then(|d| u64::try_from(d).ok()),
         replay_of: r.get(14)?,
         source: r.get(15)?,
     };

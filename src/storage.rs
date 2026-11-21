@@ -152,7 +152,8 @@ impl SqliteBackend {
                 e.status,
                 serde_json::to_string(&e.res_headers)?,
                 e.res_body,
-                e.duration_ms,
+                // SQLite integers are i64; a duration past i64::MAX ms can't happen.
+                e.duration_ms.map(|d| i64::try_from(d).unwrap_or(i64::MAX)),
                 e.replay_of,
                 encoding(e.req_body_encoding),
                 encoding(e.res_body_encoding),
@@ -374,6 +375,19 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use tempfile::TempDir;
+
+    /// RUSTSEC-2026-0459 / CVE-2026-119375: SQLite before 3.54.0 can return
+    /// uninitialized page-cache memory for a db + mismatched `-wal` pair.
+    /// `--db` opens files the user hands it, and we run in WAL mode.
+    #[test]
+    fn bundled_sqlite_has_the_wal_page_size_fix() {
+        let n = rusqlite::version_number();
+        assert!(
+            n >= 3_054_000,
+            "bundled SQLite {} predates 3.54.0",
+            rusqlite::version()
+        );
+    }
 
     fn make_entry(id: &str, host: &str, method: &str, status: u16) -> TrafficEntry {
         TrafficEntry {

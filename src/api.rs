@@ -1047,7 +1047,8 @@ mod tests {
 
         let pem = std::fs::read_to_string(dir.path().join("ca.crt")).unwrap();
         let mut roots = rustls::RootCertStore::empty();
-        for c in rustls_pemfile::certs(&mut pem.as_bytes()) {
+        use rustls::pki_types::{pem::PemObject, CertificateDer};
+        for c in CertificateDer::pem_slice_iter(pem.as_bytes()) {
             roots.add(c.unwrap()).unwrap();
         }
         let client = rustls::ClientConfig::builder()
