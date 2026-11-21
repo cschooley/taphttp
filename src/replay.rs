@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use chrono::Utc;
 use http_body_util::{BodyExt, Full};
 use hyper::Request;
 use hyper_util::client::legacy::Client;
@@ -62,7 +61,7 @@ pub async fn replay_entry(
 
     let mut replay = TrafficEntry {
         id: Uuid::new_v4().to_string(),
-        ts: Utc::now(),
+        ts: taphttp_types::Timestamp::now(),
         res_headers,
         status: Some(status),
         duration_ms: Some(duration_ms),
@@ -177,7 +176,6 @@ mod tests {
     use crate::cli::ReplayArgs;
     use crate::storage::{JsonLinesBackend, TrafficEntry};
     use bytes::Bytes;
-    use chrono::Utc;
     use http_body_util::Full;
     use hyper::body::Incoming;
     use hyper::service::service_fn;
@@ -221,7 +219,7 @@ mod tests {
     fn upstream_entry(id: &str, port: u16, method: &str) -> TrafficEntry {
         TrafficEntry {
             id: id.to_string(),
-            ts: Utc::now(),
+            ts: taphttp_types::Timestamp::now(),
             host: format!("127.0.0.1:{port}"),
             method: method.to_string(),
             url: format!("http://127.0.0.1:{port}/check"),
@@ -419,7 +417,7 @@ mod tests {
 
         let entry = TrafficEntry {
             id: "replay-test-id".to_string(),
-            ts: Utc::now(),
+            ts: taphttp_types::Timestamp::now(),
             host: format!("127.0.0.1:{port}"),
             method: "GET".to_string(),
             url: format!("http://127.0.0.1:{port}/check"),
@@ -466,7 +464,7 @@ mod tests {
 
         let entry = TrafficEntry {
             id: "override-id".to_string(),
-            ts: Utc::now(),
+            ts: taphttp_types::Timestamp::now(),
             host: format!("127.0.0.1:{port}"),
             method: "GET".to_string(),
             url: format!("http://127.0.0.1:{port}/"),
@@ -565,7 +563,7 @@ mod tests {
         JsonLinesBackend::new(&data_dir.join("traffic.jsonl"))
             .append(&TrafficEntry {
                 id: "some-id".to_string(),
-                ts: Utc::now(),
+                ts: taphttp_types::Timestamp::now(),
                 host: "x".to_string(),
                 method: "GET".to_string(),
                 url: "http://x/".to_string(),

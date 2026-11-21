@@ -143,7 +143,7 @@ impl SqliteBackend {
             ),
             rusqlite::params![
                 e.id,
-                e.ts.to_rfc3339(),
+                e.ts.to_rfc3339_offset(),
                 e.host,
                 e.method,
                 e.url,
@@ -158,7 +158,7 @@ impl SqliteBackend {
                 encoding(e.req_body_encoding),
                 encoding(e.res_body_encoding),
                 SCHEMA_VERSION,
-                e.ts.timestamp_micros(),
+                e.ts.unix_micros(),
                 e.source,
             ],
         )?;
@@ -373,7 +373,6 @@ fn truncate(s: &str, max: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
     use tempfile::TempDir;
 
     /// RUSTSEC-2026-0459 / CVE-2026-119375: SQLite before 3.54.0 can return
@@ -392,7 +391,7 @@ mod tests {
     fn make_entry(id: &str, host: &str, method: &str, status: u16) -> TrafficEntry {
         TrafficEntry {
             id: id.to_string(),
-            ts: Utc::now(),
+            ts: taphttp_types::Timestamp::now(),
             host: host.to_string(),
             method: method.to_string(),
             url: format!("http://{host}/"),
@@ -610,6 +609,66 @@ mod tests {
         assert_eq!(loaded.id, "sql-1");
         assert_eq!(loaded.method, "DELETE");
         assert_eq!(loaded.status, Some(204));
+    }
+
+    /// The sqlite `ts` text column (RFC 3339, `+00:00`, 0/3/6/9 fraction
+    /// digits) and `ts_us` stay as they were under chrono (#11), so existing
+    /// databases and outside sqlite readers keep sorting and parsing.
+    #[test]
+    fn sqlite_ts_columns_keep_their_format() {
+        let dir = TempDir::new().unwrap();
+        let sqlite = SqliteBackend::new(&dir.path().join("traffic.db")).unwrap();
+        for (id, wire) in [
+            ("n9", "2026-11-21T02:44:44.333929611Z"),
+            ("n6", "2026-11-21T02:44:44.516724Z"),
+            ("n3", "2026-11-21T02:44:44.500Z"),
+            ("n0", "2026-11-21T02:44:44Z"),
+        ] {
+            let line = format!(
+                r#"{{"id":"{id}","ts":"{wire}","host":"h","method":"GET","url":"http://h/","req_headers":[],"req_body":null,"status":200,"res_headers":[],"res_body":null,"duration_ms":1}}"#
+            );
+            sqlite
+                .append(&serde_json::from_str::<TrafficEntry>(&line).unwrap())
+                .unwrap();
+        }
+        let conn = Connection::open(dir.path().join("traffic.db")).unwrap();
+        let row = |id: &str| -> (String, i64) {
+            conn.query_row("SELECT ts, ts_us FROM traffic WHERE id = ?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            row("n9"),
+            (
+                "2026-11-21T02:44:44.333929611+00:00".into(),
+                1_795_229_084_333_929
+            )
+        );
+        assert_eq!(
+            row("n6"),
+            (
+                "2026-11-21T02:44:44.516724+00:00".into(),
+                1_795_229_084_516_724
+            )
+        );
+        assert_eq!(
+            row("n3"),
+            (
+                "2026-11-21T02:44:44.500+00:00".into(),
+                1_795_229_084_500_000
+            )
+        );
+        assert_eq!(
+            row("n0"),
+            ("2026-11-21T02:44:44+00:00".into(), 1_795_229_084_000_000)
+        );
+        // And rows read back through history keep the exact instant.
+        let back = sqlite.get("n9").unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&back).unwrap()["ts"],
+            "2026-11-21T02:44:44.333929611Z"
+        );
     }
 
     /// Read one row back the way a downstream sqlite reader would.

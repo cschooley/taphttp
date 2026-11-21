@@ -44,7 +44,7 @@ Release images are published to GHCR on every `v*` tag:
 docker run --rm -e RUST_LOG=info \
   -p 127.0.0.1:8080:8080 \
   -v taphttp-ca:/ca -v taphttp-data:/data \
-  ghcr.io/cschooley/taphttp:0.4.0
+  ghcr.io/cschooley/taphttp:0.5.0
 ```
 
 Or build it yourself (`docker build -t taphttp .`). From compose, use the image
@@ -53,8 +53,8 @@ or build straight from a tag:
 ```yaml
 services:
   taphttp:
-    image: ghcr.io/cschooley/taphttp:0.4.0
-    # or: build: https://github.com/cschooley/taphttp.git#v0.4.0
+    image: ghcr.io/cschooley/taphttp:0.5.0
+    # or: build: https://github.com/cschooley/taphttp.git#v0.5.0
     ports: ["127.0.0.1:8080:8080"]
     environment: { RUST_LOG: info }
     volumes: [taphttp-ca:/ca, taphttp-data:/data]
@@ -512,12 +512,18 @@ header map is read as pairs, a missing encoding means `utf8`, and a missing
 ### Using the types from Rust
 
 The schema is published as the `taphttp-types` crate in this repo
-(`crates/taphttp-types`). It depends only on `serde` and `chrono`, so
-consumers don't pull in the proxy:
+(`crates/taphttp-types`). It depends only on `serde` and `jiff`, so
+consumers don't pull in the proxy.
+
+`ts` is a `taphttp_types::Timestamp`: a UTC instant that serializes exactly
+as earlier releases did (RFC 3339, `Z`, 0/3/6/9 fractional digits), with
+`now()`, `unix_micros()`, `Display` and `FromStr`. It wraps its date library
+rather than exposing it, so a future change of library is not a breaking
+change. (Through taphttp-types 0.3.0, `ts` was a chrono `DateTime<Utc>`.)
 
 ```toml
 [dependencies]
-taphttp-types = { git = "https://github.com/cschooley/taphttp", tag = "v0.4.0" }
+taphttp-types = { git = "https://github.com/cschooley/taphttp", tag = "v0.5.0" }
 ```
 
 ```rust

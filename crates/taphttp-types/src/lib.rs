@@ -5,14 +5,132 @@
 //! consume that output depend on this crate instead of mirroring the type, so
 //! a schema bump is a compile error rather than silent drift.
 //!
-//! Dependencies are `serde` and `chrono` (for `ts`) only.
+//! Dependencies are `serde` and `jiff` (behind [`Timestamp`], for `ts`) only.
 
 use std::collections::BTreeMap;
 use std::fmt;
 
-use chrono::{DateTime, Utc};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+// ---------------------------------------------------------------------------
+// Timestamp
+// ---------------------------------------------------------------------------
+
+/// An instant in UTC: [`TrafficEntry::ts`].
+///
+/// On the wire it is RFC 3339 in UTC with a `Z` suffix and 0, 3, 6 or 9
+/// fractional digits, the fewest of those that are exact
+/// (`2026-11-21T02:44:44Z`, `…44.500Z`, `…44.516724Z`, `…44.333929611Z`).
+/// That is byte-for-byte what earlier releases wrote with chrono. Parsing
+/// accepts any RFC 3339 offset and converts it to UTC.
+///
+/// A newtype so the date library behind it is not part of this crate's API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Timestamp(jiff::Timestamp);
+
+/// A string that is not an RFC 3339 timestamp with an offset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimestampError(String);
+
+impl fmt::Display for TimestampError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid timestamp: {}", self.0)
+    }
+}
+
+impl std::error::Error for TimestampError {}
+
+impl Timestamp {
+    /// The current time.
+    pub fn now() -> Self {
+        Self(jiff::Timestamp::now())
+    }
+
+    /// Microseconds since the Unix epoch (truncated toward the epoch).
+    pub fn unix_micros(self) -> i64 {
+        self.0.as_microsecond()
+    }
+
+    /// The instant `micros` microseconds after the Unix epoch, if in range.
+    pub fn from_unix_micros(micros: i64) -> Option<Self> {
+        jiff::Timestamp::from_microsecond(micros).ok().map(Self)
+    }
+
+    /// `secs` seconds later (earlier if negative), if still in range.
+    pub fn checked_add_secs(self, secs: i64) -> Option<Self> {
+        self.0
+            .checked_add(jiff::SignedDuration::from_secs(secs))
+            .ok()
+            .map(Self)
+    }
+
+    /// How long from `self` until `later`; zero if `later` is not after it.
+    pub fn until(self, later: Timestamp) -> std::time::Duration {
+        std::time::Duration::try_from(later.0.duration_since(self.0)).unwrap_or_default()
+    }
+
+    /// RFC 3339 with a `+00:00` offset instead of `Z`, same fraction rule:
+    /// the form taphttp's sqlite `ts` column has always held.
+    pub fn to_rfc3339_offset(self) -> String {
+        self.format("+00:00")
+    }
+
+    fn format(self, utc: &str) -> String {
+        let dt = jiff::tz::Offset::UTC.to_datetime(self.0);
+        // The civil time's fraction: never negative, unlike the instant's
+        // before 1970.
+        let nanos = dt.subsec_nanosecond().unsigned_abs();
+        let fraction = if nanos == 0 {
+            String::new()
+        } else if nanos.is_multiple_of(1_000_000) {
+            format!(".{:03}", nanos / 1_000_000)
+        } else if nanos.is_multiple_of(1_000) {
+            format!(".{:06}", nanos / 1_000)
+        } else {
+            format!(".{nanos:09}")
+        };
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{fraction}{utc}",
+            dt.year(),
+            dt.month(),
+            dt.day(),
+            dt.hour(),
+            dt.minute(),
+            dt.second(),
+        )
+    }
+}
+
+/// The wire form: `2026-11-21T02:44:44.516724Z`.
+impl fmt::Display for Timestamp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.format("Z"))
+    }
+}
+
+impl std::str::FromStr for Timestamp {
+    type Err = TimestampError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        s.parse::<jiff::Timestamp>()
+            .map(Self)
+            .map_err(|e| TimestampError(format!("{s:?}: {e}")))
+    }
+}
+
+impl Serialize for Timestamp {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for Timestamp {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = std::borrow::Cow::<str>::deserialize(d)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
 
 /// Version of the traffic schema. Written as `"schema_version"` on every
 /// serialized [`TrafficEntry`], so a tool tailing the log can detect a
@@ -216,7 +334,7 @@ impl std::error::Error for DecodeError {}
 
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-// Hand-rolled to keep this crate's dependencies at serde + chrono.
+// Hand-rolled to keep this crate's dependencies at serde + jiff.
 fn base64_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
@@ -294,7 +412,7 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, DecodeError> {
 pub struct TrafficEntry {
     /// Stable, never reused. Findings reference exchanges by this id.
     pub id: String,
-    pub ts: DateTime<Utc>,
+    pub ts: Timestamp,
     pub host: String,
     pub method: String,
     pub url: String,
@@ -386,6 +504,61 @@ pub struct SchemaProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn at(s: &str) -> Timestamp {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn timestamp_before_the_epoch_formats_its_fraction_correctly() {
+        // -0.25s is 23:59:59.750, not .250.
+        let t = Timestamp::from_unix_micros(-250_000).unwrap();
+        assert_eq!(t.to_string(), "1969-12-31T23:59:59.750Z");
+        assert_eq!(at("1969-12-31T23:59:59.750Z"), t);
+    }
+
+    #[test]
+    fn timestamp_unix_micros_round_trip_and_truncate() {
+        let t = at("2026-11-21T02:44:44.333929611Z");
+        assert_eq!(t.unix_micros(), 1_795_229_084_333_929);
+        assert_eq!(
+            Timestamp::from_unix_micros(t.unix_micros())
+                .unwrap()
+                .to_string(),
+            "2026-11-21T02:44:44.333929Z"
+        );
+        assert_eq!(Timestamp::from_unix_micros(i64::MAX), None);
+    }
+
+    #[test]
+    fn timestamp_arithmetic_and_until() {
+        let t = at("2026-11-20T00:00:00Z");
+        assert_eq!(t.checked_add_secs(90).unwrap(), at("2026-11-20T00:01:30Z"));
+        assert_eq!(t.checked_add_secs(-1).unwrap(), at("2026-11-19T23:59:59Z"));
+        assert_eq!(t.checked_add_secs(i64::MAX), None);
+        let later = at("2026-11-20T00:00:02.5Z");
+        assert_eq!(t.until(later), std::time::Duration::from_millis(2500));
+        assert_eq!(later.until(t), std::time::Duration::ZERO, "past is zero");
+        assert!(t < later);
+    }
+
+    #[test]
+    fn timestamp_sqlite_form_uses_plus_zero_offset() {
+        assert_eq!(
+            at("2026-11-21T02:44:44.5Z").to_rfc3339_offset(),
+            "2026-11-21T02:44:44.500+00:00"
+        );
+        assert_eq!(
+            at("2026-11-21T02:44:44+00:00").to_rfc3339_offset(),
+            "2026-11-21T02:44:44+00:00"
+        );
+    }
+
+    #[test]
+    fn timestamp_parse_error_names_the_input() {
+        let e = "nope".parse::<Timestamp>().unwrap_err();
+        assert!(e.to_string().contains("\"nope\""), "{e}");
+    }
 
     fn entry() -> TrafficEntry {
         TrafficEntry {

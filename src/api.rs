@@ -446,7 +446,7 @@ mod tests {
     fn entry(id: &str, host: &str, method: &str, status: u16) -> TrafficEntry {
         TrafficEntry {
             id: id.to_string(),
-            ts: chrono::Utc::now(),
+            ts: taphttp_types::Timestamp::now(),
             host: host.to_string(),
             method: method.to_string(),
             url: format!("http://{host}/"),

@@ -7,10 +7,10 @@
 //! from concurrent connections are recorded slightly out of `ts` order.
 
 use anyhow::Result;
-use chrono::{DateTime, Utc};
 use rusqlite::types::ToSql;
 use rusqlite::{OptionalExtension, Row};
 use serde::Deserialize;
+use taphttp_types::Timestamp;
 
 use crate::storage::{Headers, SqliteBackend, TrafficEntry};
 use taphttp_types::BodyEncoding;
@@ -31,9 +31,9 @@ pub struct HistoryQuery {
     /// Substring of the URL or host, case-insensitive.
     pub q: Option<String>,
     /// Only entries with `ts` at or after this RFC 3339 time.
-    pub since: Option<DateTime<Utc>>,
+    pub since: Option<Timestamp>,
     /// Only entries with `ts` before this RFC 3339 time.
-    pub until: Option<DateTime<Utc>>,
+    pub until: Option<Timestamp>,
     /// Cursor: only entries recorded before the entry with this id.
     pub before: Option<String>,
     /// Page size; default [`DEFAULT_LIMIT`], capped at [`MAX_LIMIT`].
@@ -138,11 +138,11 @@ impl SqliteBackend {
         }
         if let Some(since) = q.since {
             sql.push_str(" AND ts_us >= ?");
-            params.push(Box::new(since.timestamp_micros()));
+            params.push(Box::new(since.unix_micros()));
         }
         if let Some(until) = q.until {
             sql.push_str(" AND ts_us < ?");
-            params.push(Box::new(until.timestamp_micros()));
+            params.push(Box::new(until.unix_micros()));
         }
         let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
         sql.push_str(" ORDER BY rowid DESC LIMIT ?");
@@ -226,9 +226,7 @@ fn row_to_entry(r: &Row) -> rusqlite::Result<(i64, TrafficEntry)> {
         }
     };
     let ts: String = r.get(2)?;
-    let ts = DateTime::parse_from_rfc3339(&ts)
-        .map_err(|e| conversion(2, e.into()))?
-        .with_timezone(&Utc);
+    let ts: Timestamp = ts.parse().map_err(|e| conversion(2, Box::new(e)))?;
     let entry = TrafficEntry {
         id: r.get(1)?,
         ts,
@@ -259,7 +257,7 @@ mod tests {
     fn entry(id: &str, host: &str, method: &str, status: u16, path: &str) -> TrafficEntry {
         TrafficEntry {
             id: id.into(),
-            ts: Utc::now(),
+            ts: Timestamp::now(),
             host: host.into(),
             method: method.into(),
             url: format!("https://{host}{path}"),

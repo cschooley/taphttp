@@ -1,10 +1,2 @@
 # OSV-Scanner suppressions. Each one needs a reason and an expiry date, so
-# nothing is ignored silently or forever.
-
-[[IgnoredVulns]]
-id = "RUSTSEC-2026-0543"
-ignoreUntil = 2027-02-21T00:00:00Z
-reason = """chrono is unmaintained (no vulnerability, no fixed version). \
-DateTime<Utc> is part of taphttp-types' public API (TrafficEntry.ts), so \
-moving to jiff or time is a breaking change spall has to adopt in step; \
-schedule it with the next taphttp-types minor rather than lockfile-only."""
+# nothing is ignored silently or forever. None at the moment.

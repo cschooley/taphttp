@@ -111,7 +111,7 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 cargo run -- start                        # start proxy on 127.0.0.1:8080
-cargo run -- logs                         # query captured traffic
+cargo run -- show <file>                  # query captured traffic
 cargo run -- replay <id>                  # replay a captured request
 cargo run -- ca info                      # CA cert path + install instructions
 ```

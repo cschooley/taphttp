@@ -15,7 +15,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Duration, Utc};
+use taphttp_types::Timestamp;
 
 // ---------------------------------------------------------------------------
 // Startup exposure check
@@ -280,23 +280,24 @@ pub fn authorize(
 
 /// `--expires`: an RFC 3339 time, or a duration from `now` like `90s`,
 /// `30m`, `8h`, `2d`. Must be in the future.
-pub fn parse_expires(s: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>> {
-    let at = if let Ok(t) = DateTime::parse_from_rfc3339(s) {
-        t.with_timezone(&Utc)
+pub fn parse_expires(s: &str, now: Timestamp) -> Result<Timestamp> {
+    let at = if let Ok(t) = s.parse::<Timestamp>() {
+        t
     } else {
         let (num, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
         let n: i64 = num.parse().ok().with_context(|| {
             format!("--expires {s:?}: expected a duration like 8h or an RFC 3339 time")
         })?;
-        let d = match unit {
-            "s" => Duration::try_seconds(n),
-            "m" => Duration::try_minutes(n),
-            "h" => Duration::try_hours(n),
-            "d" => Duration::try_days(n),
+        let unit_secs: i64 = match unit {
+            "s" => 1,
+            "m" => 60,
+            "h" => 3_600,
+            "d" => 86_400,
             _ => bail!("--expires {s:?}: unit must be s, m, h or d"),
-        }
-        .with_context(|| format!("--expires {s:?}: too large"))?;
-        now + d
+        };
+        n.checked_mul(unit_secs)
+            .and_then(|secs| now.checked_add_secs(secs))
+            .with_context(|| format!("--expires {s:?}: too large"))?
     };
     if at <= now {
         bail!("--expires {s:?} is already in the past ({at})");
@@ -314,7 +315,7 @@ pub struct BannerInfo {
     pub exposure: Exposure,
     pub allow_clients: Vec<Cidr>,
     pub proxy_users: usize,
-    pub expires: Option<DateTime<Utc>>,
+    pub expires: Option<Timestamp>,
     pub ca_fingerprint: String,
 }
 
@@ -370,7 +371,7 @@ pub fn banner(b: &BannerInfo) -> String {
     }
     match b.expires {
         Some(t) => {
-            let _ = writeln!(out, "  expires: {}", t.to_rfc3339());
+            let _ = writeln!(out, "  expires: {}", t.to_rfc3339_offset());
         }
         None => {
             let _ = writeln!(out, "  expires: never");
@@ -645,28 +646,44 @@ mod tests {
 
     #[test]
     fn expires_accepts_durations_and_rfc3339() {
-        let now: DateTime<Utc> = "2026-11-20T00:00:00Z".parse().unwrap();
+        let now: Timestamp = "2026-11-20T00:00:00Z".parse().unwrap();
+        let at = |s: &str| s.parse::<Timestamp>().unwrap();
         assert_eq!(
             parse_expires("90s", now).unwrap(),
-            now + Duration::seconds(90)
+            at("2026-11-20T00:01:30Z")
         );
         assert_eq!(
             parse_expires("30m", now).unwrap(),
-            now + Duration::minutes(30)
+            at("2026-11-20T00:30:00Z")
         );
-        assert_eq!(parse_expires("8h", now).unwrap(), now + Duration::hours(8));
-        assert_eq!(parse_expires("2d", now).unwrap(), now + Duration::days(2));
+        assert_eq!(
+            parse_expires("8h", now).unwrap(),
+            at("2026-11-20T08:00:00Z")
+        );
+        assert_eq!(
+            parse_expires("2d", now).unwrap(),
+            at("2026-11-22T00:00:00Z")
+        );
         assert_eq!(
             parse_expires("2026-11-21T09:00:00+01:00", now).unwrap(),
-            "2026-11-21T08:00:00Z".parse::<DateTime<Utc>>().unwrap()
+            at("2026-11-21T08:00:00Z")
         );
     }
 
     #[test]
     fn expires_rejects_past_zero_and_garbage() {
-        let now: DateTime<Utc> = "2026-11-20T00:00:00Z".parse().unwrap();
+        let now: Timestamp = "2026-11-20T00:00:00Z".parse().unwrap();
         for bad in ["0s", "2026-01-01T00:00:00Z", "8", "8w", "h", "", "-5m"] {
             assert!(parse_expires(bad, now).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn expires_too_large_is_an_error_not_an_overflow() {
+        let now: Timestamp = "2026-11-20T00:00:00Z".parse().unwrap();
+        for huge in ["9223372036854775807d", "999999999999d"] {
+            let e = parse_expires(huge, now).unwrap_err().to_string();
+            assert!(e.contains("too large"), "{huge}: {e}");
         }
     }
 

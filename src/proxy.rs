@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use chrono::Utc;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -12,6 +11,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
+use taphttp_types::Timestamp;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
@@ -36,7 +36,7 @@ pub struct ProxyConfig {
     /// username becomes each exchange's verified `source`.
     pub credentials: Option<ProxyCredentials>,
     /// After this, requests are refused (and `run` exits).
-    pub expires: Option<chrono::DateTime<Utc>>,
+    pub expires: Option<Timestamp>,
     /// TLS on the proxy listener itself (an HTTPS proxy), so proxy
     /// credentials aren't cleartext on the network.
     pub tls: Option<Arc<rustls::ServerConfig>>,
@@ -44,7 +44,7 @@ pub struct ProxyConfig {
 
 impl ProxyConfig {
     fn expired(&self) -> bool {
-        self.expires.is_some_and(|t| Utc::now() >= t)
+        self.expires.is_some_and(|t| Timestamp::now() >= t)
     }
 }
 
@@ -100,7 +100,7 @@ pub async fn run(args: StartArgs, data_dir: PathBuf) -> Result<()> {
     let expires = args
         .expires
         .as_deref()
-        .map(|e| deploy::parse_expires(e, Utc::now()))
+        .map(|e| deploy::parse_expires(e, Timestamp::now()))
         .transpose()?;
     let exposure = Exposure {
         proxy: Some(addr),
@@ -147,13 +147,13 @@ pub async fn run(args: StartArgs, data_dir: PathBuf) -> Result<()> {
 
     if let Some(at) = expires {
         tokio::spawn(async move {
-            let wait = (at - Utc::now()).to_std().unwrap_or_default();
+            let wait = Timestamp::now().until(at);
             tokio::time::sleep(wait).await;
             eprintln!(
                 "taphttp: deployment expired at {}; exiting",
-                at.to_rfc3339()
+                at.to_rfc3339_offset()
             );
-            tracing::warn!("deployment expired at {}; exiting", at.to_rfc3339());
+            tracing::warn!("deployment expired at {}; exiting", at.to_rfc3339_offset());
             std::process::exit(0);
         });
     }
@@ -513,7 +513,7 @@ async fn forward_https(
     let (res_body, res_body_encoding) = encode_body(&res_body_bytes);
     let entry = TrafficEntry {
         id,
-        ts: Utc::now(),
+        ts: Timestamp::now(),
         host: host.clone(),
         method,
         url,
@@ -682,7 +682,7 @@ async fn handle_http(
     let (res_body, res_body_encoding) = encode_body(&res_body_bytes);
     let entry = TrafficEntry {
         id,
-        ts: Utc::now(),
+        ts: Timestamp::now(),
         host: host.clone(),
         method,
         url,
@@ -1811,7 +1811,7 @@ mod tests {
         let (up, seen) = start_header_capture_upstream().await;
         let dir = TempDir::new().unwrap();
         let log = dir.path().join("t.jsonl");
-        let expires = Some(Utc::now() - chrono::Duration::seconds(1));
+        let expires = Timestamp::now().checked_add_secs(-1);
         let port = start_proxy_with(
             dir.path(),
             &log,

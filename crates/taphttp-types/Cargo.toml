@@ -1,6 +1,6 @@
 [package]
 name = "taphttp-types"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.87"
 description = "Traffic log types shared by taphttp and the tools that consume its output"
@@ -10,7 +10,7 @@ license = "MIT"
 # instead of mirroring TrafficEntry by hand, so it must not drag in the proxy.
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-chrono = { version = "0.4", default-features = false, features = ["serde", "std"] }
+jiff = { version = "0.2.39", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 serde_json = "1"
