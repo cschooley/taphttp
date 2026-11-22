@@ -54,6 +54,10 @@ fn start(data_dir: &std::path::Path, args: &[&str]) -> Running {
         }
         proxy_up |= line.starts_with("taphttp listening on");
     }
+    // Keep reading stderr for the child's lifetime. Dropping the pipe makes
+    // taphttp's next stderr write fail with EPIPE, and `eprintln!` panics on
+    // that, which killed the server mid-test (resets, refused connections).
+    std::thread::spawn(move || lines.for_each(drop));
     let running = Running {
         child,
         banner: banner.clone(),
