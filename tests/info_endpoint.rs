@@ -72,6 +72,12 @@ fn start(data_dir: &std::path::Path, args: &[&str]) -> Running {
 
 /// GET `path` over plain HTTP/1.1; return (status, body).
 fn get(api: &str, path: &str, token: Option<&str>) -> (u16, String) {
+    let (status, _, body) = get_bytes(api, path, token);
+    (status, String::from_utf8(body).unwrap())
+}
+
+/// GET `path`; return (status, raw head, body bytes).
+fn get_bytes(api: &str, path: &str, token: Option<&str>) -> (u16, String, Vec<u8>) {
     let mut s = TcpStream::connect(api).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let auth = token
@@ -82,11 +88,15 @@ fn get(api: &str, path: &str, token: Option<&str>) -> (u16, String) {
         "GET {path} HTTP/1.1\r\nHost: {api}\r\n{auth}Connection: close\r\n\r\n"
     )
     .unwrap();
-    let mut raw = String::new();
-    s.read_to_string(&mut raw).unwrap();
-    let status = raw[9..12].parse().unwrap();
-    let body = raw.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
-    (status, body.to_string())
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw).unwrap();
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("response head");
+    let head = String::from_utf8(raw[..split].to_vec()).unwrap();
+    let status = head[9..12].parse().unwrap();
+    (status, head, raw[split + 4..].to_vec())
 }
 
 #[test]
@@ -174,8 +184,36 @@ fn info_describes_a_fully_configured_instance_and_leaks_nothing() {
     let tmp = dir.path().to_str().unwrap();
     let mut forbidden: Vec<&str> = vec![TOKEN, USER, PASSWORD, "PRIVATE", "marker", tmp];
     forbidden.extend(key_lines);
-    for needle in forbidden {
+    for needle in &forbidden {
         assert!(!body.contains(needle), "/info contains {needle:?}: {body}");
+    }
+
+    // GET /ca.pem and /ca.der (#20): the certificate /info pins, no key.
+    for path in ["/ca.pem", "/ca.der"] {
+        assert_eq!(get_bytes(&t.api, path, None).0, 401, "{path}");
+    }
+    let (status, _, pem) = get_bytes(&t.api, "/ca.pem", Some(TOKEN));
+    assert_eq!(status, 200);
+    let (status, head, der) = get_bytes(&t.api, "/ca.der", Some(TOKEN));
+    assert_eq!(status, 200);
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("content-type: application/x-x509-ca-cert"),
+        "{head}"
+    );
+    use rustls::pki_types::{pem::PemObject, CertificateDer};
+    let from_pem = CertificateDer::from_pem_slice(&pem).unwrap();
+    assert_eq!(from_pem.as_ref(), der.as_slice(), "same certificate");
+    let pin: Vec<String> = ring::digest::digest(&ring::digest::SHA256, &der)
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect();
+    assert_eq!(pin.join(":"), sha, "the certificate /info pins");
+    let pem = String::from_utf8(pem).unwrap();
+    assert_eq!(pem.matches("-----BEGIN").count(), 1, "{pem}");
+    for needle in &forbidden {
+        assert!(!pem.contains(needle), "/ca.pem contains {needle:?}");
     }
 }
 

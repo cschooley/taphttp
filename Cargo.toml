@@ -23,6 +23,7 @@ http-body-util = "0.1"
 bytes = "1"
 rcgen = { version = "0.14", features = ["x509-parser"] }
 x509-parser = "0.18.1"
+pem = "4.0.0"
 rustls = { version = "0.23", features = ["ring"] }
 tokio-rustls = "0.26"
 hyper-rustls = { version = "0.27", features = ["http1", "http2", "native-tokio", "ring"] }

@@ -204,6 +204,7 @@ pub async fn run(args: StartArgs, data_dir: PathBuf) -> Result<()> {
             store: store.clone(),
             token,
             info: deployment,
+            ca_cert: ca.public_cert(),
         });
         let api_tls = if args.api_tls {
             listener_tls.clone()
@@ -317,6 +318,17 @@ async fn dispatch(
         Ok(source) => source,
         Err(deploy::AuthRequired) => return proxy_auth_required(),
     };
+    // `http://taphttp/`: answered here, never forwarded or recorded. A
+    // CONNECT to it (https://taphttp) gets a 405: there is no upstream, and
+    // a client without the CA can't trust taphttp's TLS anyway.
+    if crate::cert_host::is_cert_host(req.uri()) {
+        return crate::cert_host::respond(
+            req.method(),
+            req.uri().path(),
+            &ca.public_cert(),
+            &ca.fingerprint_sha256(),
+        );
+    }
     if req.method() == hyper::Method::CONNECT {
         handle_connect(req, source, ca, store, config).await
     } else {
@@ -1567,6 +1579,110 @@ mod tests {
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn proxy_answers_the_cert_host_itself_and_records_nothing() {
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("t.jsonl");
+        let port = start_proxy(dir.path(), &log, None).await;
+        let cert = Ca::load_or_create(dir.path()).unwrap().public_cert();
+        let connect = || TcpStream::connect(format!("127.0.0.1:{port}"));
+
+        let (parts, body) = request_over(
+            connect().await.unwrap(),
+            proxied_get("http://taphttp/ca.pem", None),
+        )
+        .await;
+        assert_eq!(parts.status, 200);
+        assert_eq!(parts.headers["content-type"], crate::ca::PEM_CONTENT_TYPE);
+        assert_eq!(body, cert.pem.as_bytes());
+
+        let (parts, body) = request_over(
+            connect().await.unwrap(),
+            proxied_get("http://TAPHTTP/ca.der", None),
+        )
+        .await;
+        assert_eq!(parts.status, 200);
+        assert_eq!(body, cert.der);
+
+        let (parts, body) = request_over(
+            connect().await.unwrap(),
+            proxied_get("http://taphttp/", None),
+        )
+        .await;
+        assert_eq!(parts.status, 200);
+        let ca = Ca::load_or_create(dir.path()).unwrap();
+        assert!(String::from_utf8_lossy(&body).contains(&ca.fingerprint_sha256()));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            logged(&log).is_empty(),
+            "not upstream traffic: not recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_to_the_cert_host_is_refused_not_tunnelled() {
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("t.jsonl");
+        let port = start_proxy(dir.path(), &log, None).await;
+        let stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        let connect = Request::connect("taphttp:443")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let (parts, _) = request_over(stream, connect).await;
+        assert_eq!(parts.status, 405, "https://taphttp is not served");
+    }
+
+    #[tokio::test]
+    async fn cert_host_is_behind_proxy_auth() {
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("t.jsonl");
+        let port = start_proxy_with(
+            dir.path(),
+            &log,
+            ProxyConfig {
+                credentials: creds("phone:s3cret"),
+                ..Default::default()
+            },
+        )
+        .await;
+        let connect = || TcpStream::connect(format!("127.0.0.1:{port}"));
+        let (parts, _) = request_over(
+            connect().await.unwrap(),
+            proxied_get("http://taphttp/ca.pem", None),
+        )
+        .await;
+        assert_eq!(parts.status, 407);
+        let (parts, _) = request_over(
+            connect().await.unwrap(),
+            proxied_get("http://taphttp/ca.pem", Some("phone:s3cret")),
+        )
+        .await;
+        assert_eq!(parts.status, 200);
+    }
+
+    #[tokio::test]
+    async fn expired_proxy_refuses_the_cert_host_too() {
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("t.jsonl");
+        let port = start_proxy_with(
+            dir.path(),
+            &log,
+            ProxyConfig {
+                expires: Some("2020-01-01T00:00:00Z".parse().unwrap()),
+                ..Default::default()
+            },
+        )
+        .await;
+        let stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        let (parts, _) = request_over(stream, proxied_get("http://taphttp/ca.pem", None)).await;
+        assert_eq!(parts.status, 503);
     }
 
     #[tokio::test]

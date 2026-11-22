@@ -1,5 +1,6 @@
 mod api;
 mod ca;
+mod cert_host;
 mod cli;
 mod deploy;
 mod history;

@@ -21,6 +21,23 @@ pub struct CaPublicInfo {
     pub not_after: taphttp_types::Timestamp,
 }
 
+/// How the certificate is served for download, by the lever API and by
+/// `http://taphttp/`.
+pub const PEM_CONTENT_TYPE: &str = "application/x-pem-file";
+pub const PEM_FILENAME: &str = "taphttp-ca.pem";
+pub const DER_CONTENT_TYPE: &str = "application/x-x509-ca-cert";
+pub const DER_FILENAME: &str = "taphttp-ca.der";
+
+/// The CA's public certificate, for clients to install: what `GET /ca.pem`
+/// and `GET /ca.der` serve. Only the certificate whose pin is
+/// [`Ca::fingerprint_sha256`]; never the key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaCert {
+    /// One `CERTIFICATE` block, LF line endings, built from `der`.
+    pub pem: String,
+    pub der: Vec<u8>,
+}
+
 pub struct Ca {
     /// Signs leaves: the CA's subject and key identifier, read from ca.crt,
     /// plus its private key.
@@ -92,6 +109,18 @@ impl Ca {
 
     pub fn cert_pem(&self) -> String {
         self.disk_pem.clone()
+    }
+
+    /// The certificate alone. The PEM is re-encoded from the parsed DER, not
+    /// copied from ca.crt, so nothing else in that file can come along.
+    pub fn public_cert(&self) -> CaCert {
+        CaCert {
+            pem: pem::encode_config(
+                &pem::Pem::new("CERTIFICATE", self.disk_der.clone()),
+                pem::EncodeConfig::new().set_line_ending(pem::LineEnding::LF),
+            ),
+            der: self.disk_der.clone(),
+        }
     }
 
     /// SHA-256 of the CA certificate, `AB:CD:...`, for pinning.
@@ -336,6 +365,33 @@ mod tests {
         assert_eq!(info.sha256, ca.fingerprint_sha256());
         assert_eq!(info.not_before.to_string(), "2024-01-01T00:00:00Z");
         assert_eq!(info.not_after.to_string(), "2035-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn public_cert_is_the_pinned_certificate_and_nothing_else() {
+        let dir = TempDir::new().unwrap();
+        Ca::load_or_create(dir.path()).unwrap();
+        // Someone appends the key to ca.crt: the served PEM must still carry
+        // only the certificate.
+        let key = std::fs::read_to_string(dir.path().join("ca.key")).unwrap();
+        let crt = dir.path().join("ca.crt");
+        let mut on_disk = std::fs::read_to_string(&crt).unwrap();
+        on_disk.push_str(&key);
+        std::fs::write(&crt, &on_disk).unwrap();
+
+        let ca = Ca::load_or_create(dir.path()).unwrap();
+        let cert = ca.public_cert();
+        let parsed: Vec<_> = CertificateDer::pem_slice_iter(cert.pem.as_bytes())
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].as_ref(), cert.der.as_slice());
+        assert_eq!(cert.pem.matches("-----BEGIN").count(), 1, "{}", cert.pem);
+        assert!(cert.pem.starts_with("-----BEGIN CERTIFICATE-----\n"));
+        assert!(!cert.pem.contains("PRIVATE") && !cert.pem.contains('\r'));
+        let digest = ring::digest::digest(&ring::digest::SHA256, &cert.der);
+        let hex: Vec<String> = digest.as_ref().iter().map(|b| format!("{b:02X}")).collect();
+        assert_eq!(hex.join(":"), ca.fingerprint_sha256(), "same pin as /info");
     }
 
     #[test]

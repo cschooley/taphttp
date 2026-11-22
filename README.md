@@ -252,6 +252,25 @@ recorded `id`.
 | `info` | Print CA cert path and OS-specific install instructions |
 | `print` | Print CA cert as PEM (pipe to trust store tools) |
 
+#### `http://taphttp/`: the certificate from any proxied client
+
+A device already pointed at the proxy (a phone, a VM) can fetch the CA from
+the proxy itself: browse to **`http://taphttp/`** (plain `http`). taphttp
+answers that hostname directly, on any port and in any case, and never
+forwards or records it.
+
+| Path | Serves |
+|---|---|
+| `/` | A short page with both links and the SHA-256 pin to check against the banner |
+| `/ca.pem` | The certificate, PEM (`application/x-pem-file`) |
+| `/ca.der` | The same certificate, DER (`application/x-x509-ca-cert`), for Android and some Windows dialogs |
+
+The usual proxy checks still apply first: `--allow-client`, proxy auth and
+`--expires`. Only `GET` and `HEAD` are served. `https://taphttp` is refused
+(`405` to the `CONNECT`): until the CA is installed, the device can't trust
+taphttp's TLS anyway. The key is never served. This shadows any real host
+named `taphttp`.
+
 ---
 
 ## Lever API
@@ -297,6 +316,8 @@ Where the token comes from:
 |---|---|---|
 | `GET` | `/schema` | `{ "schema_version": N }` — the traffic-entry contract to pin against |
 | `GET` | `/info` | This deployment: version, listeners, auth mode, expiry, CA public details (below) |
+| `GET` | `/ca.pem` | The CA certificate to install, PEM (`application/x-pem-file`) |
+| `GET` | `/ca.der` | The same certificate as DER (`application/x-x509-ca-cert`), for Android and some Windows dialogs |
 | `GET` | `/exchanges` | History, newest first, paged and filtered (below) |
 | `GET` | `/exchanges/{id}` | A single exchange by `id`, or `404` |
 | `POST` | `/replay` | Replay a captured exchange; records the result linked via `replay_of` |
@@ -341,6 +362,15 @@ key, the API token, proxy credentials or usernames, or filesystem paths.
   read from `ca.crt`.
 - `expires_at` is `--expires`, or `null`.
 - New fields may be added; ignore ones you don't know.
+
+#### `GET /ca.pem`, `GET /ca.der`
+
+The certificate whose SHA-256 `/info` reports as `ca.sha256`, so a UI can
+offer it for download and show the pin to check it against. Both are sent
+as attachments (`taphttp-ca.pem`, `taphttp-ca.der`). The PEM is a single
+`CERTIFICATE` block re-encoded from the certificate itself, so nothing else
+in `ca.crt` is ever served, and the key never reaches the API. Same bearer
+auth as every route.
 
 #### `GET /exchanges`
 

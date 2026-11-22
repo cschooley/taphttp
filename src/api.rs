@@ -21,6 +21,7 @@ use serde::Deserialize;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
+use crate::ca::CaCert;
 use crate::deploy::DeploymentInfo;
 use crate::history::{HistoryError, HistoryQuery};
 use crate::replay::{replay_entry, ReplayError, ReplayMods};
@@ -38,6 +39,9 @@ pub struct ApiState {
     pub token: String,
     /// What `GET /info` reports.
     pub info: DeploymentInfo,
+    /// What `GET /ca.pem` and `GET /ca.der` serve: the public certificate
+    /// only. The key never reaches the API.
+    pub ca_cert: CaCert,
 }
 
 /// Generate a fresh random API token (122 bits from a v4 UUID).
@@ -117,6 +121,8 @@ pub fn router(state: Arc<ApiState>) -> Router {
     Router::new()
         .route("/schema", get(schema))
         .route("/info", get(info))
+        .route("/ca.pem", get(ca_pem))
+        .route("/ca.der", get(ca_der))
         .route("/exchanges", get(exchanges))
         .route("/exchanges/{id}", get(exchange))
         .route("/feed", get(feed))
@@ -233,6 +239,40 @@ async fn schema() -> Json<serde_json::Value> {
 /// CA public details and history backends. No secrets and no paths.
 async fn info(State(state): State<Arc<ApiState>>) -> Json<DeploymentInfo> {
     Json(state.info.clone())
+}
+
+/// `GET /ca.pem` — the CA certificate to install, the one whose pin `/info`
+/// reports as `ca.sha256`.
+async fn ca_pem(State(state): State<Arc<ApiState>>) -> Response {
+    download(
+        crate::ca::PEM_CONTENT_TYPE,
+        crate::ca::PEM_FILENAME,
+        state.ca_cert.pem.clone().into_bytes(),
+    )
+}
+
+/// `GET /ca.der` — the same certificate as DER (Android, some Windows
+/// dialogs).
+async fn ca_der(State(state): State<Arc<ApiState>>) -> Response {
+    download(
+        crate::ca::DER_CONTENT_TYPE,
+        crate::ca::DER_FILENAME,
+        state.ca_cert.der.clone(),
+    )
+}
+
+fn download(content_type: &'static str, filename: &'static str, body: Vec<u8>) -> Response {
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, content_type.to_string()),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{filename}\""),
+            ),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 fn no_history() -> Response {
@@ -513,6 +553,7 @@ mod tests {
             store: store.clone(),
             token: TEST_TOKEN.to_string(),
             info: test_info(),
+            ca_cert: test_ca_cert(),
         });
         (state, Hist(store))
     }
@@ -565,6 +606,67 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    fn test_ca_cert() -> crate::ca::CaCert {
+        crate::ca::CaCert {
+            pem: "-----BEGIN CERTIFICATE-----\nAAEC\n-----END CERTIFICATE-----\n".into(),
+            der: vec![0, 1, 2, 0xff],
+        }
+    }
+
+    async fn body_bytes(resp: Response) -> Vec<u8> {
+        axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec()
+    }
+
+    #[tokio::test]
+    async fn ca_endpoints_serve_the_public_cert_as_pem_and_der() {
+        let dir = TempDir::new().unwrap();
+        let (state, _) = state_with_db(&dir);
+        for (path, ctype, file, body) in [
+            (
+                "/ca.pem",
+                "application/x-pem-file",
+                "taphttp-ca.pem",
+                state.ca_cert.pem.as_bytes().to_vec(),
+            ),
+            (
+                "/ca.der",
+                "application/x-x509-ca-cert",
+                "taphttp-ca.der",
+                state.ca_cert.der.clone(),
+            ),
+        ] {
+            let resp = router(state.clone())
+                .oneshot(authed_get(path))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+            let h = resp.headers();
+            assert_eq!(h["content-type"], ctype, "{path}");
+            assert_eq!(
+                h["content-disposition"],
+                format!("attachment; filename=\"{file}\"").as_str(),
+                "{path}"
+            );
+            assert_eq!(body_bytes(resp).await, body, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn ca_endpoints_require_token() {
+        let dir = TempDir::new().unwrap();
+        let (state, _) = state_with_db(&dir);
+        for path in ["/ca.pem", "/ca.der"] {
+            let resp = router(state.clone())
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{path}");
+        }
     }
 
     /// A GET request carrying the valid bearer token.
@@ -739,6 +841,7 @@ mod tests {
             store,
             token: TEST_TOKEN.to_string(),
             info: test_info(),
+            ca_cert: test_ca_cert(),
         });
         for path in ["/exchanges", "/exchanges/x"] {
             let resp = router(state.clone())
