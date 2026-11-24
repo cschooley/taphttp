@@ -44,7 +44,7 @@ Release images are published to GHCR on every `v*` tag:
 docker run --rm -e RUST_LOG=info \
   -p 127.0.0.1:8080:8080 \
   -v taphttp-ca:/ca -v taphttp-data:/data \
-  ghcr.io/cschooley/taphttp:0.6.1
+  ghcr.io/cschooley/taphttp:0.7.0
 ```
 
 Or build it yourself (`docker build -t taphttp .`). From compose, use the image
@@ -53,8 +53,8 @@ or build straight from a tag:
 ```yaml
 services:
   taphttp:
-    image: ghcr.io/cschooley/taphttp:0.6.1
-    # or: build: https://github.com/cschooley/taphttp.git#v0.6.1
+    image: ghcr.io/cschooley/taphttp:0.7.0
+    # or: build: https://github.com/cschooley/taphttp.git#v0.7.0
     ports: ["127.0.0.1:8080:8080"]
     environment: { RUST_LOG: info }
     volumes: [taphttp-ca:/ca, taphttp-data:/data]
@@ -334,7 +334,7 @@ key, the API token, proxy credentials or usernames, or filesystem paths.
 
 ```json
 {
-  "taphttp_version": "0.6.1",
+  "taphttp_version": "0.7.0",
   "schema_version": 6,
   "started_at": "2026-11-21T20:39:05.908Z",
   "expires_at": null,
@@ -677,7 +677,7 @@ change. (Through taphttp-types 0.3.0, `ts` was a chrono `DateTime<Utc>`.)
 
 ```toml
 [dependencies]
-taphttp-types = { git = "https://github.com/cschooley/taphttp", tag = "v0.6.1" }
+taphttp-types = { git = "https://github.com/cschooley/taphttp", tag = "v0.7.0" }
 ```
 
 ```rust

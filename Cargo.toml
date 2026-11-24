@@ -1,6 +1,6 @@
 [package]
 name = "taphttp"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2021"
 description = "Headless TLS-terminating MITM proxy for HTTP traffic inspection"
 license = "MIT"
@@ -15,7 +15,7 @@ name = "taphttp"
 path = "src/main.rs"
 
 [dependencies]
-taphttp-types = { path = "crates/taphttp-types", version = "0.5.0" }
+taphttp-types = { path = "crates/taphttp-types", version = "0.6.0" }
 tokio = { version = "1", features = ["full"] }
 hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
 hyper-util = { version = "0.1", features = ["tokio", "client", "client-legacy", "http1", "http2"] }
