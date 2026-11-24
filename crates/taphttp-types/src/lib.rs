@@ -150,11 +150,15 @@ impl<'de> Deserialize<'de> for Timestamp {
 ///   caller attached (`{}` otherwise), and `error`, why an exchange got no
 ///   complete response (`null` otherwise). A failed replay is recorded with
 ///   `error` set.
+/// - v6: added `origin`, how the exchange was recorded: `"proxy"`,
+///   `"replay"` or `"send"` (a new request made with the lever API's
+///   `POST /send`).
 ///
-/// v1 to v4 lines still deserialize: a header map is read as pairs, a
+/// v1 to v5 lines still deserialize: a header map is read as pairs, a
 /// missing encoding means `"utf8"`, a missing `source` or `error` means
-/// `null`, and a missing `meta` means `{}`.
-pub const SCHEMA_VERSION: u32 = 5;
+/// `null`, a missing `meta` means `{}`, and a missing `origin` is
+/// `"replay"` when `replay_of` is set and `"proxy"` otherwise.
+pub const SCHEMA_VERSION: u32 = 6;
 
 // ---------------------------------------------------------------------------
 // Headers
@@ -289,6 +293,19 @@ pub fn header_value_to_string(bytes: &[u8]) -> String {
 // Bodies
 // ---------------------------------------------------------------------------
 
+/// How an exchange came to be recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Origin {
+    /// A client sent it through the proxy.
+    Proxy,
+    /// `taphttp replay` or `POST /replay` resent a captured exchange
+    /// (`replay_of` names it).
+    Replay,
+    /// `POST /send`: a new request made through the lever API.
+    Send,
+}
+
 /// How a body string in a [`TrafficEntry`] encodes the captured bytes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -413,7 +430,7 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, DecodeError> {
 /// key is not a field: it describes the shape this crate writes, so an entry
 /// read from an older line is re-serialized as the current version. To learn
 /// the version of a raw line before parsing it, use [`SchemaProbe`].
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TrafficEntry {
     /// Stable, never reused. Findings reference exchanges by this id.
     pub id: String,
@@ -421,43 +438,103 @@ pub struct TrafficEntry {
     pub host: String,
     pub method: String,
     pub url: String,
-    #[serde(default)]
     pub req_headers: Headers,
     /// Request body, encoded per `req_body_encoding`. Prefer
     /// [`TrafficEntry::req_body_bytes`] to read it.
-    #[serde(default)]
     pub req_body: Option<String>,
-    #[serde(default)]
     pub req_body_encoding: BodyEncoding,
     pub status: Option<u16>,
-    #[serde(default)]
     pub res_headers: Headers,
     /// Response body, encoded per `res_body_encoding`. Prefer
     /// [`TrafficEntry::res_body_bytes`] to read it.
-    #[serde(default)]
     pub res_body: Option<String>,
-    #[serde(default)]
     pub res_body_encoding: BodyEncoding,
     pub duration_ms: Option<u64>,
     /// If this entry is a replay, the `id` of the original it was replayed from.
-    #[serde(default)]
     pub replay_of: Option<String>,
     /// Who sent this exchange: the username the client gave in
     /// `Proxy-Authorization` (e.g. `agent.T-3`), never the password. `None`
     /// when it gave none. Only verified when taphttp has proxy credentials
     /// configured; otherwise it is a self-reported label for the audit trail.
-    #[serde(default)]
     pub source: Option<String>,
-    /// Attribution the caller attached to a replay, e.g.
+    /// Attribution the caller attached to a replay or send, e.g.
     /// `{"actor": "agent", "task_id": "T-3"}`. Recorded, never sent
     /// upstream, and not interpreted by taphttp. Empty for proxied traffic.
-    #[serde(default)]
     pub meta: BTreeMap<String, String>,
     /// Why the exchange has no complete response: the upstream couldn't be
     /// reached, or the response broke off. `None` when it completed.
     /// `status` is `None` too unless a response head arrived.
-    #[serde(default)]
     pub error: Option<String>,
+    /// How it was recorded: proxied, replayed, or sent with `POST /send`.
+    /// Older lines without it are inferred: `replay` when `replay_of` is
+    /// set, otherwise `proxy`.
+    pub origin: Origin,
+}
+
+/// What a line deserializes into before [`TrafficEntry::origin`] is filled
+/// in for lines that predate it.
+#[derive(Deserialize)]
+struct RawTrafficEntry {
+    id: String,
+    ts: Timestamp,
+    host: String,
+    method: String,
+    url: String,
+    #[serde(default)]
+    req_headers: Headers,
+    #[serde(default)]
+    req_body: Option<String>,
+    #[serde(default)]
+    req_body_encoding: BodyEncoding,
+    status: Option<u16>,
+    #[serde(default)]
+    res_headers: Headers,
+    #[serde(default)]
+    res_body: Option<String>,
+    #[serde(default)]
+    res_body_encoding: BodyEncoding,
+    duration_ms: Option<u64>,
+    #[serde(default)]
+    replay_of: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    meta: BTreeMap<String, String>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    origin: Option<Origin>,
+}
+
+impl<'de> Deserialize<'de> for TrafficEntry {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let r = RawTrafficEntry::deserialize(d)?;
+        let origin = r.origin.unwrap_or(if r.replay_of.is_some() {
+            Origin::Replay
+        } else {
+            Origin::Proxy
+        });
+        Ok(TrafficEntry {
+            id: r.id,
+            ts: r.ts,
+            host: r.host,
+            method: r.method,
+            url: r.url,
+            req_headers: r.req_headers,
+            req_body: r.req_body,
+            req_body_encoding: r.req_body_encoding,
+            status: r.status,
+            res_headers: r.res_headers,
+            res_body: r.res_body,
+            res_body_encoding: r.res_body_encoding,
+            duration_ms: r.duration_ms,
+            replay_of: r.replay_of,
+            source: r.source,
+            meta: r.meta,
+            error: r.error,
+            origin,
+        })
+    }
 }
 
 impl TrafficEntry {
@@ -485,8 +562,8 @@ impl TrafficEntry {
 impl Serialize for TrafficEntry {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         // Keep this list in step with the struct; the
-        // `serialized_keys_are_exactly_the_v5_schema` test enforces it.
-        let mut st = s.serialize_struct("TrafficEntry", 18)?;
+        // `serialized_keys_are_exactly_the_v6_schema` test enforces it.
+        let mut st = s.serialize_struct("TrafficEntry", 19)?;
         st.serialize_field("schema_version", &SCHEMA_VERSION)?;
         st.serialize_field("id", &self.id)?;
         st.serialize_field("ts", &self.ts)?;
@@ -505,6 +582,7 @@ impl Serialize for TrafficEntry {
         st.serialize_field("source", &self.source)?;
         st.serialize_field("meta", &self.meta)?;
         st.serialize_field("error", &self.error)?;
+        st.serialize_field("origin", &self.origin)?;
         st.end()
     }
 }
@@ -596,6 +674,7 @@ mod tests {
             source: None,
             meta: BTreeMap::new(),
             error: None,
+            origin: Origin::Proxy,
         }
     }
 
@@ -741,7 +820,7 @@ mod tests {
     // --- TrafficEntry wire format ---
 
     #[test]
-    fn serialized_keys_are_exactly_the_v5_schema() {
+    fn serialized_keys_are_exactly_the_v6_schema() {
         let v = serde_json::to_value(entry()).unwrap();
         let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
         keys.sort_unstable();
@@ -754,6 +833,7 @@ mod tests {
                 "id",
                 "meta",
                 "method",
+                "origin",
                 "replay_of",
                 "req_body",
                 "req_body_encoding",
@@ -768,7 +848,8 @@ mod tests {
                 "url",
             ]
         );
-        assert_eq!(v["schema_version"], 5);
+        assert_eq!(v["schema_version"], 6);
+        assert_eq!(v["origin"], "proxy");
         assert_eq!(v["req_body_encoding"], "utf8");
         assert_eq!(
             v["meta"],
@@ -797,6 +878,47 @@ mod tests {
     }
 
     #[test]
+    fn origin_serializes_lowercase() {
+        for (o, s) in [
+            (Origin::Proxy, "proxy"),
+            (Origin::Replay, "replay"),
+            (Origin::Send, "send"),
+        ] {
+            let mut e = entry();
+            e.origin = o;
+            let v = serde_json::to_value(&e).unwrap();
+            assert_eq!(v["origin"], s);
+            let back: TrafficEntry = serde_json::from_value(v).unwrap();
+            assert_eq!(back.origin, o, "{s}");
+        }
+    }
+
+    #[test]
+    fn origin_missing_on_older_lines_is_inferred_from_replay_of() {
+        let v5 = |replay_of: &str| {
+            format!(
+                r#"{{"schema_version":5,"id":"a","ts":"2026-11-20T00:00:00Z","host":"h","method":"GET","url":"/","status":null,"duration_ms":null,"replay_of":{replay_of}}}"#
+            )
+        };
+        let proxied: TrafficEntry = serde_json::from_str(&v5("null")).unwrap();
+        assert_eq!(proxied.origin, Origin::Proxy);
+        let replay: TrafficEntry = serde_json::from_str(&v5(r#""orig""#)).unwrap();
+        assert_eq!(replay.origin, Origin::Replay);
+    }
+
+    #[test]
+    fn an_explicit_origin_wins_and_unknown_ones_are_rejected() {
+        let line = |origin: &str| {
+            format!(
+                r#"{{"schema_version":6,"id":"a","ts":"2026-11-20T00:00:00Z","host":"h","method":"GET","url":"/","status":null,"duration_ms":null,"replay_of":"x","origin":{origin}}}"#
+            )
+        };
+        let e: TrafficEntry = serde_json::from_str(&line(r#""send""#)).unwrap();
+        assert_eq!(e.origin, Origin::Send);
+        assert!(serde_json::from_str::<TrafficEntry>(&line(r#""carrier-pigeon""#)).is_err());
+    }
+
+    #[test]
     fn v4_line_without_meta_or_error_parses_as_empty() {
         let v4 = r#"{"schema_version":4,"id":"a","ts":"2026-11-20T00:00:00Z","host":"h","method":"GET","url":"/","req_headers":[],"req_body":null,"req_body_encoding":"utf8","status":200,"res_headers":[],"res_body":null,"res_body_encoding":"utf8","duration_ms":1,"replay_of":null,"source":"alice"}"#;
         let e: TrafficEntry = serde_json::from_str(v4).unwrap();
@@ -808,7 +930,7 @@ mod tests {
     #[test]
     fn schema_version_is_the_first_key_on_the_line() {
         let line = serde_json::to_string(&entry()).unwrap();
-        assert!(line.starts_with(r#"{"schema_version":5,"#), "{line}");
+        assert!(line.starts_with(r#"{"schema_version":6,"#), "{line}");
     }
 
     #[test]

@@ -213,6 +213,7 @@ separate pairs.
 | `--tls-name` | — | Name or IP clients use for a TLS listener (repeatable); needed on `0.0.0.0` |
 | `--allow-open-proxy` | off | Allow a non-loopback `--listen` without auth + TLS (private networks only) |
 | `--api-allow-plaintext` | off | Allow a non-loopback `--api-listen` without TLS (private networks only) |
+| `--api-no-send` | off | Turn off the lever API's `POST /send`, leaving observation and replay |
 | `--expires` | never | Refuse traffic and exit after this: `8h`, `30m`, `2d`, or an RFC 3339 time |
 
 Traffic is always written to stdout as JSON lines. `--log-file` and `--sqlite` are additive.
@@ -321,6 +322,7 @@ Where the token comes from:
 | `GET` | `/exchanges` | History, newest first, paged and filtered (below) |
 | `GET` | `/exchanges/{id}` | A single exchange by `id`, or `404` |
 | `POST` | `/replay` | Replay a captured exchange; records the result linked via `replay_of` |
+| `POST` | `/send` | Send a new request to any `http(s)` URL; records it with `origin: "send"` |
 | `GET` | `/feed` | WebSocket stream of exchanges as they are recorded; resumable with `?since=` |
 
 Entries are `taphttp_types::TrafficEntry` JSON (current schema), the same as log lines.
@@ -333,7 +335,7 @@ key, the API token, proxy credentials or usernames, or filesystem paths.
 ```json
 {
   "taphttp_version": "0.6.1",
-  "schema_version": 5,
+  "schema_version": 6,
   "started_at": "2026-11-21T20:39:05.908Z",
   "expires_at": null,
   "proxy": {
@@ -343,7 +345,7 @@ key, the API token, proxy credentials or usernames, or filesystem paths.
     "allow_open_proxy": true,
     "allow_client": []
   },
-  "api": { "listen": "0.0.0.0:8081", "tls": false },
+  "api": { "listen": "0.0.0.0:8081", "tls": false, "send": true },
   "ca": {
     "subject": "CN=taphttp local CA, O=taphttp",
     "sha256": "EB:6F:71:…:3A",
@@ -361,6 +363,7 @@ key, the API token, proxy credentials or usernames, or filesystem paths.
 - `ca.sha256` is the same pin the startup banner prints. The CA fields are
   read from `ca.crt`.
 - `expires_at` is `--expires`, or `null`.
+- `api.send` is whether `POST /send` is on (`--api-no-send` turns it off).
 - New fields may be added; ignore ones you don't know.
 
 #### `GET /ca.pem`, `GET /ca.der`
@@ -384,6 +387,7 @@ auth as every route.
 | `q` | URL or host contains this text (case-insensitive) |
 | `since` / `until` | RFC 3339 times; `since` is inclusive, `until` exclusive |
 | `replay_of=<id>` | Only replays of `<id>` (including failed attempts) |
+| `origin` | `proxy`, `replay` or `send`: how the exchange was recorded. Anything else: `400` |
 
 Order is the order taphttp recorded exchanges in, so a `before` cursor stays
 valid while new traffic arrives. Each lookup is an indexed sqlite query, not
@@ -426,7 +430,7 @@ curl -X POST http://127.0.0.1:8081/replay \
 | `req_headers` | The whole request header list as `[name, value]` pairs. Replaces the captured headers: send a header twice, drop one, or reorder them |
 | `headers` | `{name: value}`, applied after `req_headers`. Each replaces every value for that name (the CLI's `--header` rule) |
 | `body` | Override the body |
-| `body_encoding` | `"utf8"` (default) or `"base64"`, for binary bodies |
+| `body_encoding` | `"utf8"` (default, also `null`) or `"base64"`, for binary bodies |
 | `meta` | String attribution fields, stored on the recorded replay and never sent upstream. At most 16 keys; keys 1 to 64 bytes, values up to 1024 |
 
 A repeated header name goes out grouped at its first position (hyper's
@@ -441,8 +445,47 @@ Responses:
   off). It is still recorded, and the body is that recorded exchange:
   `error` says why, and `status` is `null` unless a response head arrived.
 - **400:** the request couldn't be built (a bad base64 body, header, method,
-  URL or `meta`). Nothing was sent or recorded.
+  URL or `meta`), or its target is one of taphttp's own listeners (below).
+  Nothing was sent or recorded.
 - **404:** no exchange with that `id`.
+
+#### `POST /send`
+
+A new request, not a replay: to any `http` or `https` URL, from taphttp's
+network position. It is recorded, attributed and on `/feed` like any other
+exchange, with `origin: "send"` and `replay_of: null`. Only `url` is
+required:
+
+```bash
+curl -X POST http://127.0.0.1:8081/send \
+  -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"method":"GET","url":"http://host.example:8080/assets/",
+       "req_headers":[["accept","*/*"]],
+       "meta":{"actor":"agent","task":"T-3"}}'
+```
+
+| Field | Meaning |
+|---|---|
+| `url` | Absolute `http` or `https` URL |
+| `method` | Default `GET`, sent as given |
+| `req_headers` | The whole request header list as `[name, value]` pairs, in order. Absent: `user-agent: taphttp/<version>`. A `host` header from the URL is put first unless the list has one |
+| `body` | The body, default empty |
+| `body_encoding` | `"utf8"` (default, also `null`) or `"base64"` |
+| `meta` | As for `/replay` |
+
+The responses are `/replay`'s: **200** with the recorded exchange, **502**
+with the recorded failed attempt (unreachable or unresolvable host, or a
+response that broke off), **400** when nothing was sent. **403** means the
+instance was started with `--api-no-send`; `/info`'s `api.send` says which.
+TLS is verified against the public web roots, as for `/replay`.
+
+Neither `/send` nor `/replay` will send to taphttp itself: a target whose
+host resolves to taphttp's proxy or lever API listener (by address and port,
+counting a `0.0.0.0` / `::` listener as reachable through any of this host's
+addresses) is a 400. The host is resolved once and the request goes to
+exactly the addresses checked, so a name can't resolve somewhere else the
+second time. Scope checks are the caller's job: taphttp sends wherever it's
+told.
 
 The API binds only where you tell it to; keep it on loopback unless you have a
 reason not to. The `?token=` form can land in logs, so prefer the header
@@ -553,7 +596,7 @@ Each line is one exchange (shown pretty-printed here):
 
 ```json
 {
-  "schema_version": 5,
+  "schema_version": 6,
   "id": "3f2a1b4c-8d9e-4a7b-b3c1-2e5f6a7d8e9f",
   "ts": "2026-07-02T14:23:01.123Z",
   "host": "example.com",
@@ -574,12 +617,13 @@ Each line is one exchange (shown pretty-printed here):
   "replay_of": null,
   "source": "agent.T-3",
   "meta": {},
-  "error": null
+  "error": null,
+  "origin": "proxy"
 }
 ```
 
 - `schema_version` is on every line, so a tool tailing the log can detect a
-  breaking change. The current version is 5.
+  breaking change. The current version is 6.
 - Headers are `[name, value]` pairs in wire order. Repeated headers (several
   `Set-Cookie`s, say) each get a pair. A value that isn't valid UTF-8 is
   kept with the bad bytes replaced by U+FFFD, not dropped.
@@ -590,11 +634,14 @@ Each line is one exchange (shown pretty-printed here):
   replay, it holds the `id` of the original.
 - `source` is who sent it (see [Attribution](#attribution-who-sent-each-exchange)),
   or `null`.
-- `meta` is attribution a replay's caller attached (`POST /replay`'s
-  `meta`), or `{}`. taphttp stores it and doesn't interpret it.
+- `meta` is attribution the caller of `POST /replay` or `POST /send`
+  attached, or `{}`. taphttp stores it and doesn't interpret it.
 - `error` is why the exchange has no complete response (the upstream
   couldn't be reached, or the response broke off), or `null`. Failed
   replays are recorded this way, so history has no gaps.
+- `origin` is how the exchange was recorded: `"proxy"` (a client sent it
+  through the proxy), `"replay"` (`taphttp replay` or `POST /replay`) or
+  `"send"` (`POST /send`).
 
 To decode base64 bodies with jq: `jq -r 'select(.res_body_encoding=="base64") | .res_body | @base64d'`.
 
@@ -602,16 +649,19 @@ To decode base64 bodies with jq: `jq -r 'select(.res_body_encoding=="base64") | 
 
 | Version | Change |
 |---|---|
+| 6 | `origin` (`proxy`, `replay` or `send`); `POST /send` |
 | 5 | `meta` (replay attribution) and `error` (why there's no complete response); failed replays are recorded |
 | 4 | `source` (proxy-auth username) |
 | 3 | Headers as ordered pairs; non-UTF-8 header values kept; `req_body_encoding` / `res_body_encoding`; `schema_version` on every line |
 | 2 | `replay_of` |
 | 1 | Initial |
 
-taphttp still reads v1 to v4 logs (`show`, `replay`, the lever API): a
-header map is read as pairs, a missing encoding means `utf8`, a missing
-`source` or `error` means `null`, and a missing `meta` means `{}`. Anything
-taphttp writes or re-emits (`show --json`, `/exchanges`) is v5.
+taphttp still reads v1 to v5 logs and databases (`show`, `replay`, the
+lever API): a header map is read as pairs, a missing encoding means `utf8`,
+a missing `source` or `error` means `null`, a missing `meta` means `{}`, and
+a missing `origin` is `replay` when `replay_of` is set and `proxy`
+otherwise (sqlite rows are filled in on first open). Anything taphttp writes
+or re-emits (`show --json`, `/exchanges`) is v6.
 
 ### Using the types from Rust
 

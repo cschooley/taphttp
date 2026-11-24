@@ -176,15 +176,21 @@ pub async fn run(args: StartArgs, data_dir: PathBuf) -> Result<()> {
         // /info reports where things actually listen (a port of 0 in
         // --listen becomes the real one).
         let mut described = info;
-        described.exposure.proxy = Some(listener.local_addr()?);
-        described.exposure.api = Some(api_listener.local_addr()?);
+        let own = vec![listener.local_addr()?, api_listener.local_addr()?];
+        described.exposure.proxy = Some(own[0]);
+        described.exposure.api = Some(own[1]);
         let history = deploy::HistoryInfo {
             sqlite: db.is_some(),
             log_file: args.log_file.is_some(),
         };
-        let deployment =
-            deploy::deployment_info(&described, ca.public_info()?, history, started_at)
-                .context("describing the deployment for /info")?;
+        let deployment = deploy::deployment_info(
+            &described,
+            ca.public_info()?,
+            history,
+            started_at,
+            !args.api_no_send,
+        )
+        .context("describing the deployment for /info")?;
         let token = match &args.api_token_file {
             // From a file: print only where it is, so it stays out of logs.
             Some(path) => {
@@ -205,6 +211,8 @@ pub async fn run(args: StartArgs, data_dir: PathBuf) -> Result<()> {
             token,
             info: deployment,
             ca_cert: ca.public_cert(),
+            own,
+            send_enabled: !args.api_no_send,
         });
         let api_tls = if args.api_tls {
             listener_tls.clone()
@@ -561,6 +569,7 @@ async fn forward_https(
         source: source.clone(),
         meta: Default::default(),
         error: upstream_error,
+        origin: crate::storage::Origin::Proxy,
     };
 
     tracing::info!(
@@ -734,6 +743,7 @@ async fn handle_http(
         source: source.clone(),
         meta: Default::default(),
         error: upstream_error,
+        origin: crate::storage::Origin::Proxy,
     };
 
     tracing::info!(
@@ -1069,6 +1079,7 @@ mod tests {
             api_tls: false,
             tls_name: vec![],
             allow_open_proxy: false,
+            api_no_send: false,
             api_allow_plaintext: false,
             expires: None,
         }
@@ -1231,6 +1242,7 @@ mod tests {
         let content = std::fs::read_to_string(&log_file).expect("traffic.jsonl should exist");
         let entry: TrafficEntry = serde_json::from_str(content.lines().next().unwrap()).unwrap();
         assert_eq!(entry.method, "GET");
+        assert_eq!(entry.origin, crate::storage::Origin::Proxy);
         assert_eq!(entry.status, Some(200));
         assert!(entry.url.contains("/probe"), "url was: {}", entry.url);
         assert!(entry.duration_ms.is_some());
@@ -1914,6 +1926,11 @@ mod tests {
         let entries = logged(&log);
         assert_eq!(entries.len(), 1);
         assert!(entries[0].url.ends_with("/inside"));
+        assert_eq!(
+            entries[0].origin,
+            crate::storage::Origin::Proxy,
+            "MITM'd HTTPS"
+        );
         assert_eq!(entries[0].source.as_deref(), Some("agent.T-3"));
     }
 

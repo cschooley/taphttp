@@ -24,7 +24,7 @@ use uuid::Uuid;
 use crate::ca::CaCert;
 use crate::deploy::DeploymentInfo;
 use crate::history::{HistoryError, HistoryQuery};
-use crate::replay::{replay_entry, ReplayError, ReplayMods};
+use crate::replay::{replay_entry_refusing, send_new, ReplayError, ReplayMods, SendSpec};
 use crate::storage::{Headers, SqliteBackend, Store, TrafficEntry, SCHEMA_VERSION};
 use taphttp_types::{decode_body, BodyEncoding};
 
@@ -42,6 +42,11 @@ pub struct ApiState {
     /// What `GET /ca.pem` and `GET /ca.der` serve: the public certificate
     /// only. The key never reaches the API.
     pub ca_cert: CaCert,
+    /// taphttp's own bound listeners (proxy and API). `/send` and `/replay`
+    /// refuse targets that resolve to one of them.
+    pub own: Vec<std::net::SocketAddr>,
+    /// `POST /send` is on unless `start --api-no-send`.
+    pub send_enabled: bool,
 }
 
 /// Generate a fresh random API token (122 bits from a v4 UUID).
@@ -127,6 +132,7 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/exchanges/{id}", get(exchange))
         .route("/feed", get(feed))
         .route("/replay", post(replay))
+        .route("/send", post(send))
         .layer(middleware::from_fn_with_state(state.clone(), require_token))
         .with_state(state)
 }
@@ -347,9 +353,10 @@ struct ReplayRequest {
     headers: HashMap<String, String>,
     #[serde(default)]
     body: Option<String>,
-    /// How `body` encodes the bytes: `"utf8"` (default) or `"base64"`.
+    /// How `body` encodes the bytes: `"utf8"` (default, also `null`) or
+    /// `"base64"`.
     #[serde(default)]
-    body_encoding: BodyEncoding,
+    body_encoding: Option<BodyEncoding>,
     /// Attribution stored on the recorded replay, never sent upstream.
     #[serde(default)]
     meta: BTreeMap<String, String>,
@@ -375,7 +382,7 @@ async fn replay(State(state): State<Arc<ApiState>>, Json(req): Json<ReplayReques
         Err(e) => return db_error(e),
     };
 
-    let body = match decode_body(req.body.as_deref(), req.body_encoding) {
+    let body = match decode_body(req.body.as_deref(), req.body_encoding.unwrap_or_default()) {
         Ok(b) => b,
         Err(e) => return (StatusCode::BAD_REQUEST, format!("body: {e}")).into_response(),
     };
@@ -386,13 +393,67 @@ async fn replay(State(state): State<Arc<ApiState>>, Json(req): Json<ReplayReques
         body,
         meta: req.meta,
     };
-    match replay_entry(&state.store, original, &mods).await {
+    outcome(replay_entry_refusing(&state.store, original, &mods, &state.own).await)
+}
+
+/// 200 with the recorded entry, 502 with the recorded failed attempt, or
+/// 400 when nothing was sent.
+fn outcome(r: Result<TrafficEntry, ReplayError>) -> Response {
+    match r {
         Ok(entry) => Json(entry).into_response(),
         Err(ReplayError::Failed(entry)) => (StatusCode::BAD_GATEWAY, Json(*entry)).into_response(),
         Err(e @ ReplayError::Invalid(_)) => {
             (StatusCode::BAD_REQUEST, e.to_string()).into_response()
         }
     }
+}
+
+/// Body of a `POST /send` request: a new request, not a replay.
+#[derive(Debug, Deserialize)]
+struct SendRequest {
+    /// Default `GET`.
+    #[serde(default)]
+    method: Option<String>,
+    url: String,
+    /// The whole request header list, `[[name, value], ...]`. Absent: a
+    /// `user-agent` naming taphttp. `host` is added from the URL unless
+    /// the list has one.
+    #[serde(default)]
+    req_headers: Option<Headers>,
+    #[serde(default)]
+    body: Option<String>,
+    /// `"utf8"` (default, also `null`) or `"base64"`.
+    #[serde(default)]
+    body_encoding: Option<BodyEncoding>,
+    /// Attribution stored on the recorded entry, never sent upstream.
+    #[serde(default)]
+    meta: BTreeMap<String, String>,
+}
+
+/// `POST /send` — send a new request to any http(s) URL through taphttp,
+/// record it with `origin: "send"`, and return the recorded entry. Same
+/// outcomes as `/replay`. Refuses taphttp's own listeners, and is 403 when
+/// started with `--api-no-send`.
+async fn send(State(state): State<Arc<ApiState>>, Json(req): Json<SendRequest>) -> Response {
+    if !state.send_enabled {
+        return (
+            StatusCode::FORBIDDEN,
+            "POST /send is turned off (start --api-no-send)",
+        )
+            .into_response();
+    }
+    let body = match decode_body(req.body.as_deref(), req.body_encoding.unwrap_or_default()) {
+        Ok(b) => b.unwrap_or_default(),
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("body: {e}")).into_response(),
+    };
+    let spec = SendSpec {
+        method: req.method.unwrap_or_else(|| "GET".into()),
+        url: req.url,
+        req_headers: req.req_headers,
+        body,
+        meta: req.meta,
+    };
+    outcome(send_new(&state.store, &spec, &state.own).await)
 }
 
 #[derive(Debug, Deserialize)]
@@ -536,6 +597,7 @@ mod tests {
             source: None,
             meta: Default::default(),
             error: None,
+            origin: crate::storage::Origin::Proxy,
         }
     }
 
@@ -554,6 +616,8 @@ mod tests {
             token: TEST_TOKEN.to_string(),
             info: test_info(),
             ca_cert: test_ca_cert(),
+            own: vec![],
+            send_enabled: true,
         });
         (state, Hist(store))
     }
@@ -578,7 +642,7 @@ mod tests {
             sqlite: true,
             log_file: false,
         };
-        crate::deploy::deployment_info(&banner, ca, history, taphttp_types::Timestamp::now())
+        crate::deploy::deployment_info(&banner, ca, history, taphttp_types::Timestamp::now(), true)
             .unwrap()
     }
 
@@ -842,6 +906,8 @@ mod tests {
             token: TEST_TOKEN.to_string(),
             info: test_info(),
             ca_cert: test_ca_cert(),
+            own: vec![],
+            send_enabled: true,
         });
         for path in ["/exchanges", "/exchanges/x"] {
             let resp = router(state.clone())
@@ -1165,6 +1231,218 @@ mod tests {
             .query(&HistoryQuery::default())
             .unwrap();
         assert_eq!(all.len(), 1, "only the original");
+    }
+
+    // --- POST /send ---
+
+    fn state_with(dir: &TempDir, own: Vec<SocketAddr>, send_enabled: bool) -> Arc<ApiState> {
+        let store = Store::new(None, Some(&dir.path().join("traffic.db"))).unwrap();
+        Arc::new(ApiState {
+            store,
+            token: TEST_TOKEN.to_string(),
+            info: test_info(),
+            ca_cert: test_ca_cert(),
+            own,
+            send_enabled,
+        })
+    }
+
+    fn recorded(state: &ApiState) -> Vec<TrafficEntry> {
+        state
+            .store
+            .history()
+            .unwrap()
+            .query(&HistoryQuery::default())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn send_endpoint_records_a_new_exchange_with_origin_send() {
+        let port = start_echo_upstream().await;
+        let dir = TempDir::new().unwrap();
+        let state = state_with(&dir, vec![], true);
+        state
+            .store
+            .history()
+            .unwrap()
+            .append(&entry("proxied", "h", "GET", 200))
+            .unwrap();
+
+        // The issue's shape, nulls included.
+        let resp = router(state.clone())
+            .oneshot(authed_post(
+                "/send",
+                serde_json::json!({
+                    "method": "POST",
+                    "url": format!("http://127.0.0.1:{port}/"),
+                    "req_headers": [["accept", "*/*"]],
+                    "body": "AP8=",
+                    "body_encoding": "base64",
+                    "meta": {"actor": "agent", "task": "T-3"},
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["origin"], "send");
+        assert_eq!(json["replay_of"], serde_json::Value::Null);
+        assert_eq!(json["meta"]["task"], "T-3");
+        assert_eq!(json["status"], 200);
+        let echoed: serde_json::Value =
+            serde_json::from_str(json["res_body"].as_str().unwrap()).unwrap();
+        assert_eq!(echoed["body"], serde_json::json!([0, 255]));
+        let sent: Vec<(String, String)> =
+            serde_json::from_value(echoed["headers"].clone()).unwrap();
+        assert_eq!(sent[0], ("host".into(), format!("127.0.0.1:{port}")));
+        assert_eq!(sent[1], ("accept".into(), "*/*".into()));
+
+        let resp = router(state.clone())
+            .oneshot(authed_get("/exchanges?origin=send"))
+            .await
+            .unwrap();
+        let only: Vec<String> = body_json(resp)
+            .await
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(only, [json["id"].as_str().unwrap()]);
+
+        let resp = router(state.clone())
+            .oneshot(authed_get("/exchanges?origin=carrier-pigeon"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn send_endpoint_accepts_null_body_and_encoding() {
+        let port = start_echo_upstream().await;
+        let dir = TempDir::new().unwrap();
+        let state = state_with(&dir, vec![], true);
+        let resp = router(state)
+            .oneshot(authed_post(
+                "/send",
+                serde_json::json!({
+                    "method": "POST",
+                    "url": format!("http://127.0.0.1:{port}/"),
+                    "body": null,
+                    "body_encoding": null,
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(
+            json["req_headers"][1],
+            serde_json::json!(["user-agent", crate::replay::USER_AGENT])
+        );
+    }
+
+    #[tokio::test]
+    async fn send_endpoint_400s_bad_input_and_records_nothing() {
+        let port = start_echo_upstream().await;
+        let dir = TempDir::new().unwrap();
+        let state = state_with(&dir, vec![], true);
+        let url = format!("http://127.0.0.1:{port}/");
+        for bad in [
+            serde_json::json!({"url": url, "body": "not base64!", "body_encoding": "base64"}),
+            serde_json::json!({"url": "ftp://example.com/"}),
+            serde_json::json!({"url": "/relative"}),
+            serde_json::json!({"url": url, "method": "BAD METHOD"}),
+            serde_json::json!({"url": url, "req_headers": [["bad header", "v"]]}),
+            serde_json::json!({"url": url, "meta": {"": "v"}}),
+        ] {
+            let resp = router(state.clone())
+                .oneshot(authed_post("/send", bad.clone()))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{bad}");
+        }
+        assert!(recorded(&state).is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_send_returns_502_with_the_recorded_entry() {
+        let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = dead.local_addr().unwrap().port();
+        drop(dead);
+        let dir = TempDir::new().unwrap();
+        let state = state_with(&dir, vec![], true);
+        let resp = router(state.clone())
+            .oneshot(authed_post(
+                "/send",
+                serde_json::json!({"url": format!("http://127.0.0.1:{port}/"), "meta": {"actor": "human"}}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let json = body_json(resp).await;
+        assert_eq!(json["origin"], "send");
+        assert_eq!(json["method"], "GET", "the default method");
+        assert!(json["error"].is_string());
+        assert_eq!(json["meta"]["actor"], "human");
+        let all = recorded(&state);
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].id, json["id"].as_str().unwrap());
+    }
+
+    #[tokio::test]
+    async fn send_and_replay_endpoints_refuse_taphttps_own_listeners() {
+        let port = start_echo_upstream().await;
+        let own: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let dir = TempDir::new().unwrap();
+        let state = state_with(&dir, vec![own], true);
+        let history = state.store.history().unwrap();
+        let mut original = entry("to-self", "127.0.0.1", "POST", 200);
+        original.url = format!("http://127.0.0.1:{port}/");
+        history.append(&original).unwrap();
+
+        let resp = router(state.clone())
+            .oneshot(authed_post(
+                "/send",
+                serde_json::json!({"url": format!("http://localhost:{port}/")}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let resp = router(state.clone())
+            .oneshot(authed_post("/replay", serde_json::json!({"id": "to-self"})))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(recorded(&state).len(), 1, "only the original");
+    }
+
+    #[tokio::test]
+    async fn send_endpoint_can_be_turned_off() {
+        let port = start_echo_upstream().await;
+        let dir = TempDir::new().unwrap();
+        let state = state_with(&dir, vec![], false);
+        let resp = router(state.clone())
+            .oneshot(authed_post(
+                "/send",
+                serde_json::json!({"url": format!("http://127.0.0.1:{port}/")}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(recorded(&state).is_empty());
+    }
+
+    #[tokio::test]
+    async fn send_endpoint_requires_token() {
+        let dir = TempDir::new().unwrap();
+        let state = state_with(&dir, vec![], true);
+        let req = Request::post("/send")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"url":"http://127.0.0.1:1/"}"#))
+            .unwrap();
+        let resp = router(state).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

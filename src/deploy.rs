@@ -395,7 +395,7 @@ pub struct DeploymentInfo {
     pub started_at: Timestamp,
     pub expires_at: Option<Timestamp>,
     pub proxy: ProxyInfo,
-    pub api: ListenerInfo,
+    pub api: ApiInfo,
     pub ca: crate::ca::CaPublicInfo,
     pub history: HistoryInfo,
 }
@@ -421,9 +421,11 @@ pub enum ProxyAuth {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct ListenerInfo {
+pub struct ApiInfo {
     pub listen: SocketAddr,
     pub tls: bool,
+    /// Whether `POST /send` is on (`start --api-no-send` turns it off).
+    pub send: bool,
 }
 
 /// Where traffic is recorded, as booleans (paths are not exposed).
@@ -440,6 +442,7 @@ pub fn deployment_info(
     ca: crate::ca::CaPublicInfo,
     history: HistoryInfo,
     started_at: Timestamp,
+    send: bool,
 ) -> Option<DeploymentInfo> {
     let e = &b.exposure;
     Some(DeploymentInfo {
@@ -458,9 +461,10 @@ pub fn deployment_info(
             allow_open_proxy: e.allow_open_proxy,
             allow_client: b.allow_clients.iter().map(ToString::to_string).collect(),
         },
-        api: ListenerInfo {
+        api: ApiInfo {
             listen: e.api?,
             tls: e.api_tls,
+            send,
         },
         ca,
         history,
@@ -850,7 +854,7 @@ mod tests {
             sqlite: true,
             log_file: false,
         };
-        let info = deployment_info(&b, ca_info(), history, started).unwrap();
+        let info = deployment_info(&b, ca_info(), history, started, false).unwrap();
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(
             json,
@@ -866,7 +870,7 @@ mod tests {
                     "allow_open_proxy": false,
                     "allow_client": ["10.0.0.0/8", "::1/128"],
                 },
-                "api": {"listen": "10.0.0.5:8081", "tls": true},
+                "api": {"listen": "10.0.0.5:8081", "tls": true, "send": false},
                 "ca": {
                     "subject": "CN=taphttp local CA, O=taphttp",
                     "sha256": "AB:CD",
@@ -894,7 +898,7 @@ mod tests {
             log_file: true,
         };
         let json = serde_json::to_value(
-            deployment_info(&b, ca_info(), history, Timestamp::now()).unwrap(),
+            deployment_info(&b, ca_info(), history, Timestamp::now(), true).unwrap(),
         )
         .unwrap();
         assert_eq!(json["proxy"]["auth"], "none");
@@ -917,6 +921,6 @@ mod tests {
             sqlite: false,
             log_file: false,
         };
-        assert!(deployment_info(&b, ca_info(), history, Timestamp::now()).is_none());
+        assert!(deployment_info(&b, ca_info(), history, Timestamp::now(), true).is_none());
     }
 }

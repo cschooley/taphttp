@@ -27,7 +27,7 @@ Findings are **flux**, a SARIF 2.1.0 profile. Spec vendored at `docs/flux/SPEC.m
 These are the things spall needs from taphttp. They are expensive to retrofit, so get them right now:
 
 1. **Stable exchange IDs.** Every `TrafficEntry.id` is stable and never reused. Findings evidence references these IDs (`flux/replayIds`).
-2. **Replays are recorded.** A replayed request/response is stored as its own `TrafficEntry`, linked to the original by `replay_of`, and failed attempts are recorded too (with `error` set). Evidence and retest both depend on this, and so does a rules-of-engagement record of what was sent. A replay's caller can attach `meta` (who caused it); it is stored, never sent upstream.
+2. **Replays are recorded.** A replayed request/response is stored as its own `TrafficEntry`, linked to the original by `replay_of`, and failed attempts are recorded too (with `error` set). Evidence and retest both depend on this, and so does a rules-of-engagement record of what was sent. A replay's caller can attach `meta` (who caused it); it is stored, never sent upstream. New requests made with `POST /send` (spall's `fetch`) are recorded the same way, with `origin: "send"`; every entry's `origin` says whether it was proxied, replayed or sent.
 3. **Programmatic access.** Query and replay are usable without the CLI (the `taphttp-types` crate and the Lever HTTP API), per the existing "separable modules" rule.
 4. **Raw storage, no redaction.** taphttp stores traffic as captured. Redaction is spall's job at export time (via the flux crate).
 

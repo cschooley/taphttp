@@ -2,16 +2,20 @@ use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::Request;
+use hyper_util::client::legacy::connect::dns::Name;
+use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use rustls::ClientConfig;
 use std::collections::BTreeMap;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 use uuid::Uuid;
 
 use crate::cli::ReplayArgs;
-use crate::storage::{self, Headers, Store, TrafficEntry};
+use crate::storage::{self, Headers, Origin, Store, TrafficEntry};
 
 /// Limits on [`ReplayMods::meta`]: it is attribution, not a payload.
 pub const MAX_META_KEYS: usize = 16;
@@ -35,7 +39,24 @@ pub struct ReplayMods {
     pub meta: BTreeMap<String, String>,
 }
 
-/// Why a replay produced no complete response.
+/// A new request for `POST /send`: not a replay of anything captured.
+#[derive(Debug, Default, Clone)]
+pub struct SendSpec {
+    pub method: String,
+    /// An absolute `http` or `https` URL.
+    pub url: String,
+    /// The whole header list, in order. `None`: [`default_headers`]. A
+    /// `host` header is added from the URL unless the list has one.
+    pub req_headers: Option<Headers>,
+    pub body: Vec<u8>,
+    /// Attribution recorded on the entry and never sent upstream.
+    pub meta: BTreeMap<String, String>,
+}
+
+/// The `user-agent` a [`SendSpec`] without headers goes out with.
+pub const USER_AGENT: &str = concat!("taphttp/", env!("CARGO_PKG_VERSION"));
+
+/// Why a replay or send produced no complete response.
 #[derive(Debug)]
 pub enum ReplayError {
     /// The request couldn't be built (bad method, URL, header, meta).
@@ -50,10 +71,10 @@ pub enum ReplayError {
 impl std::fmt::Display for ReplayError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Invalid(e) => write!(f, "invalid replay: {e:#}"),
+            Self::Invalid(e) => write!(f, "invalid request: {e:#}"),
             Self::Failed(entry) => write!(
                 f,
-                "replay failed: {} (recorded as {})",
+                "request failed: {} (recorded as {})",
                 entry.error.as_deref().unwrap_or("unknown error"),
                 entry.id
             ),
@@ -90,8 +111,19 @@ pub fn validate_meta(meta: &BTreeMap<String, String>) -> Result<()> {
 /// be built is [`ReplayError::Invalid`] and is neither sent nor recorded.
 pub async fn replay_entry(
     store: &Store,
+    original: TrafficEntry,
+    mods: &ReplayMods,
+) -> Result<TrafficEntry, ReplayError> {
+    replay_entry_refusing(store, original, mods, &[]).await
+}
+
+/// [`replay_entry`], refusing (as [`ReplayError::Invalid`]) a target that
+/// resolves to one of `own`, taphttp's listeners.
+pub async fn replay_entry_refusing(
+    store: &Store,
     mut original: TrafficEntry,
     mods: &ReplayMods,
+    own: &[SocketAddr],
 ) -> Result<TrafficEntry, ReplayError> {
     let original_id = original.id.clone();
     validate_meta(&mods.meta).map_err(ReplayError::Invalid)?;
@@ -115,10 +147,92 @@ pub async fn replay_entry(
         .map_err(ReplayError::Invalid)?
         .unwrap_or_default();
 
+    let template = TrafficEntry {
+        replay_of: Some(original_id),
+        // A replay is sent by whoever ran `replay` / POST /replay, not by
+        // the original's client, so it carries no source.
+        source: None,
+        meta: mods.meta.clone(),
+        origin: Origin::Replay,
+        ..original
+    };
+    exchange(store, template, req_body, own).await
+}
+
+/// Send a new request (`POST /send`), record it with `origin: send`, and
+/// return the entry. Outcomes are as for [`replay_entry`]; a target that
+/// resolves to one of `own` is [`ReplayError::Invalid`].
+pub async fn send_new(
+    store: &Store,
+    spec: &SendSpec,
+    own: &[SocketAddr],
+) -> Result<TrafficEntry, ReplayError> {
+    validate_meta(&spec.meta).map_err(ReplayError::Invalid)?;
+    let uri = target_uri(&spec.url).map_err(ReplayError::Invalid)?;
+    let host = uri.host().unwrap_or_default().to_string();
+    let given = spec.req_headers.clone().unwrap_or_else(default_headers);
+    let req_headers = if given.get("host").is_some() {
+        given
+    } else {
+        let mut with_host = Headers::new();
+        with_host.append("host", host_header(&uri));
+        for (k, v) in given.iter() {
+            with_host.append(k, v);
+        }
+        with_host
+    };
+    let mut template = TrafficEntry {
+        id: String::new(),
+        ts: taphttp_types::Timestamp::now(),
+        host,
+        method: spec.method.clone(),
+        url: spec.url.clone(),
+        req_headers,
+        req_body: None,
+        req_body_encoding: Default::default(),
+        status: None,
+        res_headers: Headers::new(),
+        res_body: None,
+        res_body_encoding: Default::default(),
+        duration_ms: None,
+        replay_of: None,
+        source: None,
+        meta: spec.meta.clone(),
+        error: None,
+        origin: Origin::Send,
+    };
+    template.set_req_body(&spec.body);
+    exchange(store, template, spec.body.clone(), own).await
+}
+
+/// What a [`SendSpec`] without `req_headers` sends, besides `host`.
+pub fn default_headers() -> Headers {
+    let mut h = Headers::new();
+    h.append("user-agent", USER_AGENT);
+    h
+}
+
+/// `host[:port]` from the URL, without any userinfo.
+fn host_header(uri: &hyper::Uri) -> String {
+    let host = uri.host().unwrap_or_default();
+    match uri.port_u16() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    }
+}
+
+/// Send `template`'s request, then record it completed with the response:
+/// the one path behind replay and send.
+async fn exchange(
+    store: &Store,
+    template: TrafficEntry,
+    req_body: Vec<u8>,
+    own: &[SocketAddr],
+) -> Result<TrafficEntry, ReplayError> {
     let req = build_request(
-        &original.method,
-        &original.url,
-        &original.req_headers,
+        &template.method,
+        &template.url,
+        &template.req_headers,
         req_body,
     )
     .map_err(ReplayError::Invalid)?;
@@ -127,31 +241,98 @@ pub async fn replay_entry(
     let sent_headers = crate::proxy::collect_headers(req.headers());
 
     let start = Instant::now();
-    let outcome = send(req).await;
+    let outcome = match resolve(req.uri()).await {
+        Ok(addrs) => {
+            if let Some(a) = addrs.iter().find(|a| is_own_target(**a, own, is_local_ip)) {
+                return Err(ReplayError::Invalid(anyhow::anyhow!(
+                    "{} resolves to {a}, one of taphttp's own listeners; refusing to send to itself",
+                    template.url
+                )));
+            }
+            // Connect only to the addresses just checked, so a name can't
+            // resolve elsewhere the second time (DNS rebinding).
+            send(req, addrs).await
+        }
+        Err(e) => Outcome {
+            error: Some(format!("resolving host: {e}")),
+            ..Default::default()
+        },
+    };
     let duration_ms = start.elapsed().as_millis() as u64;
 
-    let mut replay = TrafficEntry {
+    let mut entry = TrafficEntry {
         id: Uuid::new_v4().to_string(),
         ts: taphttp_types::Timestamp::now(),
         req_headers: sent_headers,
         status: outcome.status,
         res_headers: outcome.headers,
         duration_ms: Some(duration_ms),
-        replay_of: Some(original_id),
-        // A replay is sent by whoever ran `replay` / POST /replay, not by
-        // the original's client, so it carries no source.
-        source: None,
-        meta: mods.meta.clone(),
         error: outcome.error,
-        ..original
+        ..template
     };
-    replay.set_res_body(&outcome.body);
+    entry.set_res_body(&outcome.body);
 
-    store.record(replay.clone());
-    if replay.error.is_some() {
-        return Err(ReplayError::Failed(Box::new(replay)));
+    store.record(entry.clone());
+    if entry.error.is_some() {
+        return Err(ReplayError::Failed(Box::new(entry)));
     }
-    Ok(replay)
+    Ok(entry)
+}
+
+/// Every address `uri`'s host resolves to, on its port.
+async fn resolve(uri: &hyper::Uri) -> std::io::Result<Vec<SocketAddr>> {
+    let host = uri.host().unwrap_or_default();
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let port = uri
+        .port_u16()
+        .unwrap_or(if uri.scheme_str() == Some("https") {
+            443
+        } else {
+            80
+        });
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port)).await?.collect();
+    if addrs.is_empty() {
+        return Err(std::io::Error::other(format!("{host} has no addresses")));
+    }
+    Ok(addrs)
+}
+
+/// Whether connecting to `target` would reach one of `own` (taphttp's
+/// bound listeners). A listener on `0.0.0.0` / `::` is reached through any
+/// address of this host, which `is_local` decides.
+pub fn is_own_target(
+    target: SocketAddr,
+    own: &[SocketAddr],
+    is_local: impl Fn(IpAddr) -> bool,
+) -> bool {
+    let t = target.ip().to_canonical();
+    own.iter().any(|o| {
+        let l = o.ip().to_canonical();
+        o.port() == target.port()
+            && (t == l
+                || (l.is_unspecified() && (t.is_unspecified() || is_local(t)))
+                || (t.is_unspecified() && is_local(l)))
+    })
+}
+
+/// Whether `ip` is an address of this host: loopback, unspecified (which
+/// connects locally), or one a socket can bind to.
+fn is_local_ip(ip: IpAddr) -> bool {
+    let ip = ip.to_canonical();
+    ip.is_loopback()
+        || ip.is_unspecified()
+        || std::net::UdpSocket::bind(SocketAddr::new(ip, 0)).is_ok()
+}
+
+/// Parse a URL to send to: absolute `http` or `https`, with a host.
+fn target_uri(url: &str) -> Result<hyper::Uri> {
+    let uri: hyper::Uri = url
+        .parse()
+        .with_context(|| format!("invalid url {url:?}"))?;
+    if !matches!(uri.scheme_str(), Some("http" | "https")) || uri.host().is_none() {
+        bail!("url {url:?}: need an absolute http or https URL");
+    }
+    Ok(uri)
 }
 
 /// Build the request, or say why it can't be sent. Only `http(s)` URLs
@@ -164,12 +345,7 @@ fn build_request(
 ) -> Result<Request<Full<Bytes>>> {
     let method = hyper::Method::from_bytes(method.as_bytes())
         .with_context(|| format!("invalid method {method:?}"))?;
-    let uri: hyper::Uri = url
-        .parse()
-        .with_context(|| format!("invalid url {url:?}"))?;
-    if !matches!(uri.scheme_str(), Some("http" | "https")) || uri.authority().is_none() {
-        bail!("url {url:?}: need an absolute http or https URL");
-    }
+    let uri = target_uri(url)?;
 
     let mut builder = Request::builder().method(method).uri(uri);
     // `header` appends, so repeated headers are all sent.
@@ -191,8 +367,32 @@ struct Outcome {
     error: Option<String>,
 }
 
-/// Send one request. Shared by the CLI and the lever API's replay path.
-async fn send(req: Request<Full<Bytes>>) -> Outcome {
+/// A resolver that answers with addresses already looked up and checked.
+#[derive(Clone)]
+struct Pinned(Arc<Vec<SocketAddr>>);
+
+impl tower::Service<Name> for Pinned {
+    type Response = std::vec::IntoIter<SocketAddr>;
+    type Error = std::io::Error;
+    type Future = std::future::Ready<std::io::Result<Self::Response>>;
+
+    fn poll_ready(
+        &mut self,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, _: Name) -> Self::Future {
+        std::future::ready(Ok(Vec::clone(&self.0).into_iter()))
+    }
+}
+
+/// Send one request, connecting only to `addrs`. Shared by the CLI and the
+/// lever API's replay and send paths.
+async fn send(req: Request<Full<Bytes>>, addrs: Vec<SocketAddr>) -> Outcome {
+    let mut http = HttpConnector::new_with_resolver(Pinned(Arc::new(addrs)));
+    http.enforce_http(false);
     let res = if req.uri().scheme_str() == Some("https") {
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -203,11 +403,10 @@ async fn send(req: Request<Full<Bytes>>) -> Outcome {
             .with_tls_config(tls)
             .https_or_http()
             .enable_http1()
-            .build();
+            .wrap_connector(http);
         let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build(https);
         client.request(req).await
     } else {
-        let http = hyper_util::client::legacy::connect::HttpConnector::new();
         let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build(http);
         client.request(req).await
     };
@@ -365,6 +564,7 @@ mod tests {
             source: None,
             meta: Default::default(),
             error: None,
+            origin: crate::storage::Origin::Proxy,
         }
     }
 
@@ -629,6 +829,382 @@ mod tests {
         assert_eq!(replay.req_body_bytes().unwrap(), Some(body));
     }
 
+    // --- POST /send ---
+
+    fn sent_headers(seen: &(Vec<(String, Vec<u8>)>, Vec<u8>)) -> Vec<(String, String)> {
+        seen.0
+            .iter()
+            .map(|(k, v)| (k.clone(), String::from_utf8_lossy(v).into_owned()))
+            .collect()
+    }
+
+    fn log_store(dir: &TempDir) -> (Arc<Store>, std::path::PathBuf) {
+        let log = dir.path().join("traffic.jsonl");
+        (Store::new(Some(&log), None).unwrap(), log)
+    }
+
+    #[tokio::test]
+    async fn send_records_a_new_request_with_default_headers() {
+        let seen: Seen = Default::default();
+        let port = start_recording_server(seen.clone()).await;
+        let dir = TempDir::new().unwrap();
+        let (store, log) = log_store(&dir);
+        let spec = SendSpec {
+            method: "POST".into(),
+            url: format!("http://127.0.0.1:{port}/new?x=1"),
+            body: vec![0, 0xff, 7],
+            meta: agent_meta(),
+            ..Default::default()
+        };
+        let entry = send_new(&store, &spec, &[]).await.unwrap();
+
+        let seen = seen.lock().await.clone().unwrap();
+        assert_eq!(
+            sent_headers(&seen)[..2],
+            [
+                ("host".to_string(), format!("127.0.0.1:{port}")),
+                ("user-agent".to_string(), USER_AGENT.to_string()),
+            ]
+        );
+        assert_eq!(seen.1, [0, 0xff, 7], "body byte-exact");
+        assert!(USER_AGENT.starts_with("taphttp/"));
+
+        assert_eq!(entry.origin, Origin::Send);
+        assert_eq!(entry.replay_of, None);
+        assert_eq!(entry.source, None);
+        assert_eq!(entry.meta, agent_meta());
+        assert_eq!(entry.method, "POST");
+        assert_eq!(entry.url, spec.url);
+        assert_eq!(entry.host, "127.0.0.1");
+        assert_eq!(entry.status, Some(200));
+        assert_eq!(entry.req_body_bytes().unwrap(), Some(vec![0, 0xff, 7]));
+        assert_eq!(entry.req_headers.get("user-agent"), Some(USER_AGENT));
+        let logged = storage::load_entries(&log).unwrap();
+        assert_eq!(logged, [entry], "recorded once, as returned");
+        assert!(
+            !String::from_utf8_lossy(&seen.0.concat_bytes()).contains("T-3-meta-marker"),
+            "meta never goes upstream"
+        );
+    }
+
+    trait ConcatBytes {
+        fn concat_bytes(&self) -> Vec<u8>;
+    }
+    impl ConcatBytes for Vec<(String, Vec<u8>)> {
+        fn concat_bytes(&self) -> Vec<u8> {
+            self.iter()
+                .flat_map(|(k, v)| k.bytes().chain(v.iter().copied()))
+                .collect()
+        }
+    }
+
+    #[tokio::test]
+    async fn send_adds_host_from_the_url_unless_given() {
+        let store = Store::new(None, None).unwrap();
+        let headers = |pairs: &[(&str, &str)]| {
+            let mut h = Headers::new();
+            for (k, v) in pairs {
+                h.append(*k, *v);
+            }
+            h
+        };
+
+        let seen: Seen = Default::default();
+        let port = start_recording_server(seen.clone()).await;
+        let spec = SendSpec {
+            method: "GET".into(),
+            url: format!("http://127.0.0.1:{port}/"),
+            req_headers: Some(headers(&[("accept", "*/*")])),
+            ..Default::default()
+        };
+        send_new(&store, &spec, &[]).await.unwrap();
+        let got = sent_headers(&seen.lock().await.clone().unwrap());
+        assert_eq!(
+            got,
+            [
+                ("host".to_string(), format!("127.0.0.1:{port}")),
+                ("accept".to_string(), "*/*".to_string()),
+            ],
+            "no user-agent when the list is given"
+        );
+
+        let seen: Seen = Default::default();
+        let port = start_recording_server(seen.clone()).await;
+        let spec = SendSpec {
+            method: "GET".into(),
+            url: format!("http://127.0.0.1:{port}/"),
+            req_headers: Some(headers(&[("x-a", "1"), ("Host", "virtual.example")])),
+            ..Default::default()
+        };
+        send_new(&store, &spec, &[]).await.unwrap();
+        let got = sent_headers(&seen.lock().await.clone().unwrap());
+        assert_eq!(
+            got,
+            [
+                ("x-a".to_string(), "1".to_string()),
+                ("host".to_string(), "virtual.example".to_string()),
+            ],
+            "a given host is kept, once, where it was"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_send_is_recorded_with_its_error() {
+        let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = dead.local_addr().unwrap().port();
+        drop(dead);
+        let dir = TempDir::new().unwrap();
+        let (store, log) = log_store(&dir);
+        let spec = SendSpec {
+            method: "GET".into(),
+            url: format!("http://127.0.0.1:{port}/"),
+            meta: agent_meta(),
+            ..Default::default()
+        };
+        let Err(ReplayError::Failed(entry)) = send_new(&store, &spec, &[]).await else {
+            panic!("expected Failed");
+        };
+        assert_eq!(entry.origin, Origin::Send);
+        assert_eq!(entry.status, None);
+        assert!(
+            entry.error.as_deref().unwrap().contains("onnect"),
+            "{entry:?}"
+        );
+        assert_eq!(entry.meta, agent_meta());
+        assert_eq!(storage::load_entries(&log).unwrap(), [*entry]);
+    }
+
+    #[tokio::test]
+    async fn send_to_an_unresolvable_host_is_recorded_as_failed() {
+        let dir = TempDir::new().unwrap();
+        let (store, log) = log_store(&dir);
+        let spec = SendSpec {
+            method: "GET".into(),
+            url: "http://no-such-host.invalid/".into(),
+            ..Default::default()
+        };
+        let Err(ReplayError::Failed(entry)) = send_new(&store, &spec, &[]).await else {
+            panic!("expected Failed");
+        };
+        assert!(
+            entry
+                .error
+                .as_deref()
+                .unwrap()
+                .starts_with("resolving host"),
+            "{entry:?}"
+        );
+        assert_eq!(storage::load_entries(&log).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn invalid_send_is_neither_sent_nor_recorded() {
+        let hit = Arc::new(AtomicBool::new(false));
+        let port = start_capture_server(hit.clone()).await;
+        let dir = TempDir::new().unwrap();
+        let (store, log) = log_store(&dir);
+        let ok = format!("http://127.0.0.1:{port}/");
+        let mut bad_header = Headers::new();
+        bad_header.append("bad header", "v");
+        let cases = [
+            (
+                "GET",
+                format!("ftp://127.0.0.1:{port}/"),
+                None,
+                BTreeMap::new(),
+            ),
+            ("GET", "/relative".to_string(), None, BTreeMap::new()),
+            ("GET", "not a url".to_string(), None, BTreeMap::new()),
+            ("BAD METHOD", ok.clone(), None, BTreeMap::new()),
+            ("GET", ok.clone(), Some(bad_header), BTreeMap::new()),
+            (
+                "GET",
+                ok.clone(),
+                None,
+                BTreeMap::from([(String::new(), "v".to_string())]),
+            ),
+        ];
+        for (method, url, req_headers, meta) in cases {
+            let spec = SendSpec {
+                method: method.into(),
+                url: url.clone(),
+                req_headers,
+                meta,
+                ..Default::default()
+            };
+            let r = send_new(&store, &spec, &[]).await;
+            assert!(
+                matches!(r, Err(ReplayError::Invalid(_))),
+                "{method} {url}: {r:?}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!hit.load(Ordering::SeqCst), "nothing sent");
+        assert!(storage::load_entries(&log).unwrap_or_default().is_empty());
+    }
+
+    #[tokio::test]
+    async fn send_and_replay_refuse_taphttps_own_listeners() {
+        let hit = Arc::new(AtomicBool::new(false));
+        let port = start_capture_server(hit.clone()).await;
+        let dir = TempDir::new().unwrap();
+        let (store, log) = log_store(&dir);
+        let own: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let any: SocketAddr = format!("0.0.0.0:{port}").parse().unwrap();
+        for (url, own) in [
+            (format!("http://127.0.0.1:{port}/"), own),
+            (format!("http://localhost:{port}/"), own),
+            (format!("http://127.0.0.1:{port}/"), any),
+            (format!("https://127.0.0.1:{port}/"), own),
+        ] {
+            let spec = SendSpec {
+                method: "GET".into(),
+                url: url.clone(),
+                ..Default::default()
+            };
+            let Err(ReplayError::Invalid(e)) = send_new(&store, &spec, &[own]).await else {
+                panic!("{url} via {own}: expected Invalid");
+            };
+            assert!(e.to_string().contains("own listeners"), "{e}");
+        }
+        let r = replay_entry_refusing(
+            &store,
+            upstream_entry("self-1", port, "GET"),
+            &ReplayMods::default(),
+            &[own],
+        )
+        .await;
+        assert!(matches!(r, Err(ReplayError::Invalid(_))), "{r:?}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!hit.load(Ordering::SeqCst), "never sent");
+        assert!(storage::load_entries(&log).unwrap_or_default().is_empty());
+
+        // Another port on the same host is fine.
+        let other: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let spec = SendSpec {
+            method: "GET".into(),
+            url: format!("http://127.0.0.1:{port}/"),
+            ..Default::default()
+        };
+        send_new(&store, &spec, &[other]).await.unwrap();
+        assert!(hit.load(Ordering::SeqCst));
+    }
+
+    /// The address checked against `own` is the one connected to: a name is
+    /// never resolved a second time (DNS rebinding).
+    #[tokio::test]
+    async fn send_connects_only_to_the_checked_addresses() {
+        let hit = Arc::new(AtomicBool::new(false));
+        let port = start_capture_server(hit.clone()).await;
+        let req = build_request(
+            "GET",
+            &format!("http://never-resolved.invalid:{port}/"),
+            &Headers::new(),
+            vec![],
+        )
+        .unwrap();
+        let pinned = vec![SocketAddr::from(([127, 0, 0, 1], port))];
+        let outcome = send(req, pinned).await;
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.status, Some(200));
+        assert!(hit.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn errors_read_for_send_as_well_as_replay() {
+        let invalid = ReplayError::Invalid(anyhow::anyhow!("bad url"));
+        assert_eq!(invalid.to_string(), "invalid request: bad url");
+        let mut e = upstream_entry("f-1", 1, "GET");
+        e.error = Some("connect refused".into());
+        let failed = ReplayError::Failed(Box::new(e));
+        assert_eq!(
+            failed.to_string(),
+            "request failed: connect refused (recorded as f-1)"
+        );
+    }
+
+    #[test]
+    fn own_target_matching() {
+        let a = |s: &str| -> SocketAddr { s.parse().unwrap() };
+        let lan: IpAddr = "10.1.2.3".parse().unwrap();
+        let local = move |ip: IpAddr| ip.to_canonical().is_loopback() || ip == lan;
+        let own = |t: &str, o: &[&str]| {
+            let o: Vec<SocketAddr> = o.iter().map(|s| a(s)).collect();
+            is_own_target(a(t), &o, local)
+        };
+        assert!(own("127.0.0.1:8081", &["127.0.0.1:8080", "127.0.0.1:8081"]));
+        assert!(!own("127.0.0.1:9", &["127.0.0.1:8081"]), "other port");
+        assert!(!own("127.0.0.1:8081", &[]));
+        // A wildcard listener is reached through any local address...
+        assert!(own("10.1.2.3:8080", &["0.0.0.0:8080"]));
+        assert!(own("127.0.0.1:8080", &["[::]:8080"]));
+        // ...but not through another host's.
+        assert!(!own("10.9.9.9:8080", &["0.0.0.0:8080"]));
+        // A loopback listener isn't reachable through the LAN address.
+        assert!(!own("10.1.2.3:8081", &["127.0.0.1:8081"]));
+        // Connecting to 0.0.0.0 reaches this host.
+        assert!(own("0.0.0.0:8081", &["127.0.0.1:8081"]));
+        assert!(own("0.0.0.0:8080", &["0.0.0.0:8080"]));
+        // IPv4-mapped IPv6 is the same address.
+        assert!(own("[::ffff:127.0.0.1]:8081", &["127.0.0.1:8081"]));
+        assert!(own("[::1]:8081", &["[::1]:8081"]));
+    }
+
+    #[test]
+    fn local_ips_are_recognised() {
+        assert!(is_local_ip("127.0.0.1".parse().unwrap()));
+        assert!(is_local_ip("0.0.0.0".parse().unwrap()));
+        // TEST-NET-3: never assigned to a host.
+        assert!(!is_local_ip("203.0.113.9".parse().unwrap()));
+    }
+
+    /// A TLS server with a self-signed cert: nothing in webpki-roots
+    /// trusts it, so an https replay must fail on the certificate.
+    #[tokio::test]
+    async fn https_replay_connects_and_verifies_the_certificate() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["127.0.0.1".into()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let cfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.der().clone()],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()),
+            )
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(cfg));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handshook = Arc::new(AtomicBool::new(false));
+        let seen = handshook.clone();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            seen.store(true, Ordering::SeqCst);
+            let _ = acceptor.accept(stream).await;
+        });
+
+        let store = Store::new(None, None).unwrap();
+        let mut original = upstream_entry("tls-1", port, "GET");
+        original.url = format!("https://127.0.0.1:{port}/");
+        let Err(ReplayError::Failed(entry)) =
+            replay_entry(&store, original, &ReplayMods::default()).await
+        else {
+            panic!("expected Failed");
+        };
+        assert!(
+            handshook.load(Ordering::SeqCst),
+            "connected to the upstream"
+        );
+        let error = entry.error.unwrap();
+        assert!(
+            error.to_lowercase().contains("certificate"),
+            "TLS was attempted and the cert checked: {error}"
+        );
+    }
+
     fn agent_meta() -> BTreeMap<String, String> {
         [
             ("actor", "agent"),
@@ -680,11 +1256,14 @@ mod tests {
         let mut original = upstream_entry("inh-1", port, "GET");
         original.meta = agent_meta();
         original.error = Some("old failure".into());
+        // Replaying a sent request is still a replay.
+        original.origin = crate::storage::Origin::Send;
         let replay = replay_entry(&store, original, &ReplayMods::default())
             .await
             .unwrap();
         assert!(replay.meta.is_empty());
         assert_eq!(replay.error, None);
+        assert_eq!(replay.origin, crate::storage::Origin::Replay);
     }
 
     #[test]
@@ -888,6 +1467,7 @@ mod tests {
             source: None,
             meta: Default::default(),
             error: None,
+            origin: crate::storage::Origin::Proxy,
         };
 
         JsonLinesBackend::new(&data_dir.join("traffic.jsonl"))
@@ -937,6 +1517,7 @@ mod tests {
             source: None,
             meta: Default::default(),
             error: None,
+            origin: crate::storage::Origin::Proxy,
         };
 
         JsonLinesBackend::new(&data_dir.join("traffic.jsonl"))
@@ -1038,6 +1619,7 @@ mod tests {
                 source: None,
                 meta: Default::default(),
                 error: None,
+                origin: crate::storage::Origin::Proxy,
             })
             .unwrap();
 

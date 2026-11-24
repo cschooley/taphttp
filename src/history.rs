@@ -13,7 +13,7 @@ use serde::Deserialize;
 use taphttp_types::Timestamp;
 
 use crate::storage::{Headers, SqliteBackend, TrafficEntry};
-use taphttp_types::BodyEncoding;
+use taphttp_types::{BodyEncoding, Origin};
 
 /// Default and maximum page size for [`SqliteBackend::query`].
 pub const DEFAULT_LIMIT: usize = 100;
@@ -36,6 +36,8 @@ pub struct HistoryQuery {
     pub until: Option<Timestamp>,
     /// Only replays of the exchange with this id.
     pub replay_of: Option<String>,
+    /// Only exchanges recorded this way.
+    pub origin: Option<Origin>,
     /// Cursor: only entries recorded before the entry with this id.
     pub before: Option<String>,
     /// Page size; default [`DEFAULT_LIMIT`], capped at [`MAX_LIMIT`].
@@ -97,7 +99,7 @@ impl From<rusqlite::Error> for HistoryError {
 }
 
 const COLUMNS: &str = "rowid, id, ts, host, method, url, req_headers, req_body, \
-    req_body_encoding, status, res_headers, res_body, res_body_encoding, duration_ms, replay_of, source, meta, error";
+    req_body_encoding, status, res_headers, res_body, res_body_encoding, duration_ms, replay_of, source, meta, error, origin";
 
 impl SqliteBackend {
     /// Newest first, filtered, at most `limit` entries.
@@ -115,6 +117,10 @@ impl SqliteBackend {
         if let Some(of) = &q.replay_of {
             sql.push_str(" AND replay_of = ?");
             params.push(Box::new(of.clone()));
+        }
+        if let Some(origin) = q.origin {
+            sql.push_str(" AND origin = ?");
+            params.push(Box::new(crate::storage::origin_str(origin)));
         }
         if let Some(host) = &q.host {
             sql.push_str(r" AND host LIKE ? ESCAPE '\'");
@@ -233,6 +239,7 @@ fn row_to_entry(r: &Row) -> rusqlite::Result<(i64, TrafficEntry)> {
     };
     let ts: String = r.get(2)?;
     let ts: Timestamp = ts.parse().map_err(|e| conversion(2, Box::new(e)))?;
+    let replay_of: Option<String> = r.get(14)?;
     let entry = TrafficEntry {
         id: r.get(1)?,
         ts,
@@ -249,13 +256,23 @@ fn row_to_entry(r: &Row) -> rusqlite::Result<(i64, TrafficEntry)> {
         duration_ms: r
             .get::<_, Option<i64>>(13)?
             .and_then(|d| u64::try_from(d).ok()),
-        replay_of: r.get(14)?,
         source: r.get(15)?,
         meta: match r.get::<_, Option<String>>(16)? {
             Some(json) => serde_json::from_str(&json).map_err(|e| conversion(16, e.into()))?,
             None => Default::default(),
         },
         error: r.get(17)?,
+        origin: match r.get::<_, Option<String>>(18)?.as_deref() {
+            Some("proxy") => Origin::Proxy,
+            Some("replay") => Origin::Replay,
+            Some("send") => Origin::Send,
+            // Filled in on open; only a row written since by an older
+            // taphttp lacks it.
+            None if replay_of.is_some() => Origin::Replay,
+            None => Origin::Proxy,
+            Some(other) => return Err(conversion(18, format!("unknown origin {other:?}").into())),
+        },
+        replay_of,
     };
     Ok((r.get(0)?, entry))
 }
@@ -284,6 +301,7 @@ mod tests {
             source: None,
             meta: Default::default(),
             error: None,
+            origin: crate::storage::Origin::Proxy,
         }
     }
 
@@ -678,6 +696,70 @@ mod tests {
         assert_eq!(e.res_headers.get("set-cookie"), Some("a=1"));
         assert_eq!(e.res_body_encoding, BodyEncoding::Utf8);
         assert_eq!(ids(&db.query(&HistoryQuery::default()).unwrap()), ["old"]);
+    }
+
+    #[test]
+    fn origin_round_trips_and_filters() {
+        let dir = TempDir::new().unwrap();
+        let db = SqliteBackend::new(&dir.path().join("t.db")).unwrap();
+        let proxied = entry("p", "h", "GET", 200, "/");
+        let mut replay = entry("r", "h", "GET", 200, "/");
+        replay.replay_of = Some("p".into());
+        replay.origin = Origin::Replay;
+        let mut sent = entry("s", "h", "GET", 200, "/");
+        sent.origin = Origin::Send;
+        for e in [&proxied, &replay, &sent] {
+            db.append(e).unwrap();
+            assert_eq!(&db.get(&e.id).unwrap().unwrap(), e);
+        }
+        let only = |o| -> Vec<String> {
+            db.query(&HistoryQuery {
+                origin: Some(o),
+                ..Default::default()
+            })
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect()
+        };
+        assert_eq!(only(Origin::Send), ["s"]);
+        assert_eq!(only(Origin::Replay), ["r"]);
+        assert_eq!(only(Origin::Proxy), ["p"]);
+    }
+
+    #[test]
+    fn rows_from_before_v6_get_an_origin_from_replay_of() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("t.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE traffic (id TEXT PRIMARY KEY, ts TEXT NOT NULL, host TEXT NOT NULL,
+                    method TEXT NOT NULL, url TEXT NOT NULL, req_headers TEXT, req_body TEXT,
+                    status INTEGER, res_headers TEXT, res_body TEXT, duration_ms INTEGER,
+                    replay_of TEXT);
+                 INSERT INTO traffic VALUES ('old','2026-01-01T00:00:00+00:00','h','GET','http://h/',
+                    '[]',NULL,200,'[]','ok',5,NULL);
+                 INSERT INTO traffic VALUES ('again','2026-01-01T00:00:01+00:00','h','GET','http://h/',
+                    '[]',NULL,200,'[]','ok',5,'old');",
+            )
+            .unwrap();
+        }
+        let db = SqliteBackend::new(&path).unwrap();
+        assert_eq!(db.get("old").unwrap().unwrap().origin, Origin::Proxy);
+        assert_eq!(db.get("again").unwrap().unwrap().origin, Origin::Replay);
+        let only = |o| -> Vec<String> {
+            db.query(&HistoryQuery {
+                origin: Some(o),
+                ..Default::default()
+            })
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect()
+        };
+        assert_eq!(only(Origin::Proxy), ["old"], "filled in on open");
+        assert_eq!(only(Origin::Replay), ["again"]);
     }
 
     #[test]

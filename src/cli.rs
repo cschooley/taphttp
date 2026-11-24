@@ -102,6 +102,11 @@ pub struct StartArgs {
     #[arg(long)]
     pub api_allow_plaintext: bool,
 
+    /// Turn off the lever API's POST /send (new requests to any URL), for
+    /// deployments that only observe and replay. /info reports it.
+    #[arg(long)]
+    pub api_no_send: bool,
+
     /// Stop after this: a duration (90s, 30m, 8h, 2d) or an RFC 3339 time.
     /// Requests are refused from then on and taphttp exits.
     #[arg(long, value_name = "WHEN")]

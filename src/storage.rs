@@ -10,7 +10,7 @@ use tokio::sync::broadcast;
 // The traffic schema lives in the `taphttp-types` crate so consumers can
 // depend on it without the proxy. Re-exported here so the rest of the crate
 // keeps one import path.
-pub use taphttp_types::{Headers, TrafficEntry, SCHEMA_VERSION};
+pub use taphttp_types::{Headers, Origin, TrafficEntry, SCHEMA_VERSION};
 
 pub struct JsonLinesBackend {
     path: PathBuf,
@@ -66,7 +66,7 @@ pub struct SqliteBackend {
 
 /// Columns of the `traffic` table, in insert order. v1/v2 databases have
 /// only the first eleven; [`SqliteBackend::new`] adds the rest.
-const SQLITE_COLUMNS: [(&str, &str); 19] = [
+const SQLITE_COLUMNS: [(&str, &str); 20] = [
     ("id", "TEXT PRIMARY KEY"),
     ("ts", "TEXT NOT NULL"),
     ("host", "TEXT NOT NULL"),
@@ -92,6 +92,8 @@ const SQLITE_COLUMNS: [(&str, &str); 19] = [
     // exchange has no complete response.
     ("meta", "TEXT"),
     ("error", "TEXT"),
+    // v6: how the exchange was recorded (`proxy`, `replay`, `send`).
+    ("origin", "TEXT"),
 ];
 
 impl SqliteBackend {
@@ -128,6 +130,13 @@ impl SqliteBackend {
             "CREATE INDEX IF NOT EXISTS traffic_ts_us ON traffic (ts_us);
              CREATE INDEX IF NOT EXISTS traffic_replay_of ON traffic (replay_of);",
         )?;
+        // Rows from before v6 have no origin: the same inference a v5 line
+        // gets, written down so `origin` filters find them.
+        conn.execute_batch(
+            "UPDATE traffic SET origin = CASE WHEN replay_of IS NULL THEN 'proxy' ELSE 'replay' END
+             WHERE origin IS NULL;",
+        )
+        .context("migrating sqlite: filling in origin")?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -173,9 +182,19 @@ impl SqliteBackend {
                     Some(serde_json::to_string(&e.meta)?)
                 },
                 e.error,
+                origin_str(e.origin),
             ],
         )?;
         Ok(())
+    }
+}
+
+/// `origin` as stored in sqlite: its JSON string.
+pub(crate) fn origin_str(o: Origin) -> &'static str {
+    match o {
+        Origin::Proxy => "proxy",
+        Origin::Replay => "replay",
+        Origin::Send => "send",
     }
 }
 
@@ -420,6 +439,7 @@ mod tests {
             source: None,
             meta: Default::default(),
             error: None,
+            origin: crate::storage::Origin::Proxy,
         }
     }
 
