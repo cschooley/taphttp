@@ -9,6 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::net::SocketAddr;
 
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -153,12 +154,16 @@ impl<'de> Deserialize<'de> for Timestamp {
 /// - v6: added `origin`, how the exchange was recorded: `"proxy"`,
 ///   `"replay"` or `"send"` (a new request made with the lever API's
 ///   `POST /send`).
+/// - v7: added `peer`, the upstream address taphttp connected to
+///   (`"203.0.113.7:443"`, `"[2001:db8::1]:443"`), or `null` when no
+///   connection was made.
 ///
-/// v1 to v5 lines still deserialize: a header map is read as pairs, a
+/// v1 to v6 lines still deserialize: a header map is read as pairs, a
 /// missing encoding means `"utf8"`, a missing `source` or `error` means
 /// `null`, a missing `meta` means `{}`, and a missing `origin` is
-/// `"replay"` when `replay_of` is set and `"proxy"` otherwise.
-pub const SCHEMA_VERSION: u32 = 6;
+/// `"replay"` when `replay_of` is set and `"proxy"` otherwise. A missing
+/// `peer` means `null`.
+pub const SCHEMA_VERSION: u32 = 7;
 
 // ---------------------------------------------------------------------------
 // Headers
@@ -469,6 +474,11 @@ pub struct TrafficEntry {
     /// Older lines without it are inferred: `replay` when `replay_of` is
     /// set, otherwise `proxy`.
     pub origin: Origin,
+    /// The upstream address taphttp connected to for this exchange, as
+    /// resolved and dialled by taphttp itself (not a later lookup). `None`
+    /// when no connection was made (the upstream was unreachable or the
+    /// name didn't resolve), and on lines that predate it.
+    pub peer: Option<SocketAddr>,
 }
 
 /// What a line deserializes into before [`TrafficEntry::origin`] is filled
@@ -504,6 +514,8 @@ struct RawTrafficEntry {
     error: Option<String>,
     #[serde(default)]
     origin: Option<Origin>,
+    #[serde(default)]
+    peer: Option<SocketAddr>,
 }
 
 impl<'de> Deserialize<'de> for TrafficEntry {
@@ -533,6 +545,7 @@ impl<'de> Deserialize<'de> for TrafficEntry {
             meta: r.meta,
             error: r.error,
             origin,
+            peer: r.peer,
         })
     }
 }
@@ -562,8 +575,8 @@ impl TrafficEntry {
 impl Serialize for TrafficEntry {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         // Keep this list in step with the struct; the
-        // `serialized_keys_are_exactly_the_v6_schema` test enforces it.
-        let mut st = s.serialize_struct("TrafficEntry", 19)?;
+        // `serialized_keys_are_exactly_the_v7_schema` test enforces it.
+        let mut st = s.serialize_struct("TrafficEntry", 20)?;
         st.serialize_field("schema_version", &SCHEMA_VERSION)?;
         st.serialize_field("id", &self.id)?;
         st.serialize_field("ts", &self.ts)?;
@@ -583,6 +596,7 @@ impl Serialize for TrafficEntry {
         st.serialize_field("meta", &self.meta)?;
         st.serialize_field("error", &self.error)?;
         st.serialize_field("origin", &self.origin)?;
+        st.serialize_field("peer", &self.peer)?;
         st.end()
     }
 }
@@ -675,6 +689,7 @@ mod tests {
             meta: BTreeMap::new(),
             error: None,
             origin: Origin::Proxy,
+            peer: None,
         }
     }
 
@@ -820,7 +835,7 @@ mod tests {
     // --- TrafficEntry wire format ---
 
     #[test]
-    fn serialized_keys_are_exactly_the_v6_schema() {
+    fn serialized_keys_are_exactly_the_v7_schema() {
         let v = serde_json::to_value(entry()).unwrap();
         let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
         keys.sort_unstable();
@@ -834,6 +849,7 @@ mod tests {
                 "meta",
                 "method",
                 "origin",
+                "peer",
                 "replay_of",
                 "req_body",
                 "req_body_encoding",
@@ -848,8 +864,9 @@ mod tests {
                 "url",
             ]
         );
-        assert_eq!(v["schema_version"], 6);
+        assert_eq!(v["schema_version"], 7);
         assert_eq!(v["origin"], "proxy");
+        assert_eq!(v["peer"], serde_json::Value::Null);
         assert_eq!(v["req_body_encoding"], "utf8");
         assert_eq!(
             v["meta"],
@@ -919,6 +936,24 @@ mod tests {
     }
 
     #[test]
+    fn peer_is_an_address_string_and_missing_on_older_lines_is_none() {
+        for (addr, want) in [
+            ("203.0.113.7:443", r#""peer":"203.0.113.7:443""#),
+            ("[2001:db8::1]:8443", r#""peer":"[2001:db8::1]:8443""#),
+        ] {
+            let mut e = entry();
+            e.peer = Some(addr.parse().unwrap());
+            let line = serde_json::to_string(&e).unwrap();
+            assert!(line.contains(want), "{line}");
+        }
+        let v6 = r#"{"schema_version":6,"id":"a","ts":"2026-11-20T00:00:00Z","host":"h","method":"GET","url":"/","status":null,"duration_ms":null,"origin":"send"}"#;
+        let e: TrafficEntry = serde_json::from_str(v6).unwrap();
+        assert_eq!(e.peer, None);
+        let bad = v6.replace(r#""origin""#, r#""peer":"not-an-address","origin""#);
+        assert!(serde_json::from_str::<TrafficEntry>(&bad).is_err());
+    }
+
+    #[test]
     fn v4_line_without_meta_or_error_parses_as_empty() {
         let v4 = r#"{"schema_version":4,"id":"a","ts":"2026-11-20T00:00:00Z","host":"h","method":"GET","url":"/","req_headers":[],"req_body":null,"req_body_encoding":"utf8","status":200,"res_headers":[],"res_body":null,"res_body_encoding":"utf8","duration_ms":1,"replay_of":null,"source":"alice"}"#;
         let e: TrafficEntry = serde_json::from_str(v4).unwrap();
@@ -930,7 +965,7 @@ mod tests {
     #[test]
     fn schema_version_is_the_first_key_on_the_line() {
         let line = serde_json::to_string(&entry()).unwrap();
-        assert!(line.starts_with(r#"{"schema_version":6,"#), "{line}");
+        assert!(line.starts_with(r#"{"schema_version":7,"#), "{line}");
     }
 
     #[test]
@@ -947,6 +982,7 @@ mod tests {
         e.meta.insert("actor".into(), "human".into());
         e.status = None;
         e.error = Some("sending request: connection refused".into());
+        e.peer = Some("[2001:db8::1]:8443".parse().unwrap());
         let back: TrafficEntry = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
         assert_eq!(back, e);
     }

@@ -5,6 +5,7 @@ mod cli;
 mod deploy;
 mod history;
 mod intercept;
+mod peer;
 mod proxy;
 mod replay;
 mod storage;

@@ -598,6 +598,7 @@ mod tests {
             meta: Default::default(),
             error: None,
             origin: crate::storage::Origin::Proxy,
+            peer: None,
         }
     }
 
@@ -1182,6 +1183,7 @@ mod tests {
         );
         assert_eq!(json["req_body"], "AP8fiw==");
         assert_eq!(json["req_body_encoding"], "base64");
+        assert_eq!(json["peer"], format!("127.0.0.1:{port}"), "where it went");
 
         let echoed: serde_json::Value =
             serde_json::from_str(json["res_body"].as_str().unwrap()).unwrap();

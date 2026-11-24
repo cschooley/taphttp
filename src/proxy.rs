@@ -4,6 +4,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
+use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use rustls::ClientConfig;
 use std::collections::HashMap;
@@ -21,6 +22,7 @@ use crate::ca::Ca;
 use crate::cli::StartArgs;
 use crate::deploy::{self, Cidr, Exposure, ProxyCredentials};
 use crate::intercept::{self, Decision, InterceptEvent, RequestEvent, ResponseEvent};
+use crate::peer::{PeerSlot, RecordPeer};
 use crate::storage::{Headers, Store, TrafficEntry};
 use taphttp_types::{encode_body, header_value_to_string};
 
@@ -499,7 +501,7 @@ async fn forward_https(
 
     let start = Instant::now();
     let upstream_req = build_upstream_request(&method, &url, &req_headers, req_body_bytes.clone())?;
-    let res = send_https(upstream_req).await;
+    let (res, peer) = send_https(upstream_req).await;
     let duration_ms = start.elapsed().as_millis() as u64;
 
     let mut upstream_error = None;
@@ -570,6 +572,7 @@ async fn forward_https(
         meta: Default::default(),
         error: upstream_error,
         origin: crate::storage::Origin::Proxy,
+        peer: peer.get(),
     };
 
     tracing::info!(
@@ -596,14 +599,18 @@ async fn passthrough_https(req: Request<Incoming>) -> Result<Response<Full<Bytes
     let (parts, body) = req.into_parts();
     let body_bytes = body.collect().await?.to_bytes();
     let upstream = rebuild_request(&parts, body_bytes, &url)?;
-    let res = send_https(upstream).await?;
+    let res = send_https(upstream).await.0?;
     let status = res.status().as_u16();
     let headers = res.headers().clone();
     let body = res.into_body().collect().await?.to_bytes();
     client_response(status, &headers, body)
 }
 
-async fn send_https(req: Request<Full<Bytes>>) -> Result<Response<Incoming>> {
+/// Send `req` over a fresh client; the slot says where it connected.
+async fn send_https(req: Request<Full<Bytes>>) -> (Result<Response<Incoming>>, PeerSlot) {
+    let mut http = HttpConnector::new();
+    http.enforce_http(false);
+    let (http, peer) = RecordPeer::new(http);
     let mut root_store = rustls::RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let tls = ClientConfig::builder()
@@ -613,10 +620,11 @@ async fn send_https(req: Request<Full<Bytes>>) -> Result<Response<Incoming>> {
         .with_tls_config(tls)
         .https_or_http()
         .enable_http1()
-        .build();
+        .wrap_connector(http);
     let client = hyper_util::client::legacy::Client::builder(TokioExecutor::new())
         .build::<_, Full<Bytes>>(https);
-    client.request(req).await.context("https upstream request")
+    let res = client.request(req).await.context("https upstream request");
+    (res, peer)
 }
 
 async fn handle_http(
@@ -673,7 +681,7 @@ async fn handle_http(
 
     let start = Instant::now();
     let upstream_req = build_upstream_request(&method, &url, &req_headers, req_body_bytes.clone())?;
-    let res = forward_http_request(upstream_req).await;
+    let (res, peer) = forward_http_request(upstream_req).await;
     let duration_ms = start.elapsed().as_millis() as u64;
 
     let mut upstream_error = None;
@@ -744,6 +752,7 @@ async fn handle_http(
         meta: Default::default(),
         error: upstream_error,
         origin: crate::storage::Origin::Proxy,
+        peer: peer.get(),
     };
 
     tracing::info!(
@@ -770,18 +779,20 @@ async fn forward_http_raw(req: Request<Incoming>) -> Result<Response<Full<Bytes>
     let (parts, body) = req.into_parts();
     let body_bytes = body.collect().await?.to_bytes();
     let upstream = rebuild_request(&parts, body_bytes, &url)?;
-    let res = forward_http_request(upstream).await?;
+    let res = forward_http_request(upstream).await.0?;
     let status = res.status().as_u16();
     let headers = res.headers().clone();
     let body = res.into_body().collect().await?.to_bytes();
     client_response(status, &headers, body)
 }
 
-async fn forward_http_request(req: Request<Full<Bytes>>) -> Result<Response<Incoming>> {
-    let connector = hyper_util::client::legacy::connect::HttpConnector::new();
+/// Send `req` over a fresh client; the slot says where it connected.
+async fn forward_http_request(req: Request<Full<Bytes>>) -> (Result<Response<Incoming>>, PeerSlot) {
+    let (connector, peer) = RecordPeer::new(HttpConnector::new());
     let client = hyper_util::client::legacy::Client::builder(TokioExecutor::new())
         .build::<_, Full<Bytes>>(connector);
-    client.request(req).await.context("http upstream request")
+    let res = client.request(req).await.context("http upstream request");
+    (res, peer)
 }
 
 fn build_upstream_request(
@@ -1246,6 +1257,8 @@ mod tests {
         assert_eq!(entry.status, Some(200));
         assert!(entry.url.contains("/probe"), "url was: {}", entry.url);
         assert!(entry.duration_ms.is_some());
+        let to: std::net::SocketAddr = format!("127.0.0.1:{echo_port}").parse().unwrap();
+        assert_eq!(entry.peer, Some(to), "the upstream it connected to");
     }
 
     #[tokio::test]
@@ -1267,6 +1280,7 @@ mod tests {
         let error = entry.error.expect("the failure is recorded");
         assert!(error.to_lowercase().contains("connect"), "{error}");
         assert!(entry.meta.is_empty());
+        assert_eq!(entry.peer, None, "never connected");
     }
 
     /// Upstream that answers with two Set-Cookie headers, a header value that
@@ -1932,6 +1946,36 @@ mod tests {
             "MITM'd HTTPS"
         );
         assert_eq!(entries[0].source.as_deref(), Some("agent.T-3"));
+    }
+
+    #[tokio::test]
+    async fn mitm_records_the_upstream_peer_even_when_tls_fails() {
+        // Accepts TCP, then hangs up: the upstream TLS handshake fails, but
+        // taphttp did connect there.
+        let up = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((s, _)) = up.accept().await {
+                drop(s);
+            }
+        });
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("t.jsonl");
+        let port = start_proxy_with(dir.path(), &log, ProxyConfig::default()).await;
+        let authority = format!("localhost:{}", up_addr.port());
+        let (status, tls) = connect_tunnel(port, &authority, None, dir.path()).await;
+        assert_eq!(status, 200);
+        let req = Request::get("/peer")
+            .header("host", "localhost")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let (parts, _) = request_over(tls.unwrap(), req).await;
+        assert_eq!(parts.status, 502);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let entries = logged(&log);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].error.is_some());
+        assert_eq!(entries[0].peer, Some(up_addr));
     }
 
     #[tokio::test]

@@ -200,6 +200,7 @@ pub async fn send_new(
         meta: spec.meta.clone(),
         error: None,
         origin: Origin::Send,
+        peer: None,
     };
     template.set_req_body(&spec.body);
     exchange(store, template, spec.body.clone(), own).await
@@ -268,6 +269,8 @@ async fn exchange(
         res_headers: outcome.headers,
         duration_ms: Some(duration_ms),
         error: outcome.error,
+        // Where this attempt went; a replay's original may have gone elsewhere.
+        peer: outcome.peer,
         ..template
     };
     entry.set_res_body(&outcome.body);
@@ -365,6 +368,8 @@ struct Outcome {
     headers: Headers,
     body: Bytes,
     error: Option<String>,
+    /// The address connected to, if a connection was made.
+    peer: Option<SocketAddr>,
 }
 
 /// A resolver that answers with addresses already looked up and checked.
@@ -393,6 +398,7 @@ impl tower::Service<Name> for Pinned {
 async fn send(req: Request<Full<Bytes>>, addrs: Vec<SocketAddr>) -> Outcome {
     let mut http = HttpConnector::new_with_resolver(Pinned(Arc::new(addrs)));
     http.enforce_http(false);
+    let (http, peer) = crate::peer::RecordPeer::new(http);
     let res = if req.uri().scheme_str() == Some("https") {
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -415,6 +421,7 @@ async fn send(req: Request<Full<Bytes>>, addrs: Vec<SocketAddr>) -> Outcome {
         Err(e) => {
             return Outcome {
                 error: Some(format!("sending request: {}", error_chain(&e))),
+                peer: peer.get(),
                 ..Default::default()
             }
         }
@@ -428,12 +435,14 @@ async fn send(req: Request<Full<Bytes>>, addrs: Vec<SocketAddr>) -> Outcome {
             headers,
             body: body.to_bytes(),
             error: None,
+            peer: peer.get(),
         },
         Err(e) => Outcome {
             status,
             headers,
             body: Bytes::new(),
             error: Some(format!("reading response body: {}", error_chain(&e))),
+            peer: peer.get(),
         },
     }
 }
@@ -565,6 +574,7 @@ mod tests {
             meta: Default::default(),
             error: None,
             origin: crate::storage::Origin::Proxy,
+            peer: None,
         }
     }
 
@@ -878,6 +888,8 @@ mod tests {
         assert_eq!(entry.host, "127.0.0.1");
         assert_eq!(entry.status, Some(200));
         assert_eq!(entry.req_body_bytes().unwrap(), Some(vec![0, 0xff, 7]));
+        let to: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        assert_eq!(entry.peer, Some(to), "the address it connected to");
         assert_eq!(entry.req_headers.get("user-agent"), Some(USER_AGENT));
         let logged = storage::load_entries(&log).unwrap();
         assert_eq!(logged, [entry], "recorded once, as returned");
@@ -994,6 +1006,7 @@ mod tests {
                 .starts_with("resolving host"),
             "{entry:?}"
         );
+        assert_eq!(entry.peer, None);
         assert_eq!(storage::load_entries(&log).unwrap().len(), 1);
     }
 
@@ -1203,6 +1216,12 @@ mod tests {
             error.to_lowercase().contains("certificate"),
             "TLS was attempted and the cert checked: {error}"
         );
+        let to: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        assert_eq!(
+            entry.peer,
+            Some(to),
+            "connected, so known despite TLS failing"
+        );
     }
 
     fn agent_meta() -> BTreeMap<String, String> {
@@ -1258,12 +1277,19 @@ mod tests {
         original.error = Some("old failure".into());
         // Replaying a sent request is still a replay.
         original.origin = crate::storage::Origin::Send;
+        original.peer = Some("192.0.2.1:9".parse().unwrap());
         let replay = replay_entry(&store, original, &ReplayMods::default())
             .await
             .unwrap();
         assert!(replay.meta.is_empty());
         assert_eq!(replay.error, None);
         assert_eq!(replay.origin, crate::storage::Origin::Replay);
+        let to: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        assert_eq!(
+            replay.peer,
+            Some(to),
+            "where the replay went, not the original"
+        );
     }
 
     #[test]
@@ -1313,6 +1339,7 @@ mod tests {
         assert!(entry.res_headers.is_empty() && entry.res_body.is_none());
         let error = entry.error.as_deref().unwrap();
         assert!(error.contains("connect"), "{error}");
+        assert_eq!(entry.peer, None, "never connected");
         assert_eq!(entry.meta, agent_meta());
         let logged = storage::load_entries(&log).unwrap();
         assert_eq!(logged.len(), 1, "exactly one recorded exchange");
@@ -1353,6 +1380,7 @@ mod tests {
         assert_eq!(entry.res_headers.get("x-up"), Some("yes"));
         let error = entry.error.as_deref().unwrap();
         assert!(error.contains("response body"), "{error}");
+        assert!(entry.peer.is_some(), "the head arrived, so it connected");
     }
 
     #[tokio::test]
@@ -1468,6 +1496,7 @@ mod tests {
             meta: Default::default(),
             error: None,
             origin: crate::storage::Origin::Proxy,
+            peer: None,
         };
 
         JsonLinesBackend::new(&data_dir.join("traffic.jsonl"))
@@ -1518,6 +1547,7 @@ mod tests {
             meta: Default::default(),
             error: None,
             origin: crate::storage::Origin::Proxy,
+            peer: None,
         };
 
         JsonLinesBackend::new(&data_dir.join("traffic.jsonl"))
@@ -1620,6 +1650,7 @@ mod tests {
                 meta: Default::default(),
                 error: None,
                 origin: crate::storage::Origin::Proxy,
+                peer: None,
             })
             .unwrap();
 

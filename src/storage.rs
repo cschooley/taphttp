@@ -66,7 +66,7 @@ pub struct SqliteBackend {
 
 /// Columns of the `traffic` table, in insert order. v1/v2 databases have
 /// only the first eleven; [`SqliteBackend::new`] adds the rest.
-const SQLITE_COLUMNS: [(&str, &str); 20] = [
+const SQLITE_COLUMNS: [(&str, &str); 21] = [
     ("id", "TEXT PRIMARY KEY"),
     ("ts", "TEXT NOT NULL"),
     ("host", "TEXT NOT NULL"),
@@ -94,6 +94,8 @@ const SQLITE_COLUMNS: [(&str, &str); 20] = [
     ("error", "TEXT"),
     // v6: how the exchange was recorded (`proxy`, `replay`, `send`).
     ("origin", "TEXT"),
+    // v7: the upstream address taphttp connected to (`ip:port` text).
+    ("peer", "TEXT"),
 ];
 
 impl SqliteBackend {
@@ -183,6 +185,7 @@ impl SqliteBackend {
                 },
                 e.error,
                 origin_str(e.origin),
+                e.peer.map(|p| p.to_string()),
             ],
         )?;
         Ok(())
@@ -440,6 +443,7 @@ mod tests {
             meta: Default::default(),
             error: None,
             origin: crate::storage::Origin::Proxy,
+            peer: None,
         }
     }
 

@@ -335,7 +335,7 @@ key, the API token, proxy credentials or usernames, or filesystem paths.
 ```json
 {
   "taphttp_version": "0.7.0",
-  "schema_version": 6,
+  "schema_version": 7,
   "started_at": "2026-11-21T20:39:05.908Z",
   "expires_at": null,
   "proxy": {
@@ -596,7 +596,7 @@ Each line is one exchange (shown pretty-printed here):
 
 ```json
 {
-  "schema_version": 6,
+  "schema_version": 7,
   "id": "3f2a1b4c-8d9e-4a7b-b3c1-2e5f6a7d8e9f",
   "ts": "2026-07-02T14:23:01.123Z",
   "host": "example.com",
@@ -618,12 +618,13 @@ Each line is one exchange (shown pretty-printed here):
   "source": "agent.T-3",
   "meta": {},
   "error": null,
-  "origin": "proxy"
+  "origin": "proxy",
+  "peer": "93.184.215.14:443"
 }
 ```
 
 - `schema_version` is on every line, so a tool tailing the log can detect a
-  breaking change. The current version is 6.
+  breaking change. The current version is 7.
 - Headers are `[name, value]` pairs in wire order. Repeated headers (several
   `Set-Cookie`s, say) each get a pair. A value that isn't valid UTF-8 is
   kept with the bad bytes replaced by U+FFFD, not dropped.
@@ -642,6 +643,12 @@ Each line is one exchange (shown pretty-printed here):
 - `origin` is how the exchange was recorded: `"proxy"` (a client sent it
   through the proxy), `"replay"` (`taphttp replay` or `POST /replay`) or
   `"send"` (`POST /send`).
+- `peer` is the upstream address taphttp connected to, as it resolved and
+  dialled it (`"203.0.113.7:443"`, `"[2001:db8::1]:443"`). It is recorded
+  as soon as the TCP connection is up, so it's set even when TLS or the
+  response then fails, and `null` only when no connection was made (the
+  host didn't resolve or couldn't be reached). Compare it with where a host
+  resolves now to spot a target that has moved.
 
 To decode base64 bodies with jq: `jq -r 'select(.res_body_encoding=="base64") | .res_body | @base64d'`.
 
@@ -649,6 +656,7 @@ To decode base64 bodies with jq: `jq -r 'select(.res_body_encoding=="base64") | 
 
 | Version | Change |
 |---|---|
+| 7 | `peer` (the upstream address connected to) |
 | 6 | `origin` (`proxy`, `replay` or `send`); `POST /send` |
 | 5 | `meta` (replay attribution) and `error` (why there's no complete response); failed replays are recorded |
 | 4 | `source` (proxy-auth username) |
@@ -656,12 +664,13 @@ To decode base64 bodies with jq: `jq -r 'select(.res_body_encoding=="base64") | 
 | 2 | `replay_of` |
 | 1 | Initial |
 
-taphttp still reads v1 to v5 logs and databases (`show`, `replay`, the
+taphttp still reads v1 to v6 logs and databases (`show`, `replay`, the
 lever API): a header map is read as pairs, a missing encoding means `utf8`,
 a missing `source` or `error` means `null`, a missing `meta` means `{}`, and
 a missing `origin` is `replay` when `replay_of` is set and `proxy`
-otherwise (sqlite rows are filled in on first open). Anything taphttp writes
-or re-emits (`show --json`, `/exchanges`) is v6.
+otherwise (sqlite rows are filled in on first open). A missing `peer` is
+`null`: older entries don't say where they went. Anything taphttp writes or
+re-emits (`show --json`, `/exchanges`) is v7.
 
 ### Using the types from Rust
 

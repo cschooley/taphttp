@@ -99,7 +99,7 @@ impl From<rusqlite::Error> for HistoryError {
 }
 
 const COLUMNS: &str = "rowid, id, ts, host, method, url, req_headers, req_body, \
-    req_body_encoding, status, res_headers, res_body, res_body_encoding, duration_ms, replay_of, source, meta, error, origin";
+    req_body_encoding, status, res_headers, res_body, res_body_encoding, duration_ms, replay_of, source, meta, error, origin, peer";
 
 impl SqliteBackend {
     /// Newest first, filtered, at most `limit` entries.
@@ -273,6 +273,10 @@ fn row_to_entry(r: &Row) -> rusqlite::Result<(i64, TrafficEntry)> {
             Some(other) => return Err(conversion(18, format!("unknown origin {other:?}").into())),
         },
         replay_of,
+        peer: match r.get::<_, Option<String>>(19)? {
+            Some(text) => Some(text.parse().map_err(|e| conversion(19, Box::new(e)))?),
+            None => None,
+        },
     };
     Ok((r.get(0)?, entry))
 }
@@ -302,6 +306,7 @@ mod tests {
             meta: Default::default(),
             error: None,
             origin: crate::storage::Origin::Proxy,
+            peer: None,
         }
     }
 
@@ -728,6 +733,22 @@ mod tests {
     }
 
     #[test]
+    fn peer_round_trips_v4_and_v6_addresses() {
+        let dir = TempDir::new().unwrap();
+        let db = SqliteBackend::new(&dir.path().join("t.db")).unwrap();
+        for (id, peer) in [
+            ("v4", Some("203.0.113.7:443")),
+            ("v6", Some("[2001:db8::1]:8443")),
+            ("none", None),
+        ] {
+            let mut e = entry(id, "h", "GET", 200, "/");
+            e.peer = peer.map(|p| p.parse().unwrap());
+            db.append(&e).unwrap();
+            assert_eq!(db.get(id).unwrap().unwrap().peer, e.peer, "{id}");
+        }
+    }
+
+    #[test]
     fn rows_from_before_v6_get_an_origin_from_replay_of() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("t.db");
@@ -748,6 +769,11 @@ mod tests {
         let db = SqliteBackend::new(&path).unwrap();
         assert_eq!(db.get("old").unwrap().unwrap().origin, Origin::Proxy);
         assert_eq!(db.get("again").unwrap().unwrap().origin, Origin::Replay);
+        assert_eq!(
+            db.get("old").unwrap().unwrap().peer,
+            None,
+            "pre-v7: no peer"
+        );
         let only = |o| -> Vec<String> {
             db.query(&HistoryQuery {
                 origin: Some(o),
