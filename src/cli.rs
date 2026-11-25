@@ -113,6 +113,18 @@ pub struct StartArgs {
     #[arg(long)]
     pub proxy_auth_api: bool,
 
+    /// Also serve a proxy listener on this address that accepts only
+    /// credentials: ones issued through the lever API (POST /clients) or
+    /// --proxy-auth-file users. --listen keeps its own settings, and
+    /// --allow-client applies to --listen only. Uses --proxy-tls if set.
+    #[arg(long, value_name = "ADDR")]
+    pub auth_listen: Option<String>,
+
+    /// Allow a non-loopback --auth-listen without --proxy-tls. Only for a
+    /// private network (e.g. an internal compose network).
+    #[arg(long)]
+    pub auth_listen_allow_plaintext: bool,
+
     /// Stop after this: a duration (90s, 30m, 8h, 2d) or an RFC 3339 time.
     /// Requests are refused from then on and taphttp exits.
     #[arg(long, value_name = "WHEN")]

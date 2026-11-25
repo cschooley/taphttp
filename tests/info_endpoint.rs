@@ -428,3 +428,143 @@ fn b64(bytes: &[u8]) -> String {
     }
     out
 }
+
+/// One proxied GET; the raw response ("" if the proxy closed the
+/// connection without answering).
+fn proxy_raw(proxy: &str, url: &str, auth: Option<&str>) -> String {
+    let mut s = TcpStream::connect(proxy).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let auth = auth
+        .map(|a| format!("Proxy-Authorization: {a}\r\n"))
+        .unwrap_or_default();
+    let _ = write!(
+        s,
+        "GET {url} HTTP/1.1\r\nHost: x\r\n{auth}Connection: close\r\n\r\n"
+    );
+    let mut raw = Vec::new();
+    let _ = s.read_to_end(&mut raw);
+    String::from_utf8_lossy(&raw).into_owned()
+}
+
+/// An upstream that answers every request `200 ok`.
+fn tiny_upstream() -> String {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        for mut s in l.incoming().flatten() {
+            let mut buf = Vec::new();
+            let mut byte = [0u8; 1];
+            while !buf.ends_with(b"\r\n\r\n") && s.read(&mut byte).unwrap_or(0) == 1 {
+                buf.push(byte[0]);
+            }
+            let _ =
+                s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+        }
+    });
+    addr
+}
+
+#[test]
+fn auth_listen_demands_credentials_while_listen_keeps_its_own_settings() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let token_file = dir.path().join("tok");
+    std::fs::write(&token_file, TOKEN).unwrap();
+    let t = start(
+        dir.path(),
+        &[
+            "--listen",
+            "127.0.0.1:0",
+            "--api-listen",
+            "127.0.0.1:0",
+            "--api-token-file",
+            token_file.to_str().unwrap(),
+            "--auth-listen",
+            "127.0.0.1:0",
+            // Fences --listen only: this test's own client is outside it.
+            "--allow-client",
+            "10.0.0.0/8",
+        ],
+    );
+    assert!(t.banner.contains("auth proxy: 127.0.0.1:0"), "{}", t.banner);
+    let (_, body) = get(&t.api, "/info", Some(TOKEN));
+    let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let auth = info["auth_proxy"]["listen"].as_str().unwrap().to_string();
+    assert!(
+        auth.starts_with("127.0.0.1:") && !auth.ends_with(":0"),
+        "{auth}"
+    );
+    assert_eq!(info["auth_proxy"]["auth"], "issued");
+    assert_eq!(info["auth_proxy"]["tls"], false);
+    let open = info["proxy"]["listen"].as_str().unwrap().to_string();
+
+    let up = tiny_upstream();
+    let target = format!("http://{up}/");
+    assert!(
+        proxy_raw(&open, &target, None).is_empty(),
+        "--allow-client still fences --listen"
+    );
+    assert!(proxy_raw(&auth, &target, None).starts_with("HTTP/1.1 407"));
+    let label = format!("Basic {}", b64(b"agent.T-3:x"));
+    assert!(
+        proxy_raw(&auth, &target, Some(&label)).starts_with("HTTP/1.1 407"),
+        "a self-reported label isn't a credential here"
+    );
+
+    let (status, body) = post(
+        &t.api,
+        "/clients",
+        TOKEN,
+        &serde_json::json!({"allow": ["127.0.0.1"], "meta": {"task": "T-9"}}),
+    );
+    assert_eq!(status, 201, "{body}");
+    let issued: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let basic = format!(
+        "Basic {}",
+        b64(format!(
+            "{}:{}",
+            issued["username"].as_str().unwrap(),
+            issued["password"].as_str().unwrap()
+        )
+        .as_bytes())
+    );
+    let ok = proxy_raw(&auth, &target, Some(&basic));
+    assert!(ok.starts_with("HTTP/1.1 200") && ok.ends_with("ok"), "{ok}");
+    let (_, sent) = get(&t.api, "/exchanges?refused=false", Some(TOKEN));
+    let sent: serde_json::Value = serde_json::from_str(&sent).unwrap();
+    assert_eq!(sent[0]["source"], issued["id"]);
+    assert_eq!(sent[0]["meta"]["task"], "T-9");
+
+    // The auth listener is one of taphttp's own: not a target for an issued
+    // credential, /send or /replay.
+    let own = proxy_raw(&auth, &format!("http://{auth}/"), Some(&basic));
+    assert!(own.starts_with("HTTP/1.1 403"), "{own}");
+    let (status, body) = post(
+        &t.api,
+        "/send",
+        TOKEN,
+        &serde_json::json!({"url": format!("http://{auth}/")}),
+    );
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("own listeners"), "{body}");
+}
+
+#[test]
+fn auth_listen_needs_somewhere_credentials_come_from() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_taphttp"))
+        .arg("--data-dir")
+        .arg(dir.path())
+        .args([
+            "start",
+            "--listen",
+            "127.0.0.1:0",
+            "--auth-listen",
+            "127.0.0.1:0",
+        ])
+        .env_remove("TAPHTTP_PROXY_AUTH")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--auth-listen"), "{stderr}");
+}

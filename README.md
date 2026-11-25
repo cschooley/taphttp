@@ -218,6 +218,8 @@ separate pairs.
 | `--allow-open-proxy` | off | Allow a non-loopback `--listen` without auth + TLS (private networks only) |
 | `--api-allow-plaintext` | off | Allow a non-loopback `--api-listen` without TLS (private networks only) |
 | `--api-no-send` | off | Turn off the lever API's `POST /send`, leaving observation and replay |
+| `--auth-listen` | — | Also serve a proxy listener that accepts only credentials: [issued ones](#issued-proxy-credentials-clients) or `--proxy-auth-file` users. See [A credential-only listener](#a-credential-only-listener-for-sandboxes) |
+| `--auth-listen-allow-plaintext` | off | Allow a non-loopback `--auth-listen` without `--proxy-tls` (private networks only) |
 | `--proxy-auth-api` | off | Require every proxy client to use a credential [issued through the lever API](#issued-proxy-credentials-clients) (or one from `--proxy-auth-file`). Needs `--api-listen`; counts as proxy auth off loopback |
 | `--expires` | never | Refuse traffic and exit after this: `8h`, `30m`, `2d`, or an RFC 3339 time |
 
@@ -356,6 +358,7 @@ key, the API token, proxy credentials or usernames, or filesystem paths.
     "allow_client": []
   },
   "api": { "listen": "0.0.0.0:8081", "tls": false, "send": true },
+  "auth_proxy": { "listen": "0.0.0.0:8090", "tls": false, "auth": "issued" },
   "ca": {
     "subject": "CN=taphttp local CA, O=taphttp",
     "sha256": "EB:6F:71:…:3A",
@@ -374,6 +377,9 @@ key, the API token, proxy credentials or usernames, or filesystem paths.
   read from `ca.crt`.
 - `expires_at` is `--expires`, or `null`.
 - `api.send` is whether `POST /send` is on (`--api-no-send` turns it off).
+- `auth_proxy` is the `--auth-listen` listener, or `null`. `auth: "issued"`
+  means every client there must present a credential: check it before
+  routing a client there.
 - New fields may be added; ignore ones you don't know.
 
 #### `GET /ca.pem`, `GET /ca.der`
@@ -642,6 +648,7 @@ credentials, so it **refuses to start** in an unsafe configuration:
 |---|---|---|
 | Proxy (`--listen`) | nothing | proxy auth **and** `--proxy-tls`, or `--allow-open-proxy` |
 | Lever API (`--api-listen`) | nothing | `--api-tls`, or `--api-allow-plaintext` |
+| Credential-only proxy (`--auth-listen`) | `--api-listen` or `--proxy-auth-file` | the same, plus `--proxy-tls`, or `--auth-listen-allow-plaintext` |
 
 A remote setup:
 
@@ -672,13 +679,42 @@ taphttp start --listen 0.0.0.0:8443 --proxy-tls --proxy-auth-file proxy-auth \
 - **`--expires`** refuses traffic from then on and exits (status 0). A box
   forgotten on a client network stops working. With a restart policy, use an
   absolute time: a relative `8h` restarts the clock.
-- **The startup banner** states the mode, bound addresses, TLS, access
-  control and expiry, on stderr and in the `RUST_LOG=info` log, so there's a
+- **The startup banner** states the mode, bound addresses (including
+  `--auth-listen`), TLS, access control and expiry, on stderr and in the `RUST_LOG=info` log, so there's a
   record of what the deployment was doing.
 - **Compose and other private networks** bind `0.0.0.0` inside a container
   whose port is published on `127.0.0.1`. That's what `--allow-open-proxy`
   and `--api-allow-plaintext` are for. The Docker image's default command
   passes `--allow-open-proxy`.
+
+### A credential-only listener for sandboxes
+
+`--auth-listen ADDR` adds a second proxy listener where **every** client
+must present a credential: one [issued with `POST /clients`](#issued-proxy-credentials-clients)
+(enforcing its allowlist, rate and budget), or a `--proxy-auth-file` user.
+Anything else gets `407`. The main `--listen` keeps its own settings, so a
+tester's browser can stay on the open listener while an agent's sandbox is
+locked to this one.
+
+Both listeners share the CA, the recording, `/feed`, the intercept hook and
+`--expires`. A refused request is a `403`/`429` and is recorded with
+`refused: true`, as on any listener. `--proxy-tls` applies to both.
+**`--allow-client` applies to `--listen` only**, which is how you keep the
+open listener out of the sandbox's reach when taphttp joins the sandbox
+network:
+
+```sh
+taphttp start --listen 0.0.0.0:8080 --allow-open-proxy --allow-client 172.20.0.0/16 \
+  --auth-listen 0.0.0.0:8090 --auth-listen-allow-plaintext \
+  --api-listen 0.0.0.0:8081 --api-allow-plaintext --api-token-file /run/taphttp/api-token
+```
+
+Here `172.20.0.0/16` is the default (tester-facing) network. The sandboxes
+sit on an `internal: true` network whose only other member is taphttp,
+reaching it on `:8090`. The open `:8080` drops their connections without a
+byte. `--auth-listen-allow-plaintext` is only for such a private network.
+Elsewhere, use `--proxy-tls`. `GET /info` reports the listener as
+`auth_proxy`.
 
 ### Teardown
 
@@ -688,7 +724,9 @@ When an engagement ends, delete what the deployment holds:
   `ca.crt` from every client trust store it was installed in;
 - the traffic: the sqlite file (`--db`, plus its `-wal` / `-shm` files) and
   any `--log-file`;
-- the API token file and the proxy credentials file;
+- the API token file and the proxy credentials file (issued credentials
+  live in memory and end with the process; `DELETE /clients` ends them
+  sooner);
 - for Docker, the volumes: `docker volume rm` the CA, data and token volumes.
 
 ## Attribution: who sent each exchange

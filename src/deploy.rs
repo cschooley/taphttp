@@ -31,6 +31,13 @@ pub struct Exposure {
     pub api: Option<SocketAddr>,
     pub api_tls: bool,
     pub api_allow_plaintext: bool,
+    /// `--auth-listen`: a proxy listener that only accepts credentials.
+    /// Uses `--proxy-tls` like `--listen`.
+    pub auth_proxy: Option<SocketAddr>,
+    pub auth_proxy_allow_plaintext: bool,
+    /// `--proxy-auth-file` users exist (besides credentials the lever API
+    /// issues).
+    pub file_users: bool,
 }
 
 /// Refuse the unsafe combinations, saying what to do instead.
@@ -53,6 +60,21 @@ pub fn check_exposure(e: &Exposure) -> Result<()> {
                     missing.join(" and ")
                 );
             }
+        }
+    }
+    if let Some(addr) = e.auth_proxy {
+        if e.api.is_none() && !e.file_users {
+            bail!(
+                "--auth-listen {addr} accepts only credentials, and none can exist: pass \
+                 --api-listen (to issue them with POST /clients) or --proxy-auth-file."
+            );
+        }
+        if !addr.ip().is_loopback() && !e.proxy_tls && !e.auth_proxy_allow_plaintext {
+            bail!(
+                "refusing to listen on {addr} (--auth-listen) in plaintext: proxy credentials would \
+                 cross the network in the clear. Pass --proxy-tls, or, if only a private network \
+                 can reach it (e.g. an internal compose network), --auth-listen-allow-plaintext."
+            );
         }
     }
     if let Some(addr) = e.api {
@@ -139,6 +161,7 @@ pub fn client_allowed(allow: &[Cidr], ip: IpAddr) -> bool {
 // ---------------------------------------------------------------------------
 
 /// `user:password` pairs proxy clients must present (Basic auth).
+#[derive(Clone)]
 pub struct ProxyCredentials {
     users: Vec<(String, String)>,
 }
@@ -321,8 +344,10 @@ pub struct BannerInfo {
 
 pub fn banner(b: &BannerInfo) -> String {
     let e = &b.exposure;
-    let remote = e.proxy.is_some_and(|a| !a.ip().is_loopback())
-        || e.api.is_some_and(|a| !a.ip().is_loopback());
+    let remote = [e.proxy, e.api, e.auth_proxy]
+        .iter()
+        .flatten()
+        .any(|a| !a.ip().is_loopback());
     let mut out = String::new();
     let _ = writeln!(
         out,
@@ -363,6 +388,24 @@ pub fn banner(b: &BannerInfo) -> String {
             access.join(" + ")
         );
     }
+    if let Some(addr) = e.auth_proxy {
+        let transport = match (e.proxy_tls, e.auth_proxy_allow_plaintext) {
+            (true, _) => "TLS",
+            (false, true) if !addr.ip().is_loopback() => {
+                "plaintext (--auth-listen-allow-plaintext)"
+            }
+            _ => "plaintext",
+        };
+        let access = match (e.api.is_some(), b.proxy_users) {
+            (true, 0) => "issued credentials only".to_string(),
+            (true, n) => format!(
+                "issued credentials + {n} file user{}",
+                if n == 1 { "" } else { "s" }
+            ),
+            (false, n) => format!("{n} file user{}", if n == 1 { "" } else { "s" }),
+        };
+        let _ = writeln!(out, "  auth proxy: {addr} {transport}; access: {access}");
+    }
     if let Some(addr) = e.api {
         let transport = match (e.api_tls, e.api_allow_plaintext) {
             (true, _) => "TLS",
@@ -398,6 +441,8 @@ pub struct DeploymentInfo {
     pub expires_at: Option<Timestamp>,
     pub proxy: ProxyInfo,
     pub api: ApiInfo,
+    /// `--auth-listen`, or `null`.
+    pub auth_proxy: Option<AuthProxyInfo>,
     pub ca: crate::ca::CaPublicInfo,
     pub history: HistoryInfo,
 }
@@ -420,6 +465,15 @@ pub enum ProxyAuth {
     None,
     /// Credentials configured: `source` is the authenticated user.
     Basic,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AuthProxyInfo {
+    pub listen: SocketAddr,
+    pub tls: bool,
+    /// Always `"issued"`: every client must present a credential issued
+    /// with `POST /clients` (or a `--proxy-auth-file` user).
+    pub auth: &'static str,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -468,6 +522,11 @@ pub fn deployment_info(
             tls: e.api_tls,
             send,
         },
+        auth_proxy: e.auth_proxy.map(|listen| AuthProxyInfo {
+            listen,
+            tls: e.proxy_tls,
+            auth: "issued",
+        }),
         ca,
         history,
     })
@@ -824,6 +883,112 @@ mod tests {
         );
     }
 
+    #[test]
+    fn banner_states_the_auth_listener() {
+        let text = banner(&BannerInfo {
+            exposure: Exposure {
+                proxy: addr("127.0.0.1:8080"),
+                api: addr("127.0.0.1:8081"),
+                auth_proxy: addr("172.30.0.2:8090"),
+                auth_proxy_allow_plaintext: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        assert!(text.contains("mode: remote"), "{text}");
+        assert!(
+            text.contains(
+                "auth proxy: 172.30.0.2:8090 plaintext (--auth-listen-allow-plaintext); \
+                 access: issued credentials only"
+            ),
+            "{text}"
+        );
+    }
+
+    // --- auth listener (#27) ---
+
+    #[test]
+    fn auth_listener_off_loopback_needs_tls_or_its_own_opt_in() {
+        let base = Exposure {
+            proxy: addr("127.0.0.1:8080"),
+            api: addr("127.0.0.1:8081"),
+            auth_proxy: addr("0.0.0.0:8090"),
+            ..Default::default()
+        };
+        let err = check_exposure(&base).unwrap_err().to_string();
+        assert!(err.contains("--auth-listen-allow-plaintext"), "{err}");
+        // --allow-open-proxy is about --listen; it doesn't cover this one.
+        assert!(check_exposure(&Exposure {
+            allow_open_proxy: true,
+            ..base.clone()
+        })
+        .is_err());
+        for ok in [
+            Exposure {
+                proxy_tls: true,
+                ..base.clone()
+            },
+            Exposure {
+                auth_proxy_allow_plaintext: true,
+                ..base.clone()
+            },
+            Exposure {
+                auth_proxy: addr("127.0.0.1:8090"),
+                ..base.clone()
+            },
+        ] {
+            check_exposure(&ok).unwrap();
+        }
+    }
+
+    #[test]
+    fn auth_listener_needs_somewhere_credentials_come_from() {
+        let e = Exposure {
+            proxy: addr("127.0.0.1:8080"),
+            auth_proxy: addr("127.0.0.1:8090"),
+            ..Default::default()
+        };
+        let err = check_exposure(&e).unwrap_err().to_string();
+        assert!(
+            err.contains("--api-listen") && err.contains("--proxy-auth-file"),
+            "{err}"
+        );
+        check_exposure(&Exposure {
+            file_users: true,
+            ..e.clone()
+        })
+        .unwrap();
+        check_exposure(&Exposure {
+            api: addr("127.0.0.1:8081"),
+            ..e
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn deployment_info_reports_the_auth_listener() {
+        let b = BannerInfo {
+            exposure: Exposure {
+                proxy: addr("127.0.0.1:8080"),
+                api: addr("127.0.0.1:8081"),
+                auth_proxy: addr("0.0.0.0:8090"),
+                auth_proxy_allow_plaintext: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let history = HistoryInfo {
+            sqlite: true,
+            log_file: false,
+        };
+        let info = deployment_info(&b, ca_info(), history, Timestamp::now(), true).unwrap();
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(
+            json["auth_proxy"],
+            serde_json::json!({"listen": "0.0.0.0:8090", "tls": false, "auth": "issued"})
+        );
+    }
+
     // --- /info ---
 
     fn ca_info() -> crate::ca::CaPublicInfo {
@@ -873,6 +1038,7 @@ mod tests {
                     "allow_client": ["10.0.0.0/8", "::1/128"],
                 },
                 "api": {"listen": "10.0.0.5:8081", "tls": true, "send": false},
+                "auth_proxy": null,
                 "ca": {
                     "subject": "CN=taphttp local CA, O=taphttp",
                     "sha256": "AB:CD",

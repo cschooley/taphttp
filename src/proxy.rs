@@ -110,6 +110,11 @@ pub async fn run(args: StartArgs, data_dir: PathBuf) -> Result<()> {
         .as_deref()
         .map(|a| a.parse().context("invalid api-listen address"))
         .transpose()?;
+    let auth_addr: Option<SocketAddr> = args
+        .auth_listen
+        .as_deref()
+        .map(|a| a.parse().context("invalid auth-listen address"))
+        .transpose()?;
     let credentials = ProxyCredentials::load(
         args.proxy_auth_file.as_deref(),
         std::env::var("TAPHTTP_PROXY_AUTH").ok(),
@@ -132,6 +137,9 @@ pub async fn run(args: StartArgs, data_dir: PathBuf) -> Result<()> {
         api: api_addr,
         api_tls: args.api_tls,
         api_allow_plaintext: args.api_allow_plaintext,
+        auth_proxy: auth_addr,
+        auth_proxy_allow_plaintext: args.auth_listen_allow_plaintext,
+        file_users: credentials.is_some(),
     };
     if args.proxy_auth_api && api_addr.is_none() {
         anyhow::bail!(
@@ -144,6 +152,7 @@ pub async fn run(args: StartArgs, data_dir: PathBuf) -> Result<()> {
             &args.tls_name,
             &[
                 args.proxy_tls.then_some(addr),
+                auth_addr.filter(|_| args.proxy_tls),
                 api_addr.filter(|_| args.api_tls),
             ],
         )?
@@ -186,17 +195,34 @@ pub async fn run(args: StartArgs, data_dir: PathBuf) -> Result<()> {
     }
 
     let clients = api_addr.map(|_| Arc::new(crate::clients::Registry::default()));
-    let mut own_api = Vec::new();
+    // Every listener taphttp binds: what an issued credential, /send and
+    // /replay may never reach.
+    let mut own = Vec::new();
     let db = sqlite_path(&args, &data_dir);
     if let Some(db) = &db {
         eprintln!("recording to sqlite at {}", db.display());
     }
     let store = Store::new(args.log_file.as_deref(), db.as_deref())?;
     let listener = TcpListener::bind(addr).await.context("binding listener")?;
+    own.push(listener.local_addr()?);
+    let auth_listener = match auth_addr {
+        Some(a) => Some(
+            TcpListener::bind(a)
+                .await
+                .context("binding --auth-listen")?,
+        ),
+        None => None,
+    };
+    if let Some(l) = &auth_listener {
+        own.push(l.local_addr()?);
+    }
     let api_listener = match api_addr {
         Some(a) => Some(TcpListener::bind(a).await.context("binding lever API")?),
         None => None,
     };
+    if let Some(l) = &api_listener {
+        own.push(l.local_addr()?);
+    }
 
     // Optionally serve the lever API alongside the proxy, sharing the same
     // live Store so its /feed carries real traffic as it is recorded.
@@ -204,10 +230,11 @@ pub async fn run(args: StartArgs, data_dir: PathBuf) -> Result<()> {
         // /info reports where things actually listen (a port of 0 in
         // --listen becomes the real one).
         let mut described = info;
-        let own = vec![listener.local_addr()?, api_listener.local_addr()?];
-        own_api.push(own[1]);
-        described.exposure.proxy = Some(own[0]);
-        described.exposure.api = Some(own[1]);
+        described.exposure.proxy = Some(listener.local_addr()?);
+        described.exposure.api = Some(api_listener.local_addr()?);
+        if let Some(l) = &auth_listener {
+            described.exposure.auth_proxy = Some(l.local_addr()?);
+        }
         let history = deploy::HistoryInfo {
             sqlite: db.is_some(),
             log_file: args.log_file.is_some(),
@@ -240,7 +267,7 @@ pub async fn run(args: StartArgs, data_dir: PathBuf) -> Result<()> {
             token,
             info: deployment,
             ca_cert: ca.public_cert(),
-            own,
+            own: own.clone(),
             send_enabled: !args.api_no_send,
             clients: clients.clone().expect("the API is on"),
         });
@@ -256,16 +283,38 @@ pub async fn run(args: StartArgs, data_dir: PathBuf) -> Result<()> {
         });
     }
 
+    let tls = if args.proxy_tls { listener_tls } else { None };
+    if let Some(auth_listener) = auth_listener {
+        // The locked door: same CA, recording and hooks, but every client
+        // needs a credential, and --allow-client is --listen's alone.
+        let config = ProxyConfig {
+            filter_host: args.filter_host.clone(),
+            intercept_socket: args.intercept_socket.clone(),
+            allow_clients: Vec::new(),
+            credentials: credentials.clone(),
+            expires,
+            tls: tls.clone(),
+            clients: clients.clone(),
+            require_client: true,
+            own: own.clone(),
+        };
+        let (ca, store) = (ca.clone(), store.clone());
+        tokio::spawn(async move {
+            if let Err(e) = serve(auth_listener, ca, store, config).await {
+                tracing::error!("--auth-listen exited: {e}");
+            }
+        });
+    }
     let config = ProxyConfig {
         filter_host: args.filter_host,
         intercept_socket: args.intercept_socket,
         allow_clients,
         credentials,
         expires,
-        tls: if args.proxy_tls { listener_tls } else { None },
+        tls,
         clients,
         require_client: args.proxy_auth_api,
-        own: own_api,
+        own,
     };
     serve(listener, ca, store, config).await
 }
@@ -1247,6 +1296,8 @@ mod tests {
             allow_open_proxy: false,
             api_no_send: false,
             proxy_auth_api: false,
+            auth_listen: None,
+            auth_listen_allow_plaintext: false,
             api_allow_plaintext: false,
             expires: None,
         }
