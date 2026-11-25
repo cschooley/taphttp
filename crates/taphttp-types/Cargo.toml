@@ -1,6 +1,6 @@
 [package]
 name = "taphttp-types"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 rust-version = "1.87"
 description = "Traffic log types shared by taphttp and the tools that consume its output"

@@ -48,7 +48,7 @@ Release images are published to GHCR on every `v*` tag:
 docker run --rm -e RUST_LOG=info \
   -p 127.0.0.1:8080:8080 \
   -v taphttp-ca:/ca -v taphttp-data:/data \
-  ghcr.io/cschooley/taphttp:0.8.0
+  ghcr.io/cschooley/taphttp:0.9.0
 ```
 
 Or build it yourself (`docker build -t taphttp .`). From compose, use the image
@@ -57,8 +57,8 @@ or build straight from a tag:
 ```yaml
 services:
   taphttp:
-    image: ghcr.io/cschooley/taphttp:0.8.0
-    # or: build: https://github.com/cschooley/taphttp.git#v0.8.0
+    image: ghcr.io/cschooley/taphttp:0.9.0
+    # or: build: https://github.com/cschooley/taphttp.git#v0.9.0
     ports: ["127.0.0.1:8080:8080"]
     environment: { RUST_LOG: info }
     volumes: [taphttp-ca:/ca, taphttp-data:/data]
@@ -344,8 +344,8 @@ key, the API token, proxy credentials or usernames, or filesystem paths.
 
 ```json
 {
-  "taphttp_version": "0.8.0",
-  "schema_version": 7,
+  "taphttp_version": "0.9.0",
+  "schema_version": 8,
   "started_at": "2026-11-21T20:39:05.908Z",
   "expires_at": null,
   "proxy": {
@@ -722,7 +722,7 @@ Each line is one exchange (shown pretty-printed here):
 
 ```json
 {
-  "schema_version": 7,
+  "schema_version": 8,
   "id": "3f2a1b4c-8d9e-4a7b-b3c1-2e5f6a7d8e9f",
   "ts": "2026-07-02T14:23:01.123Z",
   "host": "example.com",
@@ -820,7 +820,7 @@ change. (Through taphttp-types 0.3.0, `ts` was a chrono `DateTime<Utc>`.)
 
 ```toml
 [dependencies]
-taphttp-types = { git = "https://github.com/cschooley/taphttp", tag = "v0.8.0" }
+taphttp-types = { git = "https://github.com/cschooley/taphttp", tag = "v0.9.0" }
 ```
 
 ```rust
