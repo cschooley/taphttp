@@ -1,0 +1,4 @@
+# The RFC 6455 sample WebSocket nonce ("the sample nonce", base64) in a test
+# handshake, not a secret. The test now generates its key; this is the copy
+# left in history.
+548b965dc3d841cf6fdc55c61b0e1cde2060536e:src/proxy.rs:generic-api-key:2219

@@ -2213,10 +2213,13 @@ mod tests {
     where
         IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
+        use tokio_tungstenite::tungstenite::handshake::{client::generate_key, derive_accept_key};
+        let key = generate_key();
+        let accept = derive_accept_key(key.as_bytes()).to_ascii_lowercase();
         let mut head = format!(
             "GET {target} HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\n\
              Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
-             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Sec-WebSocket-Key: {key}\r\n\
              Sec-WebSocket-Extensions: permessage-deflate\r\n"
         );
         if let Some(a) = auth {
@@ -2234,11 +2237,14 @@ mod tests {
         let status: u16 = head[9..12].parse().unwrap();
         if status == 101 {
             for needle in [
-                "sec-websocket-accept: s3pplmbitxaq9kygzzhzrbk+xoo=",
-                "upgrade: websocket",
-                "connection: upgrade",
+                format!("sec-websocket-accept: {accept}"),
+                "upgrade: websocket".into(),
+                "connection: upgrade".into(),
             ] {
-                assert!(head.contains(needle), "{needle} reaches the client: {head}");
+                assert!(
+                    head.contains(needle.as_str()),
+                    "{needle} reaches the client: {head}"
+                );
             }
         }
         let ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
