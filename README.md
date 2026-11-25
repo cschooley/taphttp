@@ -15,6 +15,10 @@ A headless, TLS-terminating MITM proxy written in Rust. Built as a composable fo
 - Optionally also writes to a file (`--log-file`) or SQLite (`--sqlite`)
 - Lets you query and filter captured traffic from the command line
 - Replays any captured request, optionally with modified headers or body
+- Relays WebSockets and streams Server-Sent Events through, recording every
+  message and event on the exchange that opened them
+- Enforces per-client limits on proxy credentials issued through its API: a
+  host allowlist, a rate limit and a request budget
 
 ## What it doesn't do
 
@@ -214,6 +218,7 @@ separate pairs.
 | `--allow-open-proxy` | off | Allow a non-loopback `--listen` without auth + TLS (private networks only) |
 | `--api-allow-plaintext` | off | Allow a non-loopback `--api-listen` without TLS (private networks only) |
 | `--api-no-send` | off | Turn off the lever API's `POST /send`, leaving observation and replay |
+| `--proxy-auth-api` | off | Require every proxy client to use a credential [issued through the lever API](#issued-proxy-credentials-clients) (or one from `--proxy-auth-file`). Needs `--api-listen`; counts as proxy auth off loopback |
 | `--expires` | never | Refuse traffic and exit after this: `8h`, `30m`, `2d`, or an RFC 3339 time |
 
 Traffic is always written to stdout as JSON lines. `--log-file` and `--sqlite` are additive.
@@ -321,9 +326,14 @@ Where the token comes from:
 | `GET` | `/ca.der` | The same certificate as DER (`application/x-x509-ca-cert`), for Android and some Windows dialogs |
 | `GET` | `/exchanges` | History, newest first, paged and filtered (below) |
 | `GET` | `/exchanges/{id}` | A single exchange by `id`, or `404` |
+| `GET` | `/exchanges/{id}/messages` | WebSocket messages / SSE events recorded on that exchange, paged |
 | `POST` | `/replay` | Replay a captured exchange; records the result linked via `replay_of` |
 | `POST` | `/send` | Send a new request to any `http(s)` URL; records it with `origin: "send"` |
-| `GET` | `/feed` | WebSocket stream of exchanges as they are recorded; resumable with `?since=` |
+| `GET` | `/feed` | WebSocket stream of exchanges (and messages) as they are recorded; resumable with `?since=` |
+| `POST` | `/clients` | Issue a proxy credential with a host allowlist, rate, budget and `meta` |
+| `GET` | `/clients` | Every issued credential with its counts |
+| `DELETE` | `/clients/{id}` | Revoke one credential; its open connections close |
+| `DELETE` | `/clients` | Revoke every credential at once (an e-stop) |
 
 Entries are `taphttp_types::TrafficEntry` JSON (current schema), the same as log lines.
 
@@ -388,6 +398,7 @@ auth as every route.
 | `since` / `until` | RFC 3339 times; `since` is inclusive, `until` exclusive |
 | `replay_of=<id>` | Only replays of `<id>` (including failed attempts) |
 | `origin` | `proxy`, `replay` or `send`: how the exchange was recorded. Anything else: `400` |
+| `refused` | `true`: only requests an issued credential's policy refused; `false`: only the rest |
 
 Order is the order taphttp recorded exchanges in, so a `before` cursor stays
 valid while new traffic arrives. Each lookup is an indexed sqlite query, not
@@ -405,6 +416,10 @@ Every text frame is JSON, one of:
     Re-sync from `GET /exchanges`.
   - `{"type":"lagged","skipped":N}`: this client fell behind and missed N
     exchanges. Reconnect with `?since=<last id received>`.
+  - `{"type":"message","message":{...}}`: a WebSocket message or SSE event
+    (see [messages](#get-exchangesidmessages)) on an exchange already sent.
+    Messages are live only: `?since=` replays exchanges, not their
+    messages; fetch those from `GET /exchanges/{id}/messages`.
 
 Without `since`, the feed sends exchanges recorded after you connect. With
 `?since=<id>`, it first sends every exchange recorded after `<id>`, oldest
@@ -448,6 +463,115 @@ Responses:
   URL or `meta`), or its target is one of taphttp's own listeners (below).
   Nothing was sent or recorded.
 - **404:** no exchange with that `id`.
+
+#### `GET /exchanges/{id}/messages`
+
+When a proxied request upgrades to a WebSocket, or its response is
+`text/event-stream`, the exchange is recorded as soon as the response head
+arrives (status `101` or `200`, `res_body: null`), and what follows is
+recorded as messages on it, in order:
+
+```json
+{
+  "schema_version": 8,
+  "exchange_id": "3f2a1b4c-8d9e-4a7b-b3c1-2e5f6a7d8e9f",
+  "seq": 4,
+  "ts": "2026-11-24T14:23:05.481Z",
+  "kind": "websocket",
+  "direction": "server_to_client",
+  "opcode": "text",
+  "event": null,
+  "event_id": null,
+  "size": 17,
+  "data": "{\"price\": 101.5}",
+  "data_encoding": "utf8",
+  "truncated": false
+}
+```
+
+- `kind` is `websocket` or `sse`; `direction` is `client_to_server` or
+  `server_to_client` (always the latter for SSE). `seq` counts from 0 per
+  exchange, both directions together.
+- WebSocket: `opcode` is `text`, `binary`, `close`, `ping` or `pong`, and
+  `data` is the payload (a close frame's is the 2-byte code then the
+  reason, as on the wire). SSE: `event` and `event_id` are the event's
+  `event:` and `id:` fields (`null` when absent), and `data` is its `data:`
+  lines joined with `\n`.
+- `data` is encoded like bodies (`utf8`, or `base64` when it isn't valid
+  UTF-8) and capped at 1 MiB per message; `size` is the full length and
+  `truncated` says whether `data` is cut short.
+
+Parameters: `after=<seq>` (only later messages) and `limit` (default 100,
+max 1000). An exchange with no messages returns `[]`; an unknown id, `404`.
+
+Messages are stored in sqlite and sent on `/feed`. They are not written to
+stdout or `--log-file`, which stay one exchange per line.
+
+What the proxy does to pass these through:
+
+- **WebSocket:** taphttp completes the upgrade with both sides and relays
+  whole messages (so a fragmented message is passed on as one). It strips
+  `Sec-WebSocket-Extensions` from the handshake, so no compression is
+  negotiated: the relay has to read every frame. Works for `ws://` and for
+  `wss://` inside a MITM'd tunnel.
+- **SSE:** the response is streamed to the client as it arrives instead of
+  buffered. A compressed stream (`Content-Encoding` other than `identity`)
+  passes through but its events aren't recorded.
+- The intercept hook sees the request, but not these responses: there is no
+  complete body to pause on.
+
+#### Issued proxy credentials: `/clients`
+
+For giving a client (an agent's sandbox, say) proxy access with limits
+taphttp enforces on every request, not just the ones another tool sends:
+
+```bash
+curl -X POST http://127.0.0.1:8081/clients \
+  -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"allow":["shop.example","*.shop.example","10.20.0.0/16"],
+       "rate":{"per_second":5,"burst":20},"budget":2000,
+       "meta":{"actor":"agent","task":"T-7"}}'
+```
+
+| Field | Meaning |
+|---|---|
+| `allow` | Required. Hosts it may reach: `shop.example` (exactly), `*.shop.example` (subdomains, not the name itself), an IP, a CIDR, or `*` for any |
+| `rate` | Optional token bucket: `per_second` sustained, bursts of up to `burst` (default `per_second` rounded up) |
+| `budget` | Optional total number of requests it may send |
+| `meta` | Recorded on every exchange made with it (limits as for `/replay`) |
+
+The answer (`201`) has `username` and `password` for `Proxy-Authorization`
+(Basic), shown only this once, plus the fields `GET /clients` lists: `id`
+(the username), `allow`, `rate`, `budget`, `meta`, `sent`, `refused`,
+`remaining` (`null` without a budget), `created_at` and `revoked`.
+
+How it's enforced:
+
+- **Allowlist:** checked on `CONNECT` and on every plain-HTTP request. A
+  name allowed by name may use every address it resolves to. A name that
+  isn't may still be reached through an IP or CIDR rule, but only at the
+  addresses that rule allows. The host is resolved once, and taphttp
+  connects only to the addresses it checked (inside a tunnel, the ones
+  checked at `CONNECT`), so a rebinding name can't slip past. taphttp's own
+  listeners are always refused.
+- **Rate and budget:** counted per request, including each request inside
+  an HTTPS tunnel. Refusals don't use up either.
+- **Refusals** get `403` (allowlist, budget, revoked) or `429` with
+  `Retry-After` (rate), and nothing is sent upstream. They are recorded as
+  exchanges with `refused: true`, `status: null` and `error` saying why
+  (`"refused: …"`), so `GET /exchanges?refused=true` lists them.
+- **Revoking** (`DELETE /clients/{id}`, or `DELETE /clients` for all) stops
+  the credential authenticating (`407`) and closes its open connections,
+  tunnels and WebSockets at once.
+- The exchange's `source` is the credential's `id`, and its `meta` is the
+  credential's `meta`.
+
+Credentials live in memory: restarting taphttp revokes them all. Without
+`--proxy-auth-api`, other clients keep working as before (a self-reported
+`source` locally, or `--proxy-auth-file` users). With it, an issued
+credential (or a `--proxy-auth-file` user) is required. taphttp decides
+nothing about what should be allowed: the issuer sends the policy, and
+taphttp enforces and counts it.
 
 #### `POST /send`
 
@@ -587,6 +711,8 @@ curl --proxy http://agent.T-3@127.0.0.1:8080 http://target/
   username.
 - `Proxy-Authorization` is removed before anything else sees the request:
   it isn't sent upstream, logged, or passed to an intercept hook.
+- **With an [issued credential](#issued-proxy-credentials-clients)**,
+  `source` is the credential's `id` and `meta` its `meta`, both verified.
 - Untagged traffic and replays have `source: null`. For HTTPS, the source
   given on `CONNECT` applies to everything in that tunnel.
 
@@ -619,12 +745,13 @@ Each line is one exchange (shown pretty-printed here):
   "meta": {},
   "error": null,
   "origin": "proxy",
-  "peer": "93.184.215.14:443"
+  "peer": "93.184.215.14:443",
+  "refused": false
 }
 ```
 
 - `schema_version` is on every line, so a tool tailing the log can detect a
-  breaking change. The current version is 7.
+  breaking change. The current version is 8.
 - Headers are `[name, value]` pairs in wire order. Repeated headers (several
   `Set-Cookie`s, say) each get a pair. A value that isn't valid UTF-8 is
   kept with the bad bytes replaced by U+FFFD, not dropped.
@@ -636,7 +763,8 @@ Each line is one exchange (shown pretty-printed here):
 - `source` is who sent it (see [Attribution](#attribution-who-sent-each-exchange)),
   or `null`.
 - `meta` is attribution the caller of `POST /replay` or `POST /send`
-  attached, or `{}`. taphttp stores it and doesn't interpret it.
+  attached, or an issued proxy credential's `meta`, or `{}`. taphttp stores
+  it and doesn't interpret it.
 - `error` is why the exchange has no complete response (the upstream
   couldn't be reached, or the response broke off), or `null`. Failed
   replays are recorded this way, so history has no gaps.
@@ -649,6 +777,10 @@ Each line is one exchange (shown pretty-printed here):
   response then fails, and `null` only when no connection was made (the
   host didn't resolve or couldn't be reached). Compare it with where a host
   resolves now to spot a target that has moved.
+- `refused` is `true` when an issued credential's policy refused the
+  request: nothing was sent, and `error` says why.
+- A WebSocket's or event stream's traffic after the head is in its
+  [messages](#get-exchangesidmessages), not `res_body`.
 
 To decode base64 bodies with jq: `jq -r 'select(.res_body_encoding=="base64") | .res_body | @base64d'`.
 
@@ -656,6 +788,7 @@ To decode base64 bodies with jq: `jq -r 'select(.res_body_encoding=="base64") | 
 
 | Version | Change |
 |---|---|
+| 8 | `refused`; WebSocket and SSE `Message`s (`/exchanges/{id}/messages`, `/feed`) |
 | 7 | `peer` (the upstream address connected to) |
 | 6 | `origin` (`proxy`, `replay` or `send`); `POST /send` |
 | 5 | `meta` (replay attribution) and `error` (why there's no complete response); failed replays are recorded |
@@ -664,13 +797,14 @@ To decode base64 bodies with jq: `jq -r 'select(.res_body_encoding=="base64") | 
 | 2 | `replay_of` |
 | 1 | Initial |
 
-taphttp still reads v1 to v6 logs and databases (`show`, `replay`, the
+taphttp still reads v1 to v7 logs and databases (`show`, `replay`, the
 lever API): a header map is read as pairs, a missing encoding means `utf8`,
 a missing `source` or `error` means `null`, a missing `meta` means `{}`, and
 a missing `origin` is `replay` when `replay_of` is set and `proxy`
 otherwise (sqlite rows are filled in on first open). A missing `peer` is
-`null`: older entries don't say where they went. Anything taphttp writes or
-re-emits (`show --json`, `/exchanges`) is v7.
+`null`: older entries don't say where they went. A missing `refused` is
+`false`. Anything taphttp writes or re-emits (`show --json`, `/exchanges`)
+is v8.
 
 ### Using the types from Rust
 
@@ -696,6 +830,9 @@ let entry: TrafficEntry = serde_json::from_str(line)?;
 let cookies: Vec<&str> = entry.res_headers.get_all("set-cookie").collect();
 let body: Option<Vec<u8>> = entry.res_body_bytes()?; // exact bytes, base64 or not
 ```
+
+Messages are `taphttp_types::Message` (with `data_bytes()`), and the
+`MessageKind`, `Direction` and `Opcode` enums.
 
 `SchemaProbe` reads only `schema_version` from a raw line, for checking the
 version before a full parse.

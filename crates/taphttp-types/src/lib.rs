@@ -157,13 +157,17 @@ impl<'de> Deserialize<'de> for Timestamp {
 /// - v7: added `peer`, the upstream address taphttp connected to
 ///   (`"203.0.113.7:443"`, `"[2001:db8::1]:443"`), or `null` when no
 ///   connection was made.
+/// - v8: added `refused`, `true` when taphttp's policy for an issued proxy
+///   credential refused the request (it was never sent; `error` says why).
+///   WebSocket messages and SSE events are recorded as [`Message`]s, which
+///   carry the same `schema_version`.
 ///
-/// v1 to v6 lines still deserialize: a header map is read as pairs, a
+/// v1 to v7 lines still deserialize: a header map is read as pairs, a
 /// missing encoding means `"utf8"`, a missing `source` or `error` means
 /// `null`, a missing `meta` means `{}`, and a missing `origin` is
 /// `"replay"` when `replay_of` is set and `"proxy"` otherwise. A missing
-/// `peer` means `null`.
-pub const SCHEMA_VERSION: u32 = 7;
+/// `peer` means `null`, and a missing `refused` means `false`.
+pub const SCHEMA_VERSION: u32 = 8;
 
 // ---------------------------------------------------------------------------
 // Headers
@@ -479,6 +483,11 @@ pub struct TrafficEntry {
     /// when no connection was made (the upstream was unreachable or the
     /// name didn't resolve), and on lines that predate it.
     pub peer: Option<SocketAddr>,
+    /// Refused by taphttp before anything was sent: an issued proxy
+    /// credential's host allowlist, rate or budget didn't allow it, or the
+    /// credential was revoked. `error` says which; `status` and `peer` are
+    /// `None`.
+    pub refused: bool,
 }
 
 /// What a line deserializes into before [`TrafficEntry::origin`] is filled
@@ -516,6 +525,8 @@ struct RawTrafficEntry {
     origin: Option<Origin>,
     #[serde(default)]
     peer: Option<SocketAddr>,
+    #[serde(default)]
+    refused: bool,
 }
 
 impl<'de> Deserialize<'de> for TrafficEntry {
@@ -546,6 +557,7 @@ impl<'de> Deserialize<'de> for TrafficEntry {
             error: r.error,
             origin,
             peer: r.peer,
+            refused: r.refused,
         })
     }
 }
@@ -575,8 +587,8 @@ impl TrafficEntry {
 impl Serialize for TrafficEntry {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         // Keep this list in step with the struct; the
-        // `serialized_keys_are_exactly_the_v7_schema` test enforces it.
-        let mut st = s.serialize_struct("TrafficEntry", 20)?;
+        // `serialized_keys_are_exactly_the_v8_schema` test enforces it.
+        let mut st = s.serialize_struct("TrafficEntry", 21)?;
         st.serialize_field("schema_version", &SCHEMA_VERSION)?;
         st.serialize_field("id", &self.id)?;
         st.serialize_field("ts", &self.ts)?;
@@ -597,6 +609,113 @@ impl Serialize for TrafficEntry {
         st.serialize_field("error", &self.error)?;
         st.serialize_field("origin", &self.origin)?;
         st.serialize_field("peer", &self.peer)?;
+        st.serialize_field("refused", &self.refused)?;
+        st.end()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Messages
+// ---------------------------------------------------------------------------
+
+/// What carried a [`Message`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MessageKind {
+    /// A WebSocket message on a connection the exchange upgraded.
+    Websocket,
+    /// An event of the exchange's `text/event-stream` response.
+    Sse,
+}
+
+/// Which way a [`Message`] went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Direction {
+    ClientToServer,
+    ServerToClient,
+}
+
+/// A WebSocket message's type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Opcode {
+    Text,
+    Binary,
+    Close,
+    Ping,
+    Pong,
+}
+
+/// One WebSocket message or SSE event, recorded on the exchange that opened
+/// the socket or stream (`exchange_id` is that [`TrafficEntry::id`]).
+///
+/// Serializes with `"schema_version"` first, like [`TrafficEntry`].
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct Message {
+    pub exchange_id: String,
+    /// Position on the exchange, from 0, in the order taphttp saw them
+    /// (both directions share one sequence).
+    pub seq: u64,
+    pub ts: Timestamp,
+    pub kind: MessageKind,
+    pub direction: Direction,
+    /// WebSocket only.
+    #[serde(default)]
+    pub opcode: Option<Opcode>,
+    /// SSE only: the `event:` field, `None` when the event had none (a
+    /// browser treats that as `"message"`).
+    #[serde(default)]
+    pub event: Option<String>,
+    /// SSE only: the `id:` field.
+    #[serde(default)]
+    pub event_id: Option<String>,
+    /// Payload length in bytes as it went over the wire, before any cap.
+    pub size: u64,
+    /// The payload (an SSE event's `data:` lines joined with `\n`),
+    /// encoded per `data_encoding`, at most the recorder's cap. Prefer
+    /// [`Message::data_bytes`] to read it.
+    #[serde(default)]
+    pub data: Option<String>,
+    #[serde(default)]
+    pub data_encoding: BodyEncoding,
+    /// `data` holds only the first part of the payload.
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+impl Message {
+    /// The recorded payload bytes.
+    pub fn data_bytes(&self) -> Result<Option<Vec<u8>>, DecodeError> {
+        decode_body(self.data.as_deref(), self.data_encoding)
+    }
+
+    /// Store `payload`, keeping at most `cap` bytes of it; `size` is the
+    /// full length.
+    pub fn set_data(&mut self, payload: &[u8], cap: usize) {
+        self.size = payload.len() as u64;
+        self.truncated = payload.len() > cap;
+        (self.data, self.data_encoding) = encode_body(&payload[..payload.len().min(cap)]);
+    }
+}
+
+impl Serialize for Message {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        // Keep in step with the struct; `message_keys_are_exactly_the_v8_schema`.
+        let mut st = s.serialize_struct("Message", 13)?;
+        st.serialize_field("schema_version", &SCHEMA_VERSION)?;
+        st.serialize_field("exchange_id", &self.exchange_id)?;
+        st.serialize_field("seq", &self.seq)?;
+        st.serialize_field("ts", &self.ts)?;
+        st.serialize_field("kind", &self.kind)?;
+        st.serialize_field("direction", &self.direction)?;
+        st.serialize_field("opcode", &self.opcode)?;
+        st.serialize_field("event", &self.event)?;
+        st.serialize_field("event_id", &self.event_id)?;
+        st.serialize_field("size", &self.size)?;
+        st.serialize_field("data", &self.data)?;
+        st.serialize_field("data_encoding", &self.data_encoding)?;
+        st.serialize_field("truncated", &self.truncated)?;
         st.end()
     }
 }
@@ -690,6 +809,7 @@ mod tests {
             error: None,
             origin: Origin::Proxy,
             peer: None,
+            refused: false,
         }
     }
 
@@ -835,7 +955,7 @@ mod tests {
     // --- TrafficEntry wire format ---
 
     #[test]
-    fn serialized_keys_are_exactly_the_v7_schema() {
+    fn serialized_keys_are_exactly_the_v8_schema() {
         let v = serde_json::to_value(entry()).unwrap();
         let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
         keys.sort_unstable();
@@ -850,6 +970,7 @@ mod tests {
                 "method",
                 "origin",
                 "peer",
+                "refused",
                 "replay_of",
                 "req_body",
                 "req_body_encoding",
@@ -864,7 +985,8 @@ mod tests {
                 "url",
             ]
         );
-        assert_eq!(v["schema_version"], 7);
+        assert_eq!(v["schema_version"], 8);
+        assert_eq!(v["refused"], false);
         assert_eq!(v["origin"], "proxy");
         assert_eq!(v["peer"], serde_json::Value::Null);
         assert_eq!(v["req_body_encoding"], "utf8");
@@ -954,6 +1076,121 @@ mod tests {
     }
 
     #[test]
+    fn refused_is_missing_on_older_lines_and_reads_as_false() {
+        let v7 = r#"{"schema_version":7,"id":"a","ts":"2026-11-20T00:00:00Z","host":"h","method":"GET","url":"/","status":null,"duration_ms":null,"peer":null}"#;
+        let e: TrafficEntry = serde_json::from_str(v7).unwrap();
+        assert!(!e.refused);
+        let refused = v7.replace(r#""peer":null"#, r#""peer":null,"refused":true"#);
+        let e: TrafficEntry = serde_json::from_str(&refused).unwrap();
+        assert!(e.refused);
+    }
+
+    // --- Message ---
+
+    fn message() -> Message {
+        Message {
+            exchange_id: "e1".into(),
+            seq: 0,
+            ts: "2026-11-20T00:00:01Z".parse().unwrap(),
+            kind: MessageKind::Websocket,
+            direction: Direction::ClientToServer,
+            opcode: Some(Opcode::Text),
+            event: None,
+            event_id: None,
+            size: 2,
+            data: Some("hi".into()),
+            data_encoding: BodyEncoding::Utf8,
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn message_keys_are_exactly_the_v8_schema() {
+        let v = serde_json::to_value(message()).unwrap();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "data",
+                "data_encoding",
+                "direction",
+                "event",
+                "event_id",
+                "exchange_id",
+                "kind",
+                "opcode",
+                "schema_version",
+                "seq",
+                "size",
+                "truncated",
+                "ts",
+            ]
+        );
+        let line = serde_json::to_string(&message()).unwrap();
+        assert!(line.starts_with(r#"{"schema_version":8,"#), "{line}");
+    }
+
+    #[test]
+    fn message_enums_serialize_as_documented() {
+        let mut m = message();
+        for (kind, k) in [
+            (MessageKind::Websocket, "websocket"),
+            (MessageKind::Sse, "sse"),
+        ] {
+            m.kind = kind;
+            assert_eq!(serde_json::to_value(&m).unwrap()["kind"], k);
+        }
+        for (dir, d) in [
+            (Direction::ClientToServer, "client_to_server"),
+            (Direction::ServerToClient, "server_to_client"),
+        ] {
+            m.direction = dir;
+            assert_eq!(serde_json::to_value(&m).unwrap()["direction"], d);
+        }
+        for (op, o) in [
+            (Opcode::Text, "text"),
+            (Opcode::Binary, "binary"),
+            (Opcode::Close, "close"),
+            (Opcode::Ping, "ping"),
+            (Opcode::Pong, "pong"),
+        ] {
+            m.opcode = Some(op);
+            assert_eq!(serde_json::to_value(&m).unwrap()["opcode"], o);
+        }
+    }
+
+    #[test]
+    fn message_roundtrips_and_decodes_its_data() {
+        let mut m = message();
+        m.kind = MessageKind::Sse;
+        m.direction = Direction::ServerToClient;
+        m.opcode = None;
+        m.event = Some("update".into());
+        m.event_id = Some("42".into());
+        m.set_data(&[0xff, 0x00, 0x01], 10);
+        assert_eq!(m.data_encoding, BodyEncoding::Base64);
+        assert_eq!(m.size, 3);
+        assert!(!m.truncated);
+        let back: Message = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(back, m);
+        assert_eq!(back.data_bytes().unwrap(), Some(vec![0xff, 0x00, 0x01]));
+    }
+
+    #[test]
+    fn message_data_is_capped_but_size_is_the_full_length() {
+        let mut m = message();
+        m.set_data(b"abcdefgh", 3);
+        assert_eq!(m.data.as_deref(), Some("abc"));
+        assert_eq!(m.size, 8);
+        assert!(m.truncated);
+        m.set_data(b"", 3);
+        assert_eq!(m.data, None);
+        assert_eq!(m.size, 0);
+        assert!(!m.truncated);
+    }
+
+    #[test]
     fn v4_line_without_meta_or_error_parses_as_empty() {
         let v4 = r#"{"schema_version":4,"id":"a","ts":"2026-11-20T00:00:00Z","host":"h","method":"GET","url":"/","req_headers":[],"req_body":null,"req_body_encoding":"utf8","status":200,"res_headers":[],"res_body":null,"res_body_encoding":"utf8","duration_ms":1,"replay_of":null,"source":"alice"}"#;
         let e: TrafficEntry = serde_json::from_str(v4).unwrap();
@@ -965,7 +1202,7 @@ mod tests {
     #[test]
     fn schema_version_is_the_first_key_on_the_line() {
         let line = serde_json::to_string(&entry()).unwrap();
-        assert!(line.starts_with(r#"{"schema_version":7,"#), "{line}");
+        assert!(line.starts_with(r#"{"schema_version":8,"#), "{line}");
     }
 
     #[test]
@@ -983,6 +1220,7 @@ mod tests {
         e.status = None;
         e.error = Some("sending request: connection refused".into());
         e.peer = Some("[2001:db8::1]:8443".parse().unwrap());
+        e.refused = true;
         let back: TrafficEntry = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
         assert_eq!(back, e);
     }

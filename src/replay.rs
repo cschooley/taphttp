@@ -2,20 +2,16 @@ use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::Request;
-use hyper_util::client::legacy::connect::dns::Name;
-use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::client::legacy::Client;
-use hyper_util::rt::TokioExecutor;
-use rustls::ClientConfig;
 use std::collections::BTreeMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Instant;
 use uuid::Uuid;
 
 use crate::cli::ReplayArgs;
 use crate::storage::{self, Headers, Origin, Store, TrafficEntry};
+pub use crate::upstream::is_own_target;
+use crate::upstream::{error_chain, is_local_ip, resolve};
 
 /// Limits on [`ReplayMods::meta`]: it is attribution, not a payload.
 pub const MAX_META_KEYS: usize = 16;
@@ -201,6 +197,7 @@ pub async fn send_new(
         error: None,
         origin: Origin::Send,
         peer: None,
+        refused: false,
     };
     template.set_req_body(&spec.body);
     exchange(store, template, spec.body.clone(), own).await
@@ -271,6 +268,7 @@ async fn exchange(
         error: outcome.error,
         // Where this attempt went; a replay's original may have gone elsewhere.
         peer: outcome.peer,
+        refused: false,
         ..template
     };
     entry.set_res_body(&outcome.body);
@@ -280,51 +278,6 @@ async fn exchange(
         return Err(ReplayError::Failed(Box::new(entry)));
     }
     Ok(entry)
-}
-
-/// Every address `uri`'s host resolves to, on its port.
-async fn resolve(uri: &hyper::Uri) -> std::io::Result<Vec<SocketAddr>> {
-    let host = uri.host().unwrap_or_default();
-    let host = host.trim_start_matches('[').trim_end_matches(']');
-    let port = uri
-        .port_u16()
-        .unwrap_or(if uri.scheme_str() == Some("https") {
-            443
-        } else {
-            80
-        });
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port)).await?.collect();
-    if addrs.is_empty() {
-        return Err(std::io::Error::other(format!("{host} has no addresses")));
-    }
-    Ok(addrs)
-}
-
-/// Whether connecting to `target` would reach one of `own` (taphttp's
-/// bound listeners). A listener on `0.0.0.0` / `::` is reached through any
-/// address of this host, which `is_local` decides.
-pub fn is_own_target(
-    target: SocketAddr,
-    own: &[SocketAddr],
-    is_local: impl Fn(IpAddr) -> bool,
-) -> bool {
-    let t = target.ip().to_canonical();
-    own.iter().any(|o| {
-        let l = o.ip().to_canonical();
-        o.port() == target.port()
-            && (t == l
-                || (l.is_unspecified() && (t.is_unspecified() || is_local(t)))
-                || (t.is_unspecified() && is_local(l)))
-    })
-}
-
-/// Whether `ip` is an address of this host: loopback, unspecified (which
-/// connects locally), or one a socket can bind to.
-fn is_local_ip(ip: IpAddr) -> bool {
-    let ip = ip.to_canonical();
-    ip.is_loopback()
-        || ip.is_unspecified()
-        || std::net::UdpSocket::bind(SocketAddr::new(ip, 0)).is_ok()
 }
 
 /// Parse a URL to send to: absolute `http` or `https`, with a host.
@@ -372,50 +325,10 @@ struct Outcome {
     peer: Option<SocketAddr>,
 }
 
-/// A resolver that answers with addresses already looked up and checked.
-#[derive(Clone)]
-struct Pinned(Arc<Vec<SocketAddr>>);
-
-impl tower::Service<Name> for Pinned {
-    type Response = std::vec::IntoIter<SocketAddr>;
-    type Error = std::io::Error;
-    type Future = std::future::Ready<std::io::Result<Self::Response>>;
-
-    fn poll_ready(
-        &mut self,
-        _: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::task::Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, _: Name) -> Self::Future {
-        std::future::ready(Ok(Vec::clone(&self.0).into_iter()))
-    }
-}
-
 /// Send one request, connecting only to `addrs`. Shared by the CLI and the
 /// lever API's replay and send paths.
 async fn send(req: Request<Full<Bytes>>, addrs: Vec<SocketAddr>) -> Outcome {
-    let mut http = HttpConnector::new_with_resolver(Pinned(Arc::new(addrs)));
-    http.enforce_http(false);
-    let (http, peer) = crate::peer::RecordPeer::new(http);
-    let res = if req.uri().scheme_str() == Some("https") {
-        let mut root_store = rustls::RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let tls = ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-        let https = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_tls_config(tls)
-            .https_or_http()
-            .enable_http1()
-            .wrap_connector(http);
-        let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build(https);
-        client.request(req).await
-    } else {
-        let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build(http);
-        client.request(req).await
-    };
+    let (res, peer) = crate::upstream::request(req, addrs).await;
     let res = match res {
         Ok(r) => r,
         Err(e) => {
@@ -445,19 +358,6 @@ async fn send(req: Request<Full<Bytes>>, addrs: Vec<SocketAddr>) -> Outcome {
             peer: peer.get(),
         },
     }
-}
-
-/// `e: its source: …`, since hyper's top-level messages are vague
-/// ("client error (Connect)").
-fn error_chain(e: &dyn std::error::Error) -> String {
-    let mut out = e.to_string();
-    let mut next = e.source();
-    while let Some(cause) = next {
-        out.push_str(": ");
-        out.push_str(&cause.to_string());
-        next = cause.source();
-    }
-    out
 }
 
 pub async fn run(args: ReplayArgs, data_dir: PathBuf) -> Result<()> {
@@ -575,6 +475,7 @@ mod tests {
             error: None,
             origin: crate::storage::Origin::Proxy,
             peer: None,
+            refused: false,
         }
     }
 
@@ -1139,8 +1040,8 @@ mod tests {
     #[test]
     fn own_target_matching() {
         let a = |s: &str| -> SocketAddr { s.parse().unwrap() };
-        let lan: IpAddr = "10.1.2.3".parse().unwrap();
-        let local = move |ip: IpAddr| ip.to_canonical().is_loopback() || ip == lan;
+        let lan: std::net::IpAddr = "10.1.2.3".parse().unwrap();
+        let local = move |ip: std::net::IpAddr| ip.to_canonical().is_loopback() || ip == lan;
         let own = |t: &str, o: &[&str]| {
             let o: Vec<SocketAddr> = o.iter().map(|s| a(s)).collect();
             is_own_target(a(t), &o, local)
@@ -1497,6 +1398,7 @@ mod tests {
             error: None,
             origin: crate::storage::Origin::Proxy,
             peer: None,
+            refused: false,
         };
 
         JsonLinesBackend::new(&data_dir.join("traffic.jsonl"))
@@ -1548,6 +1450,7 @@ mod tests {
             error: None,
             origin: crate::storage::Origin::Proxy,
             peer: None,
+            refused: false,
         };
 
         JsonLinesBackend::new(&data_dir.join("traffic.jsonl"))
@@ -1651,6 +1554,7 @@ mod tests {
                 error: None,
                 origin: crate::storage::Origin::Proxy,
                 peer: None,
+                refused: false,
             })
             .unwrap();
 

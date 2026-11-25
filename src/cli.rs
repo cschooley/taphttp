@@ -107,6 +107,12 @@ pub struct StartArgs {
     #[arg(long)]
     pub api_no_send: bool,
 
+    /// Require every proxy client to authenticate with a credential issued
+    /// through the lever API (POST /clients), or one from --proxy-auth-file.
+    /// Needs --api-listen. Counts as proxy auth for a non-loopback --listen.
+    #[arg(long)]
+    pub proxy_auth_api: bool,
+
     /// Stop after this: a duration (90s, 30m, 8h, 2d) or an RFC 3339 time.
     /// Requests are refused from then on and taphttp exits.
     #[arg(long, value_name = "WHEN")]

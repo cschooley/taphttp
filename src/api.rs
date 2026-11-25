@@ -47,6 +47,9 @@ pub struct ApiState {
     pub own: Vec<std::net::SocketAddr>,
     /// `POST /send` is on unless `start --api-no-send`.
     pub send_enabled: bool,
+    /// Proxy credentials issued with `POST /clients`, shared with the proxy,
+    /// which enforces them.
+    pub clients: Arc<crate::clients::Registry>,
 }
 
 /// Generate a fresh random API token (122 bits from a v4 UUID).
@@ -130,9 +133,17 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/ca.der", get(ca_der))
         .route("/exchanges", get(exchanges))
         .route("/exchanges/{id}", get(exchange))
+        .route("/exchanges/{id}/messages", get(exchange_messages))
         .route("/feed", get(feed))
         .route("/replay", post(replay))
         .route("/send", post(send))
+        .route(
+            "/clients",
+            post(issue_client)
+                .get(list_clients)
+                .delete(revoke_all_clients),
+        )
+        .route("/clients/{id}", axum::routing::delete(revoke_client))
         .layer(middleware::from_fn_with_state(state.clone(), require_token))
         .with_state(state)
 }
@@ -322,6 +333,41 @@ async fn exchanges(
 }
 
 /// `GET /exchanges/{id}` — a single exchange by id (indexed), or 404.
+#[derive(Deserialize)]
+struct MessagesParams {
+    /// Only messages after this `seq`.
+    after: Option<u64>,
+    limit: Option<usize>,
+}
+
+/// `GET /exchanges/{id}/messages` — the WebSocket messages or SSE events
+/// recorded on an exchange, in order, paged by `?after=<seq>&limit=N`
+/// (default 100, at most 1000). 404 if there is no such exchange.
+async fn exchange_messages(
+    State(state): State<Arc<ApiState>>,
+    PathParam(id): PathParam<String>,
+    Query(p): Query<MessagesParams>,
+) -> Response {
+    let Some(history) = state.store.history() else {
+        return no_history();
+    };
+    let limit = p.limit.unwrap_or(100);
+    if !(1..=1000).contains(&limit) {
+        return (StatusCode::BAD_REQUEST, "limit must be 1 to 1000").into_response();
+    }
+    match history.get(&id) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, format!("no exchange with id {id}")).into_response()
+        }
+        Err(e) => return db_error(e),
+    }
+    match history.messages(&id, p.after, limit) {
+        Ok(messages) => Json(messages).into_response(),
+        Err(e) => db_error(e),
+    }
+}
+
 async fn exchange(
     State(state): State<Arc<ApiState>>,
     PathParam(id): PathParam<String>,
@@ -398,6 +444,41 @@ async fn replay(State(state): State<Arc<ApiState>>, Json(req): Json<ReplayReques
 
 /// 200 with the recorded entry, 502 with the recorded failed attempt, or
 /// 400 when nothing was sent.
+/// `POST /clients` — issue a proxy credential with its allowlist, rate,
+/// budget and meta. 201 with the credential; the password is shown only
+/// here.
+async fn issue_client(State(state): State<Arc<ApiState>>, body: axum::body::Bytes) -> Response {
+    let issued = crate::clients::parse_spec(&body).and_then(|spec| state.clients.issue(spec));
+    match issued {
+        Ok(issued) => (StatusCode::CREATED, Json(issued)).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
+    }
+}
+
+/// `GET /clients` — every issued credential with its counts.
+async fn list_clients(State(state): State<Arc<ApiState>>) -> Response {
+    Json(state.clients.list()).into_response()
+}
+
+/// `DELETE /clients/{id}` — revoke one credential; its open connections
+/// close.
+async fn revoke_client(
+    State(state): State<Arc<ApiState>>,
+    PathParam(id): PathParam<String>,
+) -> Response {
+    if state.clients.revoke(&id) {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        (StatusCode::NOT_FOUND, "no such client").into_response()
+    }
+}
+
+/// `DELETE /clients` — revoke every credential at once (an e-stop).
+async fn revoke_all_clients(State(state): State<Arc<ApiState>>) -> Response {
+    let n = state.clients.revoke_all();
+    Json(serde_json::json!({ "revoked": n })).into_response()
+}
+
 fn outcome(r: Result<TrafficEntry, ReplayError>) -> Response {
     match r {
         Ok(entry) => Json(entry).into_response(),
@@ -475,6 +556,9 @@ const FEED_BACKLOG_PAGE: usize = 500;
 ///   Re-sync from `GET /exchanges`.
 /// - `{"type":"lagged","skipped":N}`: this client fell behind and N live
 ///   entries were dropped. Reconnect with `?since=<last id received>`.
+/// - `{"type":"message","message":{...}}`: a WebSocket message or SSE event
+///   recorded on an exchange already sent. Live only: `since` replays
+///   exchanges, not messages (`GET /exchanges/{id}/messages` has them).
 ///
 /// With `?since=<id>`, entries recorded after `<id>` are sent first, oldest
 /// first, then live entries, with no gap and no duplicates.
@@ -533,7 +617,7 @@ async fn send_backlog(
 
 async fn pump_feed(
     mut socket: WebSocket,
-    mut rx: broadcast::Receiver<TrafficEntry>,
+    mut rx: broadcast::Receiver<crate::storage::Live>,
     state: Arc<ApiState>,
     since: Option<String>,
 ) {
@@ -546,12 +630,18 @@ async fn pump_feed(
     };
     loop {
         match rx.recv().await {
-            Ok(entry) => {
+            Ok(crate::storage::Live::Entry(entry)) => {
                 // Recorded after subscribing but already sent from history.
                 if already_sent.remove(&entry.id) {
                     continue;
                 }
                 if !send_json(&mut socket, &entry).await {
+                    break;
+                }
+            }
+            Ok(crate::storage::Live::Message(message)) => {
+                let frame = serde_json::json!({ "type": "message", "message": message });
+                if !send_json(&mut socket, &frame).await {
                     break;
                 }
             }
@@ -599,6 +689,7 @@ mod tests {
             error: None,
             origin: crate::storage::Origin::Proxy,
             peer: None,
+            refused: false,
         }
     }
 
@@ -619,6 +710,7 @@ mod tests {
             ca_cert: test_ca_cert(),
             own: vec![],
             send_enabled: true,
+            clients: Default::default(),
         });
         (state, Hist(store))
     }
@@ -909,6 +1001,7 @@ mod tests {
             ca_cert: test_ca_cert(),
             own: vec![],
             send_enabled: true,
+            clients: Default::default(),
         });
         for path in ["/exchanges", "/exchanges/x"] {
             let resp = router(state.clone())
@@ -1246,6 +1339,7 @@ mod tests {
             ca_cert: test_ca_cert(),
             own,
             send_enabled,
+            clients: Default::default(),
         })
     }
 
@@ -1486,6 +1580,137 @@ mod tests {
         assert_eq!(replays[0].id, json["id"].as_str().unwrap());
     }
 
+    fn authed(method: &str, path: &str, json: Option<serde_json::Value>) -> Request<Body> {
+        let b = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(AUTHORIZATION, format!("Bearer {TEST_TOKEN}"))
+            .header("content-type", "application/json");
+        b.body(json.map_or_else(Body::empty, |j| Body::from(j.to_string())))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn clients_are_issued_listed_and_revoked() {
+        let dir = TempDir::new().unwrap();
+        let (state, _) = state_with_db(&dir);
+        let issue = |json| router(state.clone()).oneshot(authed("POST", "/clients", Some(json)));
+
+        let resp = issue(serde_json::json!({
+            "allow": ["example.com", "*.example.org", "10.0.0.0/8"],
+            "rate": {"per_second": 5},
+            "budget": 100,
+            "meta": {"actor": "agent", "task": "T-7"},
+        }))
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let issued = body_json(resp).await;
+        let id = issued["id"].as_str().unwrap().to_string();
+        assert_eq!(issued["username"], id.as_str());
+        let password = issued["password"].as_str().unwrap().to_string();
+        assert!(password.len() >= 32);
+        assert_eq!(issued["remaining"], 100);
+        assert_eq!(issued["meta"]["task"], "T-7");
+        assert!(matches!(
+            state.clients.authenticate(&id, &password),
+            crate::clients::Lookup::Granted(_)
+        ));
+
+        let second = body_json(issue(serde_json::json!({"allow": ["*"]})).await.unwrap()).await;
+        let second_id = second["id"].as_str().unwrap().to_string();
+
+        for bad in [
+            serde_json::json!({"allow": []}),
+            serde_json::json!({"allow": ["not a host"]}),
+            serde_json::json!({"allow": ["*"], "rate": {"per_second": -1}}),
+            serde_json::json!({"allow": ["*"], "unknown": true}),
+            serde_json::json!({}),
+        ] {
+            let resp = issue(bad.clone()).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{bad}");
+        }
+
+        let list = body_json(
+            router(state.clone())
+                .oneshot(authed("GET", "/clients", None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let list = list.as_array().unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0]["id"], id.as_str());
+        assert_eq!(list[0]["sent"], 0);
+        assert_eq!(list[0]["refused"], 0);
+        assert_eq!(list[0]["revoked"], false);
+        assert!(!serde_json::to_string(list).unwrap().contains(&password));
+
+        let del = |path: String| router(state.clone()).oneshot(authed("DELETE", &path, None));
+        assert_eq!(
+            del(format!("/clients/{id}")).await.unwrap().status(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            del("/clients/c-nope".into()).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
+        assert!(matches!(
+            state.clients.authenticate(&id, &password),
+            crate::clients::Lookup::Denied
+        ));
+
+        // Revoke all: the e-stop.
+        let resp = del("/clients".into()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(resp).await["revoked"],
+            1,
+            "only the second was live"
+        );
+        let views = state.clients.list();
+        assert!(views.iter().all(|v| v.revoked), "{second_id}");
+
+        let resp = router(state.clone())
+            .oneshot(Request::get("/clients").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "same token as every route"
+        );
+    }
+
+    #[tokio::test]
+    async fn exchanges_filter_by_refused() {
+        let dir = TempDir::new().unwrap();
+        let (state, log) = state_with_db(&dir);
+        log.append(&entry("ok", "h", "GET", 200)).unwrap();
+        let mut no = entry("no", "h", "GET", 200);
+        no.refused = true;
+        log.append(&no).unwrap();
+        for (q, want) in [("true", "no"), ("false", "ok")] {
+            let resp = router(state.clone())
+                .oneshot(authed_get(&format!("/exchanges?refused={q}")))
+                .await
+                .unwrap();
+            let json = body_json(resp).await;
+            let ids: Vec<&str> = json
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e["id"].as_str().unwrap())
+                .collect();
+            assert_eq!(ids, [want], "refused={q}");
+        }
+        let resp = router(state)
+            .oneshot(authed_get("/exchanges?refused=maybe"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
     #[tokio::test]
     async fn exchanges_filter_by_replay_of() {
         let dir = TempDir::new().unwrap();
@@ -1555,6 +1780,97 @@ mod tests {
             .unwrap()
             .unwrap();
         serde_json::from_str(msg.to_text().unwrap()).unwrap()
+    }
+
+    fn ws_message(exchange: &str, seq: u64, text: &str) -> taphttp_types::Message {
+        let mut m = taphttp_types::Message {
+            exchange_id: exchange.into(),
+            seq,
+            ts: taphttp_types::Timestamp::now(),
+            kind: taphttp_types::MessageKind::Websocket,
+            direction: taphttp_types::Direction::ClientToServer,
+            opcode: Some(taphttp_types::Opcode::Text),
+            event: None,
+            event_id: None,
+            size: 0,
+            data: None,
+            data_encoding: Default::default(),
+            truncated: false,
+        };
+        m.set_data(text.as_bytes(), 1024);
+        m
+    }
+
+    #[tokio::test]
+    async fn feed_carries_messages_after_their_exchange() {
+        let dir = TempDir::new().unwrap();
+        let (state, _) = state_with_db(&dir);
+        let store = state.store.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router(state)).await.unwrap();
+        });
+        let (mut ws, _) =
+            tokio_tungstenite::connect_async(format!("ws://{addr}/feed?token={TEST_TOKEN}"))
+                .await
+                .unwrap();
+        store.record(entry("ws-9", "example.com", "GET", 101));
+        store.record_message(ws_message("ws-9", 0, "hello"));
+        assert_eq!(next_json(&mut ws).await["id"], "ws-9");
+        let frame = next_json(&mut ws).await;
+        assert_eq!(frame["type"], "message");
+        assert_eq!(frame["message"]["exchange_id"], "ws-9");
+        assert_eq!(frame["message"]["data"], "hello");
+        assert_eq!(frame["message"]["schema_version"], SCHEMA_VERSION);
+    }
+
+    #[tokio::test]
+    async fn exchange_messages_are_paged_by_seq() {
+        let dir = TempDir::new().unwrap();
+        let (state, log) = state_with_db(&dir);
+        log.append(&entry("ws-1", "h", "GET", 101)).unwrap();
+        log.append(&entry("plain", "h", "GET", 200)).unwrap();
+        for seq in 0..5 {
+            state
+                .store
+                .record_message(ws_message("ws-1", seq, &format!("m{seq}")));
+        }
+        let page = |q: &str| {
+            let state = state.clone();
+            let q = q.to_string();
+            async move {
+                let resp = router(state).oneshot(authed_get(&q)).await.unwrap();
+                let status = resp.status();
+                let json = if status == StatusCode::OK {
+                    body_json(resp).await
+                } else {
+                    serde_json::Value::Null
+                };
+                (status, json)
+            }
+        };
+        let datas = |json: &serde_json::Value| -> Vec<String> {
+            json.as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["data"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let (status, json) = page("/exchanges/ws-1/messages").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(datas(&json), ["m0", "m1", "m2", "m3", "m4"]);
+        let (_, json) = page("/exchanges/ws-1/messages?limit=2").await;
+        assert_eq!(datas(&json), ["m0", "m1"]);
+        let (_, json) = page("/exchanges/ws-1/messages?after=1&limit=2").await;
+        assert_eq!(datas(&json), ["m2", "m3"]);
+        let (status, json) = page("/exchanges/plain/messages").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json, serde_json::json!([]));
+        let (status, _) = page("/exchanges/nope/messages").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = page("/exchanges/ws-1/messages?limit=0").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

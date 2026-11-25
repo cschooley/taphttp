@@ -1,12 +1,10 @@
 use anyhow::{Context, Result};
 use bytes::Bytes;
+use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response};
-use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::rt::TokioExecutor;
-use rustls::ClientConfig;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -20,9 +18,9 @@ use uuid::Uuid;
 
 use crate::ca::Ca;
 use crate::cli::StartArgs;
+use crate::clients::{Grant, Lookup, Refusal, Registry, Target};
 use crate::deploy::{self, Cidr, Exposure, ProxyCredentials};
 use crate::intercept::{self, Decision, InterceptEvent, RequestEvent, ResponseEvent};
-use crate::peer::{PeerSlot, RecordPeer};
 use crate::storage::{Headers, Store, TrafficEntry};
 use taphttp_types::{encode_body, header_value_to_string};
 
@@ -42,6 +40,27 @@ pub struct ProxyConfig {
     /// TLS on the proxy listener itself (an HTTPS proxy), so proxy
     /// credentials aren't cleartext on the network.
     pub tls: Option<Arc<rustls::ServerConfig>>,
+    /// Credentials issued through the lever API (`POST /clients`), whose
+    /// allowlist, rate and budget are enforced here.
+    pub clients: Option<Arc<Registry>>,
+    /// `--proxy-auth-api`: every client must present an issued credential
+    /// (or one from `--proxy-auth-file`).
+    pub require_client: bool,
+    /// taphttp's own listeners, which an issued credential may never reach.
+    /// [`serve`] adds the proxy's own.
+    pub own: Vec<SocketAddr>,
+}
+
+/// What the proxy answers its clients with: buffered, or streamed through.
+pub type ProxyBody = UnsyncBoxBody<Bytes, hyper::Error>;
+
+/// A buffered body.
+fn full(bytes: impl Into<Bytes>) -> ProxyBody {
+    full_body(Full::new(bytes.into()))
+}
+
+fn full_body(body: Full<Bytes>) -> ProxyBody {
+    body.map_err(|never| match never {}).boxed_unsync()
 }
 
 impl ProxyConfig {
@@ -108,12 +127,17 @@ pub async fn run(args: StartArgs, data_dir: PathBuf) -> Result<()> {
     let exposure = Exposure {
         proxy: Some(addr),
         proxy_tls: args.proxy_tls,
-        proxy_auth: credentials.is_some(),
+        proxy_auth: credentials.is_some() || args.proxy_auth_api,
         allow_open_proxy: args.allow_open_proxy,
         api: api_addr,
         api_tls: args.api_tls,
         api_allow_plaintext: args.api_allow_plaintext,
     };
+    if args.proxy_auth_api && api_addr.is_none() {
+        anyhow::bail!(
+            "--proxy-auth-api needs --api-listen: credentials are issued through the lever API"
+        );
+    }
     deploy::check_exposure(&exposure)?;
     let names = if args.proxy_tls || args.api_tls {
         tls_names(
@@ -161,6 +185,8 @@ pub async fn run(args: StartArgs, data_dir: PathBuf) -> Result<()> {
         });
     }
 
+    let clients = api_addr.map(|_| Arc::new(crate::clients::Registry::default()));
+    let mut own_api = Vec::new();
     let db = sqlite_path(&args, &data_dir);
     if let Some(db) = &db {
         eprintln!("recording to sqlite at {}", db.display());
@@ -179,6 +205,7 @@ pub async fn run(args: StartArgs, data_dir: PathBuf) -> Result<()> {
         // --listen becomes the real one).
         let mut described = info;
         let own = vec![listener.local_addr()?, api_listener.local_addr()?];
+        own_api.push(own[1]);
         described.exposure.proxy = Some(own[0]);
         described.exposure.api = Some(own[1]);
         let history = deploy::HistoryInfo {
@@ -215,6 +242,7 @@ pub async fn run(args: StartArgs, data_dir: PathBuf) -> Result<()> {
             ca_cert: ca.public_cert(),
             own,
             send_enabled: !args.api_no_send,
+            clients: clients.clone().expect("the API is on"),
         });
         let api_tls = if args.api_tls {
             listener_tls.clone()
@@ -235,6 +263,9 @@ pub async fn run(args: StartArgs, data_dir: PathBuf) -> Result<()> {
         credentials,
         expires,
         tls: if args.proxy_tls { listener_tls } else { None },
+        clients,
+        require_client: args.proxy_auth_api,
+        own: own_api,
     };
     serve(listener, ca, store, config).await
 }
@@ -243,9 +274,10 @@ pub async fn serve(
     listener: TcpListener,
     ca: Arc<Ca>,
     store: Arc<Store>,
-    config: ProxyConfig,
+    mut config: ProxyConfig,
 ) -> Result<()> {
     let addr = listener.local_addr()?;
+    config.own.push(addr);
     let scheme = if config.tls.is_some() {
         "https"
     } else {
@@ -294,19 +326,63 @@ where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let io = hyper_util::rt::TokioIo::new(stream);
-    hyper::server::conn::http1::Builder::new()
+    let (closer, closed) = ConnCloser::new();
+    let serving = hyper::server::conn::http1::Builder::new()
         .serve_connection(
             io,
             service_fn(move |req| {
                 let ca = ca.clone();
                 let store = store.clone();
                 let config = config.clone();
-                async move { dispatch(req, ca, store, config).await }
+                let closer = closer.clone();
+                async move { dispatch(req, ca, store, config, closer).await }
             }),
         )
-        .with_upgrades()
-        .await
-        .context("serving http1 connection")
+        .with_upgrades();
+    tokio::select! {
+        r = serving => r.context("serving http1 connection"),
+        // An issued credential used on this connection was revoked: drop it.
+        _ = crate::clients::revoked(closed) => Ok(()),
+    }
+}
+
+/// Closes a client connection when a credential used on it is revoked.
+#[derive(Clone)]
+struct ConnCloser {
+    close: Arc<tokio::sync::watch::Sender<bool>>,
+    watching: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ConnCloser {
+    fn new() -> (Self, tokio::sync::watch::Receiver<bool>) {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        (
+            Self {
+                close: Arc::new(tx),
+                watching: Default::default(),
+            },
+            rx,
+        )
+    }
+
+    /// Close this connection when `grant` is revoked. Watches once per
+    /// connection, and stops watching when the connection ends.
+    fn watch(&self, grant: &Grant) {
+        if self
+            .watching
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        let close = self.close.clone();
+        let revoked = grant.revoked.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = crate::clients::revoked(revoked) => { close.send_replace(true); }
+                _ = close.closed() => {}
+            }
+        });
+    }
 }
 
 async fn dispatch(
@@ -314,7 +390,8 @@ async fn dispatch(
     ca: Arc<Ca>,
     store: Arc<Store>,
     config: Arc<ProxyConfig>,
-) -> Result<Response<Full<Bytes>>> {
+    closer: ConnCloser,
+) -> Result<Response<ProxyBody>> {
     if config.expired() {
         return make_drop_response(503, Some("taphttp: this deployment has expired".into()));
     }
@@ -324,47 +401,61 @@ async fn dispatch(
         .headers()
         .get(hyper::header::PROXY_AUTHORIZATION)
         .map(|v| v.as_bytes());
-    let source = match deploy::authorize(header, config.credentials.as_ref()) {
-        Ok(source) => source,
-        Err(deploy::AuthRequired) => return proxy_auth_required(),
+    let lookup = match &config.clients {
+        Some(registry) => crate::clients::lookup(registry, header),
+        None => Lookup::Unknown,
+    };
+    let (source, grant) = match lookup {
+        Lookup::Granted(g) => {
+            closer.watch(&g);
+            (Some(g.id.clone()), Some(Arc::new(g)))
+        }
+        Lookup::Denied => return proxy_auth_required(),
+        Lookup::Unknown if config.require_client && config.credentials.is_none() => {
+            return proxy_auth_required()
+        }
+        Lookup::Unknown => match deploy::authorize(header, config.credentials.as_ref()) {
+            Ok(source) => (source, None),
+            Err(deploy::AuthRequired) => return proxy_auth_required(),
+        },
     };
     // `http://taphttp/`: answered here, never forwarded or recorded. A
     // CONNECT to it (https://taphttp) gets a 405: there is no upstream, and
     // a client without the CA can't trust taphttp's TLS anyway.
     if crate::cert_host::is_cert_host(req.uri()) {
-        return crate::cert_host::respond(
+        return Ok(crate::cert_host::respond(
             req.method(),
             req.uri().path(),
             &ca.public_cert(),
             &ca.fingerprint_sha256(),
-        );
+        )?
+        .map(full_body));
     }
     if req.method() == hyper::Method::CONNECT {
-        handle_connect(req, source, ca, store, config).await
+        handle_connect(req, source, grant, ca, store, config).await
     } else {
-        handle_http(req, source, store, config).await
+        handle_http(req, source, grant, store, config).await
     }
 }
 
-fn proxy_auth_required() -> Result<Response<Full<Bytes>>> {
+fn proxy_auth_required() -> Result<Response<ProxyBody>> {
     Ok(Response::builder()
         .status(407)
         .header(
             hyper::header::PROXY_AUTHENTICATE,
             r#"Basic realm="taphttp""#,
         )
-        .body(Full::new(Bytes::from_static(
-            b"proxy authentication required",
-        )))?)
+        .body(full(Bytes::from_static(b"proxy authentication required")))?)
 }
 
 async fn handle_connect(
     req: Request<Incoming>,
     source: Option<String>,
+    grant: Option<Arc<Grant>>,
     ca: Arc<Ca>,
     store: Arc<Store>,
     config: Arc<ProxyConfig>,
-) -> Result<Response<Full<Bytes>>> {
+) -> Result<Response<ProxyBody>> {
     let host_port = req
         .uri()
         .authority()
@@ -377,30 +468,85 @@ async fn handle_connect(
         .unwrap_or(&host_port)
         .to_string();
 
-    tokio::task::spawn(async move {
-        match hyper::upgrade::on(req).await {
-            Ok(upgraded) => {
-                if let Err(e) = mitm_tls(upgraded, host, host_port, source, ca, store, config).await
-                {
-                    tracing::debug!("mitm error: {e}");
-                }
+    // An issued credential's allowlist is checked here, once, and every
+    // request in the tunnel connects only to the addresses checked.
+    let mut addrs = None;
+    if let Some(g) = &grant {
+        let port = req.uri().port_u16().unwrap_or(443);
+        let refusal = match crate::clients::check_target(&g.allow, &host, port, &config.own).await {
+            Target::Allowed(a) => {
+                addrs = Some(Arc::new(a));
+                None
             }
-            Err(e) => tracing::debug!("upgrade error: {e}"),
+            Target::Refused(r) => Some(r),
+            // Allowed by name but unresolvable: nothing to tunnel to.
+            Target::Unresolvable(e) => {
+                tracing::debug!("CONNECT {host_port}: {e}");
+                return make_drop_response(502, Some(format!("taphttp: {e}")));
+            }
+        };
+        if let Some(r) = refusal {
+            let url = host_port.clone();
+            return refuse(&req, host, url, source, g, r, &store, &config);
+        }
+    }
+
+    tokio::task::spawn(async move {
+        let revoked = grant.as_ref().map(|g| g.revoked.clone());
+        let tunnel = async {
+            match hyper::upgrade::on(req).await {
+                Ok(upgraded) => {
+                    let target = Tunnel {
+                        host,
+                        host_port,
+                        source,
+                        grant,
+                        addrs,
+                    };
+                    if let Err(e) = mitm_tls(upgraded, target, ca, store, config).await {
+                        tracing::debug!("mitm error: {e}");
+                    }
+                }
+                Err(e) => tracing::debug!("upgrade error: {e}"),
+            }
+        };
+        match revoked {
+            // Revoking the credential closes the tunnel.
+            Some(r) => tokio::select! {
+                _ = tunnel => {}
+                _ = crate::clients::revoked(r) => {}
+            },
+            None => tunnel.await,
         }
     });
 
-    Ok(Response::new(Full::new(Bytes::new())))
+    Ok(Response::new(full(Bytes::new())))
+}
+
+/// Where a CONNECT tunnel goes and who opened it.
+struct Tunnel {
+    host: String,
+    host_port: String,
+    source: Option<String>,
+    grant: Option<Arc<Grant>>,
+    /// Checked at CONNECT time for an issued credential.
+    addrs: Option<Arc<Vec<SocketAddr>>>,
 }
 
 async fn mitm_tls(
     upgraded: hyper::upgrade::Upgraded,
-    host: String,
-    host_port: String,
-    source: Option<String>,
+    tunnel: Tunnel,
     ca: Arc<Ca>,
     store: Arc<Store>,
     config: Arc<ProxyConfig>,
 ) -> Result<()> {
+    let Tunnel {
+        host,
+        host_port,
+        source,
+        grant,
+        addrs,
+    } = tunnel;
     let server_cfg = ca
         .server_config_for(&host)
         .await
@@ -423,6 +569,8 @@ async fn mitm_tls(
                 let host = host_clone.clone();
                 let host_port = host_port_clone.clone();
                 let source = source.clone();
+                let grant = grant.clone();
+                let addrs = addrs.clone();
                 let store = store.clone();
                 let config = config.clone();
                 async move {
@@ -440,26 +588,128 @@ async fn mitm_tls(
                         .unwrap_or("/");
                     let full_url = format!("https://{host_port}{path}");
                     *req.uri_mut() = full_url.parse()?;
-                    forward_https(req, host, source, store, config).await
+                    forward(req, host, source, grant, addrs, store, config).await
                 }
             }),
         )
+        // WebSockets inside the tunnel (wss).
+        .with_upgrades()
         .await
         .context("serving mitm https")
 }
 
-async fn forward_https(
+/// A plain-HTTP request from the client: absolute-form, so the URL names
+/// the upstream.
+async fn handle_http(
     req: Request<Incoming>,
-    host: String,
     source: Option<String>,
+    grant: Option<Arc<Grant>>,
     store: Arc<Store>,
     config: Arc<ProxyConfig>,
-) -> Result<Response<Full<Bytes>>> {
-    if let Some(f) = &config.filter_host {
-        if !host.contains(f.as_str()) {
-            return passthrough_https(req).await;
+) -> Result<Response<ProxyBody>> {
+    let host = req.uri().host().unwrap_or("").to_string();
+    forward(req, host, source, grant, None, store, config).await
+}
+
+/// Refuse a request made with an issued credential: record it (`refused`,
+/// nothing sent), count it, and answer 403 or 429.
+#[allow(clippy::too_many_arguments)]
+fn refuse(
+    req: &Request<Incoming>,
+    host: String,
+    url: String,
+    source: Option<String>,
+    grant: &Grant,
+    refusal: Refusal,
+    store: &Store,
+    config: &ProxyConfig,
+) -> Result<Response<ProxyBody>> {
+    if !matches!(
+        refusal,
+        Refusal::Rate { .. } | Refusal::Budget | Refusal::Revoked
+    ) {
+        // `admit` counted those itself.
+        if let Some(registry) = &config.clients {
+            registry.note_refused(&grant.id);
         }
     }
+    let mut req_headers = collect_headers(req.headers());
+    req_headers.remove("proxy-authorization");
+    let reason = refusal.reason();
+    tracing::info!("{} {} {reason}", req.method(), url);
+    store.record(TrafficEntry {
+        id: Uuid::new_v4().to_string(),
+        ts: Timestamp::now(),
+        host,
+        method: req.method().to_string(),
+        url,
+        req_headers,
+        req_body: None,
+        req_body_encoding: Default::default(),
+        status: None,
+        res_headers: Headers::new(),
+        res_body: None,
+        res_body_encoding: Default::default(),
+        duration_ms: None,
+        replay_of: None,
+        source,
+        meta: grant.meta.clone(),
+        error: Some(reason.clone()),
+        origin: crate::storage::Origin::Proxy,
+        peer: None,
+        refused: true,
+    });
+    let mut res = Response::builder().status(refusal.status());
+    if let Refusal::Rate { retry_after } = refusal {
+        res = res.header(
+            hyper::header::RETRY_AFTER,
+            retry_after.as_secs_f64().ceil().max(1.0).to_string(),
+        );
+    }
+    Ok(res.body(full(format!("taphttp: {reason}")))?)
+}
+
+/// Forward one proxied request (plain HTTP, or from inside a MITM'd
+/// tunnel; `req`'s URI is absolute either way) and record the exchange,
+/// unless `--filter-host` leaves this host out.
+async fn forward(
+    mut req: Request<Incoming>,
+    host: String,
+    source: Option<String>,
+    grant: Option<Arc<Grant>>,
+    addrs: Option<Arc<Vec<SocketAddr>>>,
+    store: Arc<Store>,
+    config: Arc<ProxyConfig>,
+) -> Result<Response<ProxyBody>> {
+    // An issued credential: the host check (unless a CONNECT already did
+    // it), then its budget and rate.
+    let mut checked = addrs.map(|a| a.to_vec());
+    let mut unresolvable = None;
+    if let Some(g) = &grant {
+        if checked.is_none() {
+            let port = req.uri().port_u16().unwrap_or(80);
+            match crate::clients::check_target(&g.allow, &host, port, &config.own).await {
+                Target::Allowed(a) => checked = Some(a),
+                Target::Unresolvable(e) => unresolvable = Some(e),
+                Target::Refused(r) => {
+                    let url = req.uri().to_string();
+                    return refuse(&req, host, url, source, g, r, &store, &config);
+                }
+            }
+        }
+        if let Some(registry) = &config.clients {
+            if let Err(r) = registry.admit(&g.id, std::time::Instant::now()) {
+                let url = req.uri().to_string();
+                return refuse(&req, host, url, source, g, r, &store, &config);
+            }
+        }
+    }
+    let meta = grant.as_ref().map(|g| g.meta.clone()).unwrap_or_default();
+
+    let record = config
+        .filter_host
+        .as_ref()
+        .is_none_or(|f| host.contains(f.as_str()));
 
     let id = Uuid::new_v4().to_string();
     let mut method = req.method().to_string();
@@ -468,12 +718,19 @@ async fn forward_https(
     // Proxy credentials are ours: never logged, never shown to an intercept
     // hook, never sent upstream.
     req_headers.remove("proxy-authorization");
+    // A WebSocket handshake: take the client side of the upgrade now, and
+    // negotiate no extensions, since the relay can't read compressed frames.
+    let mut client_upgrade =
+        crate::stream::is_websocket_upgrade(req.headers()).then(|| hyper::upgrade::on(&mut req));
+    if client_upgrade.is_some() {
+        req_headers.remove("sec-websocket-extensions");
+    }
 
     let (_, body) = req.into_parts();
     let mut req_body_bytes = body.collect().await?.to_bytes();
 
     // --- intercept request ---
-    if let Some(socket) = &config.intercept_socket {
+    if let (true, Some(socket)) = (record, &config.intercept_socket) {
         let event = InterceptEvent::Request(RequestEvent {
             id: id.clone(),
             method: method.clone(),
@@ -501,8 +758,92 @@ async fn forward_https(
 
     let start = Instant::now();
     let upstream_req = build_upstream_request(&method, &url, &req_headers, req_body_bytes.clone())?;
-    let (res, peer) = send_https(upstream_req).await;
+    let resolved = match (checked, unresolvable) {
+        (Some(a), _) => Ok(a),
+        (None, Some(e)) => Err(e),
+        (None, None) => crate::upstream::resolve(upstream_req.uri())
+            .await
+            .map_err(|e| format!("resolving host: {e}")),
+    };
+    let (res, peer) = match resolved {
+        Ok(addrs) => {
+            let (res, peer) = crate::upstream::request(upstream_req, addrs).await;
+            (
+                res.map_err(|e| format!("sending request: {}", crate::upstream::error_chain(&e))),
+                peer.get(),
+            )
+        }
+        Err(e) => (Err(e), None),
+    };
     let duration_ms = start.elapsed().as_millis() as u64;
+
+    // A WebSocket the upstream accepted, or an event stream: recorded now,
+    // then passed through as it flows (no response intercept, no buffering).
+    let res = match res {
+        Ok(mut r) => {
+            let upgrade = (r.status() == hyper::StatusCode::SWITCHING_PROTOCOLS)
+                .then(|| client_upgrade.take())
+                .flatten();
+            let event_stream = crate::stream::is_event_stream(r.headers());
+            if upgrade.is_some() || event_stream {
+                let raw = r.headers().clone();
+                let status = r.status().as_u16();
+                let recorder = record.then(|| {
+                    let (req_body, req_body_encoding) = encode_body(&req_body_bytes);
+                    store.record(TrafficEntry {
+                        id: id.clone(),
+                        ts: Timestamp::now(),
+                        host: host.clone(),
+                        method: method.clone(),
+                        url: url.clone(),
+                        req_headers: req_headers.clone(),
+                        req_body,
+                        req_body_encoding,
+                        status: Some(status),
+                        res_headers: collect_headers(&raw),
+                        res_body: None,
+                        res_body_encoding: Default::default(),
+                        duration_ms: Some(duration_ms),
+                        replay_of: None,
+                        source: source.clone(),
+                        meta: meta.clone(),
+                        error: None,
+                        origin: crate::storage::Origin::Proxy,
+                        peer,
+                        refused: false,
+                    });
+                    crate::stream::Recorder::new(store.clone(), id.clone())
+                });
+                tracing::info!("{method} {url} {status} {duration_ms}ms (streaming)");
+                if let Some(client_upgrade) = upgrade {
+                    let upstream_upgrade = hyper::upgrade::on(&mut r);
+                    let revoked = grant.as_ref().map(|g| g.revoked.clone());
+                    let stop = async move {
+                        match revoked {
+                            Some(r) => crate::clients::revoked(r).await,
+                            None => std::future::pending().await,
+                        }
+                    };
+                    tokio::spawn(crate::stream::relay_websocket(
+                        client_upgrade,
+                        upstream_upgrade,
+                        recorder,
+                        stop,
+                    ));
+                    return switching_protocols(&raw);
+                }
+                // A compressed stream passes through, but its events can't
+                // be read.
+                let readable = raw
+                    .get(hyper::header::CONTENT_ENCODING)
+                    .is_none_or(|v| v.as_bytes().eq_ignore_ascii_case(b"identity"));
+                let body = crate::stream::SseTap::new(r.into_body(), recorder.filter(|_| readable));
+                return client_response_streamed(status, &raw, body.boxed());
+            }
+            Ok(r)
+        }
+        Err(e) => Err(e),
+    };
 
     let mut upstream_error = None;
     let (mut status, mut res_headers, mut res_raw_headers, mut res_body_bytes) = match res {
@@ -515,10 +856,16 @@ async fn forward_https(
         }
         Err(e) => {
             tracing::debug!("upstream error: {e}");
-            upstream_error = Some(format!("{e:#}"));
+            upstream_error = Some(e);
             (None, Headers::new(), hyper::HeaderMap::new(), Bytes::new())
         }
     };
+    if !record {
+        return match status {
+            Some(s) => client_response(s, &res_raw_headers, res_body_bytes),
+            None => make_drop_response(502, None),
+        };
+    }
 
     // --- intercept response ---
     if let Some(socket) = &config.intercept_socket {
@@ -556,7 +903,7 @@ async fn forward_https(
     let entry = TrafficEntry {
         id,
         ts: Timestamp::now(),
-        host: host.clone(),
+        host,
         method,
         url,
         req_headers,
@@ -568,11 +915,12 @@ async fn forward_https(
         res_body_encoding,
         duration_ms: Some(duration_ms),
         replay_of: None,
-        source: source.clone(),
-        meta: Default::default(),
+        source,
+        meta,
         error: upstream_error,
         origin: crate::storage::Origin::Proxy,
-        peer: peer.get(),
+        peer,
+        refused: false,
     };
 
     tracing::info!(
@@ -592,207 +940,6 @@ async fn forward_https(
         Some(s) => client_response(s, &res_raw_headers, res_body_bytes),
         None => make_drop_response(502, None),
     }
-}
-
-async fn passthrough_https(req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
-    let url = req.uri().to_string();
-    let (parts, body) = req.into_parts();
-    let body_bytes = body.collect().await?.to_bytes();
-    let upstream = rebuild_request(&parts, body_bytes, &url)?;
-    let res = send_https(upstream).await.0?;
-    let status = res.status().as_u16();
-    let headers = res.headers().clone();
-    let body = res.into_body().collect().await?.to_bytes();
-    client_response(status, &headers, body)
-}
-
-/// Send `req` over a fresh client; the slot says where it connected.
-async fn send_https(req: Request<Full<Bytes>>) -> (Result<Response<Incoming>>, PeerSlot) {
-    let mut http = HttpConnector::new();
-    http.enforce_http(false);
-    let (http, peer) = RecordPeer::new(http);
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let tls = ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-    let https = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_tls_config(tls)
-        .https_or_http()
-        .enable_http1()
-        .wrap_connector(http);
-    let client = hyper_util::client::legacy::Client::builder(TokioExecutor::new())
-        .build::<_, Full<Bytes>>(https);
-    let res = client.request(req).await.context("https upstream request");
-    (res, peer)
-}
-
-async fn handle_http(
-    req: Request<Incoming>,
-    source: Option<String>,
-    store: Arc<Store>,
-    config: Arc<ProxyConfig>,
-) -> Result<Response<Full<Bytes>>> {
-    let host = req.uri().host().unwrap_or("").to_string();
-
-    if let Some(f) = &config.filter_host {
-        if !host.contains(f.as_str()) {
-            return forward_http_raw(req).await;
-        }
-    }
-
-    let id = Uuid::new_v4().to_string();
-    let mut method = req.method().to_string();
-    let mut url = req.uri().to_string();
-    let mut req_headers = collect_headers(req.headers());
-    // Proxy credentials are ours: never logged, never shown to an intercept
-    // hook, never sent upstream.
-    req_headers.remove("proxy-authorization");
-
-    let (_, body) = req.into_parts();
-    let mut req_body_bytes = body.collect().await?.to_bytes();
-
-    // --- intercept request ---
-    if let Some(socket) = &config.intercept_socket {
-        let event = InterceptEvent::Request(RequestEvent {
-            id: id.clone(),
-            method: method.clone(),
-            url: url.clone(),
-            headers: intercept_header_map(&req_headers),
-            body: maybe_utf8(&req_body_bytes),
-        });
-        match intercept::pause(socket, &event).await {
-            Ok(Decision::Forward(mods)) => {
-                apply_request_mods(
-                    &mut method,
-                    &mut url,
-                    &mut req_headers,
-                    &mut req_body_bytes,
-                    mods,
-                );
-            }
-            Ok(Decision::Drop(d)) => return make_drop_response(d.status.unwrap_or(403), d.body),
-            Err(e) => {
-                tracing::warn!("intercept error on request: {e}");
-                return make_drop_response(502, Some("intercept unavailable".into()));
-            }
-        }
-    }
-
-    let start = Instant::now();
-    let upstream_req = build_upstream_request(&method, &url, &req_headers, req_body_bytes.clone())?;
-    let (res, peer) = forward_http_request(upstream_req).await;
-    let duration_ms = start.elapsed().as_millis() as u64;
-
-    let mut upstream_error = None;
-    let (mut status, mut res_headers, mut res_raw_headers, mut res_body_bytes) = match res {
-        Ok(r) => {
-            let s = r.status().as_u16();
-            let h = collect_headers(r.headers());
-            let raw = r.headers().clone();
-            let b = r.into_body().collect().await?.to_bytes();
-            (Some(s), h, raw, b)
-        }
-        Err(e) => {
-            tracing::debug!("http upstream error: {e}");
-            upstream_error = Some(format!("{e:#}"));
-            (None, Headers::new(), hyper::HeaderMap::new(), Bytes::new())
-        }
-    };
-
-    // --- intercept response ---
-    if let Some(socket) = &config.intercept_socket {
-        if let Some(s) = status {
-            let event = InterceptEvent::Response(ResponseEvent {
-                id: Uuid::new_v4().to_string(),
-                request_id: id.clone(),
-                status: s,
-                headers: intercept_header_map(&res_headers),
-                body: maybe_utf8(&res_body_bytes),
-            });
-            match intercept::pause(socket, &event).await {
-                Ok(Decision::Forward(mods)) => {
-                    apply_response_mods(
-                        &mut status,
-                        &mut res_headers,
-                        &mut res_raw_headers,
-                        &mut res_body_bytes,
-                        mods,
-                    );
-                }
-                Ok(Decision::Drop(d)) => {
-                    return make_drop_response(d.status.unwrap_or(502), d.body);
-                }
-                Err(e) => {
-                    tracing::warn!("intercept error on response: {e}");
-                    return make_drop_response(502, Some("intercept unavailable".into()));
-                }
-            }
-        }
-    }
-
-    let (req_body, req_body_encoding) = encode_body(&req_body_bytes);
-    let (res_body, res_body_encoding) = encode_body(&res_body_bytes);
-    let entry = TrafficEntry {
-        id,
-        ts: Timestamp::now(),
-        host: host.clone(),
-        method,
-        url,
-        req_headers,
-        req_body,
-        req_body_encoding,
-        status,
-        res_headers,
-        res_body,
-        res_body_encoding,
-        duration_ms: Some(duration_ms),
-        replay_of: None,
-        source: source.clone(),
-        meta: Default::default(),
-        error: upstream_error,
-        origin: crate::storage::Origin::Proxy,
-        peer: peer.get(),
-    };
-
-    tracing::info!(
-        "{} {} {} {}ms",
-        entry.method,
-        entry.url,
-        entry
-            .status
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "ERR".to_string()),
-        duration_ms
-    );
-
-    store.record(entry);
-
-    match status {
-        Some(s) => client_response(s, &res_raw_headers, res_body_bytes),
-        None => make_drop_response(502, None),
-    }
-}
-
-async fn forward_http_raw(req: Request<Incoming>) -> Result<Response<Full<Bytes>>> {
-    let url = req.uri().to_string();
-    let (parts, body) = req.into_parts();
-    let body_bytes = body.collect().await?.to_bytes();
-    let upstream = rebuild_request(&parts, body_bytes, &url)?;
-    let res = forward_http_request(upstream).await.0?;
-    let status = res.status().as_u16();
-    let headers = res.headers().clone();
-    let body = res.into_body().collect().await?.to_bytes();
-    client_response(status, &headers, body)
-}
-
-/// Send `req` over a fresh client; the slot says where it connected.
-async fn forward_http_request(req: Request<Full<Bytes>>) -> (Result<Response<Incoming>>, PeerSlot) {
-    let (connector, peer) = RecordPeer::new(HttpConnector::new());
-    let client = hyper_util::client::legacy::Client::builder(TokioExecutor::new())
-        .build::<_, Full<Bytes>>(connector);
-    let res = client.request(req).await.context("http upstream request");
-    (res, peer)
 }
 
 fn build_upstream_request(
@@ -809,25 +956,6 @@ fn build_upstream_request(
         if !k.eq_ignore_ascii_case("host")
             && !k.eq_ignore_ascii_case("proxy-connection")
             && !k.eq_ignore_ascii_case("proxy-authorization")
-        {
-            builder = builder.header(k, v);
-        }
-    }
-    Ok(builder.body(Full::new(body))?)
-}
-
-fn rebuild_request(
-    parts: &hyper::http::request::Parts,
-    body: Bytes,
-    url: &str,
-) -> Result<Request<Full<Bytes>>> {
-    let mut builder = Request::builder()
-        .method(parts.method.clone())
-        .uri(url.parse::<hyper::Uri>()?);
-    for (k, v) in &parts.headers {
-        if k != hyper::header::HOST
-            && k != "proxy-connection"
-            && k != hyper::header::PROXY_AUTHORIZATION
         {
             builder = builder.header(k, v);
         }
@@ -896,7 +1024,34 @@ fn client_response(
     status: u16,
     headers: &hyper::HeaderMap,
     body: Bytes,
-) -> Result<Response<Full<Bytes>>> {
+) -> Result<Response<ProxyBody>> {
+    client_response_streamed(status, headers, full(body))
+}
+
+/// The 101 for an accepted WebSocket: upstream's headers, `Upgrade` and
+/// `Connection` included (they are the point), minus framing and proxy
+/// headers.
+fn switching_protocols(headers: &hyper::HeaderMap) -> Result<Response<ProxyBody>> {
+    let mut builder = Response::builder().status(hyper::StatusCode::SWITCHING_PROTOCOLS);
+    for (k, v) in headers {
+        let name = k.as_str();
+        if name != "connection"
+            && name != "upgrade"
+            && (NOT_FORWARDED.contains(&name) || name == "content-length")
+        {
+            continue;
+        }
+        builder = builder.header(k, v);
+    }
+    Ok(builder.body(full(Bytes::new()))?)
+}
+
+/// [`client_response`] with any body, e.g. one streamed through.
+fn client_response_streamed(
+    status: u16,
+    headers: &hyper::HeaderMap,
+    body: ProxyBody,
+) -> Result<Response<ProxyBody>> {
     // Headers named in Connection are hop-by-hop too.
     let named: Vec<String> = headers
         .get_all(hyper::header::CONNECTION)
@@ -916,7 +1071,7 @@ fn client_response(
         }
         builder = builder.header(k, v);
     }
-    Ok(builder.body(Full::new(body))?)
+    Ok(builder.body(body)?)
 }
 
 /// Build a sendable header map from string headers (an intercept hook's
@@ -936,13 +1091,13 @@ fn to_header_map(headers: &Headers) -> hyper::HeaderMap {
     map
 }
 
-fn make_drop_response(status: u16, body: Option<String>) -> Result<Response<Full<Bytes>>> {
+fn make_drop_response(status: u16, body: Option<String>) -> Result<Response<ProxyBody>> {
     let body_bytes = body
         .map(|b| Bytes::from(b.into_bytes()))
         .unwrap_or_default();
     Ok(Response::builder()
         .status(status)
-        .body(Full::new(body_bytes))
+        .body(full(body_bytes))
         .unwrap())
 }
 
@@ -1091,6 +1246,7 @@ mod tests {
             tls_name: vec![],
             allow_open_proxy: false,
             api_no_send: false,
+            proxy_auth_api: false,
             api_allow_plaintext: false,
             expires: None,
         }
@@ -1124,19 +1280,15 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_request_strips_proxy_connection_header() {
-        let original = Request::builder()
-            .method("GET")
-            .uri("http://example.com/")
-            .header("proxy-connection", "keep-alive")
-            .header("accept", "*/*")
-            .body(Full::new(Bytes::new()))
-            .unwrap();
-        let (parts, body) = original.into_parts();
-        let rebuilt = rebuild_request(&parts, Bytes::new(), "http://example.com/").unwrap();
-        assert!(!rebuilt.headers().contains_key("proxy-connection"));
-        assert!(rebuilt.headers().contains_key("accept"));
-        drop(body);
+    fn upstream_request_strips_proxy_headers() {
+        let mut h = Headers::new();
+        h.append("proxy-connection", "keep-alive");
+        h.append("proxy-authorization", "Basic eDp5");
+        h.append("accept", "*/*");
+        let req = build_upstream_request("GET", "http://example.com/", &h, Bytes::new()).unwrap();
+        assert!(!req.headers().contains_key("proxy-connection"));
+        assert!(!req.headers().contains_key("proxy-authorization"));
+        assert!(req.headers().contains_key("accept"));
     }
 
     // --- integration test helpers ---
@@ -1226,7 +1378,8 @@ mod tests {
         // `main` does this; tests that do TLS need it too.
         let _ = rustls::crypto::ring::default_provider().install_default();
         let ca = Arc::new(Ca::load_or_create(data_dir).unwrap());
-        let store = Store::new(Some(log_file), None).unwrap();
+        // sqlite too, for the messages (see `messages_of`).
+        let store = Store::new(Some(log_file), Some(&data_dir.join("t.db"))).unwrap();
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = proxy_listener.local_addr().unwrap().port();
         tokio::spawn(serve(proxy_listener, ca, store, config));
@@ -1894,7 +2047,7 @@ mod tests {
         for c in CertificateDer::pem_slice_iter(pem.as_bytes()) {
             roots.add(c.unwrap()).unwrap();
         }
-        let cfg = ClientConfig::builder()
+        let cfg = rustls::ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
         tokio_rustls::TlsConnector::from(Arc::new(cfg))
@@ -1976,6 +2129,769 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert!(entries[0].error.is_some());
         assert_eq!(entries[0].peer, Some(up_addr));
+    }
+
+    // --- WebSocket and SSE (#26) ---
+
+    fn messages_of(dir: &std::path::Path, id: &str) -> Vec<taphttp_types::Message> {
+        crate::storage::SqliteBackend::new(&dir.join("t.db"))
+            .unwrap()
+            .messages(id, None, 1000)
+            .unwrap()
+    }
+
+    type Seen = Arc<std::sync::Mutex<Vec<hyper::HeaderMap>>>;
+
+    /// A WebSocket echo server that greets each client with Binary [1,2,3].
+    /// With `tls`, it speaks wss with a certificate taphttp trusts.
+    async fn start_ws_upstream(tls: Option<&std::path::Path>) -> (u16, Seen) {
+        let acceptor = match tls {
+            Some(dir) => {
+                let ca = Ca::load_or_create(dir).unwrap();
+                crate::upstream::TEST_ROOTS
+                    .lock()
+                    .unwrap()
+                    .push(ca.public_cert().der.into());
+                Some(TlsAcceptor::from(
+                    ca.server_config_for("localhost").await.unwrap(),
+                ))
+            }
+            None => None,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen: Seen = Default::default();
+        let s = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let s = s.clone();
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let callback =
+                        |req: &tokio_tungstenite::tungstenite::handshake::server::Request, res| {
+                            s.lock().unwrap().push(req.headers().clone());
+                            Ok(res)
+                        };
+                    match acceptor {
+                        Some(a) => {
+                            let tls = a.accept(stream).await.unwrap();
+                            let ws = tokio_tungstenite::accept_hdr_async(tls, callback).await;
+                            echo(ws.unwrap()).await
+                        }
+                        None => {
+                            let ws = tokio_tungstenite::accept_hdr_async(stream, callback).await;
+                            echo(ws.unwrap()).await
+                        }
+                    }
+                });
+            }
+        });
+        (port, seen)
+    }
+
+    async fn echo<S>(mut ws: tokio_tungstenite::WebSocketStream<S>)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message as M;
+        ws.send(M::Binary(vec![1, 2, 3].into())).await.unwrap();
+        while let Some(Ok(m)) = ws.next().await {
+            if matches!(m, M::Text(_) | M::Binary(_)) && ws.send(m).await.is_err() {
+                break;
+            }
+        }
+    }
+
+    /// The client side of a WebSocket handshake over `io` (through the
+    /// proxy: `target` is absolute-form, or origin-form inside a tunnel).
+    async fn ws_through<IO>(
+        mut io: IO,
+        target: &str,
+        auth: Option<&str>,
+    ) -> (u16, tokio_tungstenite::WebSocketStream<IO>)
+    where
+        IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let mut head = format!(
+            "GET {target} HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\n\
+             Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Sec-WebSocket-Extensions: permessage-deflate\r\n"
+        );
+        if let Some(a) = auth {
+            head.push_str(&format!("Proxy-Authorization: {}\r\n", basic_header(a)));
+        }
+        head.push_str("\r\n");
+        io.write_all(head.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        let mut byte = [0u8; 1];
+        while !buf.ends_with(b"\r\n\r\n") {
+            assert_eq!(io.read(&mut byte).await.unwrap(), 1, "head cut short");
+            buf.push(byte[0]);
+        }
+        let head = String::from_utf8_lossy(&buf).to_ascii_lowercase();
+        let status: u16 = head[9..12].parse().unwrap();
+        if status == 101 {
+            for needle in [
+                "sec-websocket-accept: s3pplmbitxaq9kygzzhzrbk+xoo=",
+                "upgrade: websocket",
+                "connection: upgrade",
+            ] {
+                assert!(head.contains(needle), "{needle} reaches the client: {head}");
+            }
+        }
+        let ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            io,
+            tokio_tungstenite::tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await;
+        (status, ws)
+    }
+
+    /// Talk to the echo server and check what came back.
+    async fn chat<S>(ws: &mut tokio_tungstenite::WebSocketStream<S>)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message as M;
+        let hello = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("a message within 5s")
+            .unwrap()
+            .unwrap();
+        assert_eq!(hello, M::Binary(vec![1, 2, 3].into()));
+        ws.send(M::Text("hello".into())).await.unwrap();
+        assert_eq!(ws.next().await.unwrap().unwrap(), M::Text("hello".into()));
+        ws.send(M::Binary(vec![0xff, 0].into())).await.unwrap();
+        assert_eq!(
+            ws.next().await.unwrap().unwrap(),
+            M::Binary(vec![0xff, 0].into())
+        );
+        ws.close(None).await.unwrap();
+        while let Some(Ok(_)) = ws.next().await {}
+    }
+
+    /// What a [`chat`] records, in order.
+    fn check_chat_recorded(messages: &[taphttp_types::Message]) {
+        use taphttp_types::{Direction::*, MessageKind, Opcode::*};
+        let got: Vec<_> = messages
+            .iter()
+            .map(|m| {
+                (
+                    m.direction,
+                    m.opcode.unwrap(),
+                    m.data_bytes().unwrap().unwrap_or_default(),
+                )
+            })
+            .collect();
+        assert!(got.len() >= 6, "{got:?}");
+        assert_eq!(
+            got[..6],
+            [
+                (ServerToClient, Binary, vec![1, 2, 3]),
+                (ClientToServer, Text, b"hello".to_vec()),
+                (ServerToClient, Text, b"hello".to_vec()),
+                (ClientToServer, Binary, vec![0xff, 0]),
+                (ServerToClient, Binary, vec![0xff, 0]),
+                (ClientToServer, Close, vec![]),
+            ]
+        );
+        for (i, m) in messages.iter().enumerate() {
+            assert_eq!(m.seq, i as u64);
+            assert_eq!(m.kind, MessageKind::Websocket);
+            assert_eq!(
+                m.size,
+                m.data_bytes().unwrap().map_or(0, |d| d.len()) as u64
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn websockets_are_relayed_and_every_message_recorded() {
+        let (up, seen) = start_ws_upstream(None).await;
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("t.jsonl");
+        let port = start_proxy(dir.path(), &log, None).await;
+        let stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        let (status, mut ws) =
+            ws_through(stream, &format!("http://127.0.0.1:{up}/chat"), None).await;
+        assert_eq!(status, 101);
+        chat(&mut ws).await;
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let entries = logged(&log);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].status, Some(101));
+        assert!(entries[0].url.ends_with("/chat"));
+        check_chat_recorded(&messages_of(dir.path(), &entries[0].id));
+        let up_headers = &seen.lock().unwrap()[0];
+        assert!(
+            !up_headers.contains_key("sec-websocket-extensions"),
+            "no extensions: the relay can't read compressed frames"
+        );
+    }
+
+    #[tokio::test]
+    async fn websockets_inside_a_mitm_tunnel_are_relayed_and_recorded() {
+        let up_dir = TempDir::new().unwrap();
+        let (up, _) = start_ws_upstream(Some(up_dir.path())).await;
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("t.jsonl");
+        let port = start_proxy(dir.path(), &log, None).await;
+        let (status, tls) =
+            connect_tunnel(port, &format!("localhost:{up}"), None, dir.path()).await;
+        assert_eq!(status, 200);
+        let (status, mut ws) = ws_through(tls.unwrap(), "/chat", None).await;
+        assert_eq!(status, 101);
+        chat(&mut ws).await;
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let entries = logged(&log);
+        assert_eq!(entries[0].status, Some(101));
+        assert!(
+            entries[0].url.starts_with("https://localhost:"),
+            "{}",
+            entries[0].url
+        );
+        check_chat_recorded(&messages_of(dir.path(), &entries[0].id));
+    }
+
+    #[tokio::test]
+    async fn a_websocket_outside_the_filter_is_relayed_unrecorded() {
+        let (up, _) = start_ws_upstream(None).await;
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("t.jsonl");
+        let port = start_proxy_with(
+            dir.path(),
+            &log,
+            ProxyConfig {
+                filter_host: Some("example.com".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+        let stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        let (status, mut ws) = ws_through(stream, &format!("http://127.0.0.1:{up}/"), None).await;
+        assert_eq!(status, 101);
+        chat(&mut ws).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!log.exists() || logged(&log).is_empty());
+    }
+
+    #[tokio::test]
+    async fn revoking_a_credential_closes_its_websockets() {
+        use futures_util::StreamExt;
+        let (up, _) = start_ws_upstream(None).await;
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("t.jsonl");
+        let reg = Arc::new(crate::clients::Registry::default());
+        let (id, creds) = issue(&reg, &["127.0.0.1"], None, None);
+        let port = start_proxy_with(dir.path(), &log, with_clients(&reg)).await;
+        let stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        let (status, mut ws) =
+            ws_through(stream, &format!("http://127.0.0.1:{up}/"), Some(&creds)).await;
+        assert_eq!(status, 101);
+        ws.next().await.unwrap().unwrap();
+        assert!(reg.revoke(&id));
+        let end = tokio::time::timeout(Duration::from_secs(2), ws.next())
+            .await
+            .expect("the socket is closed");
+        assert!(!matches!(
+            end,
+            Some(Ok(tokio_tungstenite::tungstenite::Message::Text(_)))
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(logged(&log)[0].meta["task"], "T-7");
+    }
+
+    type EventTx = tokio::sync::mpsc::UnboundedSender<String>;
+
+    /// An upstream whose `text/event-stream` body is whatever the test
+    /// sends on the returned channel; dropping it ends the stream.
+    async fn start_sse_upstream() -> (u16, Arc<tokio::sync::Mutex<Option<EventTx>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let slot: Arc<tokio::sync::Mutex<Option<EventTx>>> = Default::default();
+        let s = slot.clone();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let s = s.clone();
+            hyper::server::conn::http1::Builder::new()
+                .serve_connection(
+                    hyper_util::rt::TokioIo::new(stream),
+                    service_fn(move |_req: Request<Incoming>| {
+                        let s = s.clone();
+                        async move {
+                            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                            *s.lock().await = Some(tx);
+                            let body = http_body_util::StreamBody::new(
+                                futures_util::stream::unfold(rx, next_chunk),
+                            );
+                            Ok::<_, anyhow::Error>(
+                                Response::builder()
+                                    .header("content-type", "text/event-stream")
+                                    .header("cache-control", "no-cache")
+                                    .body(body)
+                                    .unwrap(),
+                            )
+                        }
+                    }),
+                )
+                .await
+                .ok();
+        });
+        (port, slot)
+    }
+
+    async fn next_chunk(
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) -> Option<(
+        Result<hyper::body::Frame<Bytes>, std::convert::Infallible>,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+    )> {
+        let chunk = rx.recv().await?;
+        Some((Ok(hyper::body::Frame::data(Bytes::from(chunk))), rx))
+    }
+
+    #[tokio::test]
+    async fn event_streams_are_streamed_through_and_each_event_recorded() {
+        let (up, tx) = start_sse_upstream().await;
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("t.jsonl");
+        let port = start_proxy(dir.path(), &log, None).await;
+        let stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        let (mut sender, conn) =
+            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
+                .await
+                .unwrap();
+        tokio::spawn(conn);
+        let res = sender
+            .send_request(proxied_get(&format!("http://127.0.0.1:{up}/events"), None))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        assert_eq!(res.headers()["content-type"], "text/event-stream");
+        let mut body = res.into_body();
+        let tx = tx.lock().await.take().unwrap();
+        tx.send("event: tick\nid: 1\ndata: one\n\n".into()).unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(5), body.frame())
+            .await
+            .expect("the first event arrives while the stream is still open")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            first.data_ref().unwrap(),
+            &b"event: tick\nid: 1\ndata: one\n\n"[..]
+        );
+
+        // The exchange is recorded when the stream starts, not when it ends.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let entries = logged(&log);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].status, Some(200));
+        assert_eq!(
+            entries[0].res_body, None,
+            "the body is recorded as messages"
+        );
+
+        tx.send("data: two\r\ndata: lines\r\n\r\n: keepalive\n\n".into())
+            .unwrap();
+        drop(tx);
+        let rest = tokio::time::timeout(Duration::from_secs(5), body.collect())
+            .await
+            .unwrap()
+            .unwrap()
+            .to_bytes();
+        assert!(rest.starts_with(b"data: two"));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let messages = messages_of(dir.path(), &entries[0].id);
+        let got: Vec<_> = messages
+            .iter()
+            .map(|m| {
+                (
+                    m.seq,
+                    m.kind,
+                    m.direction,
+                    m.event.clone(),
+                    m.event_id.clone(),
+                    m.data.clone(),
+                )
+            })
+            .collect();
+        use taphttp_types::{Direction::ServerToClient, MessageKind::Sse};
+        assert_eq!(
+            got,
+            [
+                (
+                    0,
+                    Sse,
+                    ServerToClient,
+                    Some("tick".into()),
+                    Some("1".into()),
+                    Some("one".into())
+                ),
+                (
+                    1,
+                    Sse,
+                    ServerToClient,
+                    None,
+                    None,
+                    Some("two\nlines".into())
+                ),
+            ]
+        );
+    }
+
+    // --- issued credentials (#25) ---
+
+    fn issue(
+        reg: &crate::clients::Registry,
+        allow: &[&str],
+        budget: Option<u64>,
+        rate: Option<crate::clients::Rate>,
+    ) -> (String, String) {
+        let issued = reg
+            .issue(crate::clients::ClientSpec {
+                allow: allow.iter().map(|s| s.to_string()).collect(),
+                rate,
+                budget,
+                meta: [("task".to_string(), "T-7".to_string())].into(),
+            })
+            .unwrap();
+        let id = issued.username.clone();
+        (id.clone(), format!("{id}:{}", issued.password))
+    }
+
+    fn with_clients(reg: &Arc<crate::clients::Registry>) -> ProxyConfig {
+        ProxyConfig {
+            clients: Some(reg.clone()),
+            ..Default::default()
+        }
+    }
+
+    async fn proxy_get(port: u16, target: &str, auth: &str) -> hyper::http::response::Parts {
+        let stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        request_over(stream, proxied_get(target, Some(auth)))
+            .await
+            .0
+    }
+
+    #[tokio::test]
+    async fn issued_credentials_enforce_the_allowlist_and_budget_and_are_recorded() {
+        let (up, seen) = start_header_capture_upstream().await;
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("t.jsonl");
+        let reg = Arc::new(crate::clients::Registry::default());
+        let (id, creds) = issue(&reg, &["127.0.0.1"], Some(2), None);
+        let port = start_proxy_with(dir.path(), &log, with_clients(&reg)).await;
+        let allowed = format!("http://127.0.0.1:{up}/a");
+
+        assert_eq!(proxy_get(port, &allowed, &creds).await.status, 200);
+        let refused = proxy_get(port, "http://192.0.2.1:9/", &creds).await;
+        assert_eq!(refused.status, 403, "not in the allowlist");
+        assert_eq!(proxy_get(port, &allowed, &creds).await.status, 200);
+        assert_eq!(
+            proxy_get(port, &allowed, &creds).await.status,
+            403,
+            "budget of 2 used up"
+        );
+        let (user, _) = creds.split_once(':').unwrap();
+        assert_eq!(
+            proxy_get(port, &allowed, &format!("{user}:wrong"))
+                .await
+                .status,
+            407
+        );
+
+        assert_eq!(seen.lock().await.len(), 2, "refusals never reach upstream");
+        for h in seen.lock().await.iter() {
+            assert!(!h.contains_key("proxy-authorization"));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let entries = logged(&log);
+        assert_eq!(entries.len(), 4, "the 407 isn't an exchange");
+        let refused: Vec<bool> = entries.iter().map(|e| e.refused).collect();
+        assert_eq!(refused, [false, true, false, true]);
+        for e in &entries {
+            assert_eq!(e.source.as_deref(), Some(id.as_str()));
+            assert_eq!(e.meta["task"], "T-7", "the credential's meta");
+            if e.refused {
+                assert_eq!(e.status, None);
+                assert_eq!(e.peer, None);
+                assert!(
+                    e.error.as_deref().unwrap().starts_with("refused: "),
+                    "{e:?}"
+                );
+            }
+        }
+        assert!(entries[1].error.as_deref().unwrap().contains("allowlist"));
+        assert!(entries[3].error.as_deref().unwrap().contains("budget"));
+        let view = &reg.list()[0];
+        assert_eq!((view.sent, view.refused, view.remaining), (2, 2, Some(0)));
+    }
+
+    #[tokio::test]
+    async fn issued_credentials_are_rate_limited_with_retry_after() {
+        let (up, _) = start_header_capture_upstream().await;
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("t.jsonl");
+        let reg = Arc::new(crate::clients::Registry::default());
+        let rate = crate::clients::Rate {
+            per_second: 0.01,
+            burst: Some(1),
+        };
+        let (_, creds) = issue(&reg, &["*"], None, Some(rate));
+        let port = start_proxy_with(dir.path(), &log, with_clients(&reg)).await;
+        let target = format!("http://127.0.0.1:{up}/");
+        assert_eq!(proxy_get(port, &target, &creds).await.status, 200);
+        let limited = proxy_get(port, &target, &creds).await;
+        assert_eq!(limited.status, 429);
+        let wait: u64 = limited.headers["retry-after"]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((90..=100).contains(&wait), "{wait}");
+    }
+
+    #[tokio::test]
+    async fn issued_credentials_cant_reach_the_proxy_itself() {
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("t.jsonl");
+        let reg = Arc::new(crate::clients::Registry::default());
+        let (_, creds) = issue(&reg, &["*"], None, None);
+        let port = start_proxy_with(dir.path(), &log, with_clients(&reg)).await;
+        let own = proxy_get(port, &format!("http://127.0.0.1:{port}/"), &creds).await;
+        assert_eq!(own.status, 403);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let e = &logged(&log)[0];
+        assert!(e.refused);
+        assert!(
+            e.error.as_deref().unwrap().contains("own listeners"),
+            "{e:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_to_a_host_outside_the_allowlist_is_refused_and_recorded() {
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("t.jsonl");
+        let reg = Arc::new(crate::clients::Registry::default());
+        let (id, creds) = issue(&reg, &["example.com"], None, None);
+        let port = start_proxy_with(dir.path(), &log, with_clients(&reg)).await;
+        let (status, tls) = connect_tunnel(port, "192.0.2.1:443", Some(&creds), dir.path()).await;
+        assert_eq!(status, 403);
+        assert!(tls.is_none());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let e = &logged(&log)[0];
+        assert!(e.refused);
+        assert_eq!(e.method, "CONNECT");
+        assert_eq!(e.host, "192.0.2.1");
+        assert_eq!(e.source.as_deref(), Some(id.as_str()));
+        assert_eq!(reg.list()[0].refused, 1);
+    }
+
+    #[tokio::test]
+    async fn requests_inside_a_tunnel_use_the_checked_addresses_and_count() {
+        // Accepts TCP and hangs up: the upstream TLS handshake fails, but
+        // the connection went to the address checked at CONNECT time.
+        let up = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((s, _)) = up.accept().await {
+                drop(s);
+            }
+        });
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("t.jsonl");
+        let reg = Arc::new(crate::clients::Registry::default());
+        let (_, creds) = issue(&reg, &["127.0.0.0/8"], Some(1), None);
+        let port = start_proxy_with(dir.path(), &log, with_clients(&reg)).await;
+        let authority = format!("localhost:{}", up_addr.port());
+        let (status, tls) = connect_tunnel(port, &authority, Some(&creds), dir.path()).await;
+        assert_eq!(
+            status, 200,
+            "localhost is allowed through its 127.0.0.1 address"
+        );
+        let (mut sender, conn) =
+            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(tls.unwrap()))
+                .await
+                .unwrap();
+        tokio::spawn(conn);
+        let get = || {
+            Request::get("/x")
+                .header("host", "localhost")
+                .body(Full::new(Bytes::new()))
+                .unwrap()
+        };
+        assert_eq!(sender.send_request(get()).await.unwrap().status(), 502);
+        assert_eq!(
+            sender.send_request(get()).await.unwrap().status(),
+            403,
+            "budget 1: counted inside the tunnel"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let entries = logged(&log);
+        assert_eq!(entries[0].peer, Some(up_addr), "never ::1");
+        assert!(entries[1].refused);
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_keeps_the_addresses_checked_at_connect_when_the_name_rebinds() {
+        let (up, _) = start_header_capture_upstream().await;
+        let name = format!("rebind-{up}.test");
+        let set = |ip: &str| {
+            crate::upstream::TEST_DNS
+                .lock()
+                .unwrap()
+                .insert(name.clone(), vec![ip.parse().unwrap()]);
+        };
+        set("127.0.0.1");
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("t.jsonl");
+        let reg = Arc::new(crate::clients::Registry::default());
+        let (_, creds) = issue(&reg, &[name.as_str()], None, None);
+        let port = start_proxy_with(dir.path(), &log, with_clients(&reg)).await;
+        let (status, tls) =
+            connect_tunnel(port, &format!("{name}:{up}"), Some(&creds), dir.path()).await;
+        assert_eq!(status, 200);
+        // After the CONNECT's check, the name points somewhere else.
+        set("127.0.0.2");
+        let req = Request::get("/")
+            .header("host", name.as_str())
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        // The upstream speaks plain HTTP, so TLS to it fails; what matters is
+        // where taphttp connected.
+        request_over(tls.unwrap(), req).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let to: SocketAddr = format!("127.0.0.1:{up}").parse().unwrap();
+        assert_eq!(
+            logged(&log)[0].peer,
+            Some(to),
+            "pinned at CONNECT, not re-resolved"
+        );
+    }
+
+    #[tokio::test]
+    async fn revoking_closes_open_connections_and_tunnels() {
+        let (up, _) = start_header_capture_upstream().await;
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("t.jsonl");
+        let reg = Arc::new(crate::clients::Registry::default());
+        let (id, creds) = issue(&reg, &["127.0.0.1", "localhost"], None, None);
+        let port = start_proxy_with(dir.path(), &log, with_clients(&reg)).await;
+
+        // A keep-alive connection that has made one request.
+        let stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        let (mut sender, conn) =
+            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
+                .await
+                .unwrap();
+        let conn = tokio::spawn(conn);
+        let res = sender
+            .send_request(proxied_get(
+                &format!("http://127.0.0.1:{up}/"),
+                Some(&creds),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        res.into_body().collect().await.unwrap();
+
+        // And an open tunnel.
+        let (status, tls) =
+            connect_tunnel(port, &format!("localhost:{up}"), Some(&creds), dir.path()).await;
+        assert_eq!(status, 200);
+        let mut tls = tls.unwrap();
+
+        assert!(reg.revoke(&id));
+        tokio::time::timeout(Duration::from_secs(2), conn)
+            .await
+            .expect("the keep-alive connection is closed")
+            .unwrap()
+            .ok();
+        let mut buf = [0u8; 16];
+        let n = tokio::time::timeout(Duration::from_secs(2), tls.read(&mut buf))
+            .await
+            .expect("the tunnel is closed");
+        assert!(matches!(n, Ok(0) | Err(_)), "{n:?}");
+        assert_eq!(
+            proxy_get(port, &format!("http://127.0.0.1:{up}/"), &creds)
+                .await
+                .status,
+            407,
+            "revoked credentials no longer authenticate"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_auth_api_requires_an_issued_credential() {
+        let (up, _) = start_header_capture_upstream().await;
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("t.jsonl");
+        let reg = Arc::new(crate::clients::Registry::default());
+        let (_, creds) = issue(&reg, &["*"], None, None);
+        let port = start_proxy_with(
+            dir.path(),
+            &log,
+            ProxyConfig {
+                require_client: true,
+                ..with_clients(&reg)
+            },
+        )
+        .await;
+        let target = format!("http://127.0.0.1:{up}/");
+        let stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        assert_eq!(
+            request_over(stream, proxied_get(&target, None))
+                .await
+                .0
+                .status,
+            407
+        );
+        assert_eq!(
+            proxy_get(port, &target, "self-labelled:x").await.status,
+            407
+        );
+        assert_eq!(proxy_get(port, &target, &creds).await.status, 200);
+    }
+
+    #[tokio::test]
+    async fn without_require_client_other_users_keep_the_old_behaviour() {
+        let (up, _) = start_header_capture_upstream().await;
+        let dir = TempDir::new().unwrap();
+        let log = dir.path().join("t.jsonl");
+        let reg = Arc::new(crate::clients::Registry::default());
+        let port = start_proxy_with(dir.path(), &log, with_clients(&reg)).await;
+        let target = format!("http://127.0.0.1:{up}/");
+        assert_eq!(proxy_get(port, &target, "agent.T-3:x").await.status, 200);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let e = &logged(&log)[0];
+        assert_eq!(
+            e.source.as_deref(),
+            Some("agent.T-3"),
+            "self-reported label"
+        );
+        assert!(e.meta.is_empty() && !e.refused);
     }
 
     #[tokio::test]

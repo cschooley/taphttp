@@ -10,7 +10,7 @@ use tokio::sync::broadcast;
 // The traffic schema lives in the `taphttp-types` crate so consumers can
 // depend on it without the proxy. Re-exported here so the rest of the crate
 // keeps one import path.
-pub use taphttp_types::{Headers, Origin, TrafficEntry, SCHEMA_VERSION};
+pub use taphttp_types::{Headers, Message, Origin, TrafficEntry, SCHEMA_VERSION};
 
 pub struct JsonLinesBackend {
     path: PathBuf,
@@ -66,7 +66,7 @@ pub struct SqliteBackend {
 
 /// Columns of the `traffic` table, in insert order. v1/v2 databases have
 /// only the first eleven; [`SqliteBackend::new`] adds the rest.
-const SQLITE_COLUMNS: [(&str, &str); 21] = [
+const SQLITE_COLUMNS: [(&str, &str); 22] = [
     ("id", "TEXT PRIMARY KEY"),
     ("ts", "TEXT NOT NULL"),
     ("host", "TEXT NOT NULL"),
@@ -96,6 +96,8 @@ const SQLITE_COLUMNS: [(&str, &str); 21] = [
     ("origin", "TEXT"),
     // v7: the upstream address taphttp connected to (`ip:port` text).
     ("peer", "TEXT"),
+    // v8: refused by an issued credential's policy (0/1; NULL is 0).
+    ("refused", "INTEGER"),
 ];
 
 impl SqliteBackend {
@@ -128,6 +130,13 @@ impl SqliteBackend {
                     .with_context(|| format!("migrating sqlite: adding column {name}"))?;
             }
         }
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS messages (
+                exchange_id TEXT NOT NULL, seq INTEGER NOT NULL, ts TEXT NOT NULL,
+                kind TEXT NOT NULL, direction TEXT NOT NULL, opcode TEXT, event TEXT,
+                event_id TEXT, size INTEGER NOT NULL, data TEXT, data_encoding TEXT NOT NULL,
+                truncated INTEGER NOT NULL, PRIMARY KEY (exchange_id, seq));",
+        )?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS traffic_ts_us ON traffic (ts_us);
              CREATE INDEX IF NOT EXISTS traffic_replay_of ON traffic (replay_of);",
@@ -186,9 +195,44 @@ impl SqliteBackend {
                 e.error,
                 origin_str(e.origin),
                 e.peer.map(|p| p.to_string()),
+                e.refused,
             ],
         )?;
         Ok(())
+    }
+}
+
+impl SqliteBackend {
+    pub fn append_message(&self, m: &Message) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO messages (exchange_id, seq, ts, kind, direction, opcode,
+                event, event_id, size, data, data_encoding, truncated)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            rusqlite::params![
+                m.exchange_id,
+                i64::try_from(m.seq).unwrap_or(i64::MAX),
+                m.ts.to_rfc3339_offset(),
+                enum_str(&m.kind)?,
+                enum_str(&m.direction)?,
+                m.opcode.as_ref().map(enum_str).transpose()?,
+                m.event,
+                m.event_id,
+                i64::try_from(m.size).unwrap_or(i64::MAX),
+                m.data,
+                enum_str(&m.data_encoding)?,
+                m.truncated,
+            ],
+        )?;
+        Ok(())
+    }
+}
+
+/// A unit enum's JSON string (`"websocket"`, `"client_to_server"`, …).
+pub(crate) fn enum_str<T: Serialize>(v: &T) -> Result<String> {
+    match serde_json::to_value(v)? {
+        serde_json::Value::String(s) => Ok(s),
+        other => anyhow::bail!("not a unit enum: {other}"),
     }
 }
 
@@ -208,9 +252,27 @@ const LIVE_FEED_CAPACITY: usize = 1024;
 pub struct Store {
     log_file: Option<JsonLinesBackend>,
     sqlite: Option<SqliteBackend>,
-    /// Fans each recorded entry out to live subscribers (the API `/feed`
-    /// WebSocket, the MCP server, anything watching traffic as it happens).
-    live: broadcast::Sender<TrafficEntry>,
+    /// Fans each recorded entry and message out to live subscribers (the
+    /// API `/feed` WebSocket, anything watching traffic as it happens). One
+    /// channel, so a message never overtakes the exchange it belongs to.
+    live: broadcast::Sender<Live>,
+}
+
+/// What the live feed carries.
+#[derive(Debug, Clone)]
+pub enum Live {
+    Entry(Box<TrafficEntry>),
+    Message(Box<Message>),
+}
+
+#[cfg(test)]
+impl Live {
+    pub fn entry(self) -> TrafficEntry {
+        match self {
+            Self::Entry(e) => *e,
+            Self::Message(m) => panic!("expected an entry, got {m:?}"),
+        }
+    }
 }
 
 impl Store {
@@ -229,7 +291,7 @@ impl Store {
 
     /// Subscribe to the live feed of recorded entries. Each subscriber
     /// receives every entry recorded after it subscribes.
-    pub fn subscribe(&self) -> broadcast::Receiver<TrafficEntry> {
+    pub fn subscribe(&self) -> broadcast::Receiver<Live> {
         self.live.subscribe()
     }
 
@@ -262,7 +324,19 @@ impl Store {
 
         // Fan out to live subscribers last. An error here just means no one
         // is listening, which is fine — the feed is best-effort.
-        let _ = self.live.send(entry);
+        let _ = self.live.send(Live::Entry(Box::new(entry)));
+    }
+
+    /// Record a WebSocket message or SSE event: into sqlite and onto the
+    /// live feed. Not to stdout or the log file, which hold one exchange
+    /// per line.
+    pub fn record_message(&self, message: Message) {
+        if let Some(db) = &self.sqlite {
+            if let Err(e) = db.append_message(&message) {
+                tracing::warn!("Failed to write message to sqlite: {e}");
+            }
+        }
+        let _ = self.live.send(Live::Message(Box::new(message)));
     }
 }
 
@@ -444,6 +518,7 @@ mod tests {
             error: None,
             origin: crate::storage::Origin::Proxy,
             peer: None,
+            refused: false,
         }
     }
 
@@ -993,11 +1068,44 @@ mod tests {
     // --- live feed (broadcast primitive the API/MCP bridge to) ---
 
     #[tokio::test]
+    async fn messages_are_stored_in_sqlite_and_broadcast_but_not_logged() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let log = dir.path().join("t.jsonl");
+        let store = Store::new(Some(&log), Some(&dir.path().join("t.db"))).unwrap();
+        store.record(make_entry("ws-1", "h", "GET", 101));
+        let mut rx = store.subscribe();
+        let mut m = taphttp_types::Message {
+            exchange_id: "ws-1".into(),
+            seq: 0,
+            ts: taphttp_types::Timestamp::now(),
+            kind: taphttp_types::MessageKind::Websocket,
+            direction: taphttp_types::Direction::ServerToClient,
+            opcode: Some(taphttp_types::Opcode::Binary),
+            event: None,
+            event_id: None,
+            size: 0,
+            data: None,
+            data_encoding: Default::default(),
+            truncated: false,
+        };
+        m.set_data(&[0, 1, 2], 1024);
+        store.record_message(m.clone());
+        match rx.recv().await.unwrap() {
+            Live::Message(got) => assert_eq!(*got, m),
+            other => panic!("{other:?}"),
+        }
+        let stored = store.history().unwrap().messages("ws-1", None, 10).unwrap();
+        assert_eq!(stored, [m]);
+        let lines = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(lines.lines().count(), 1, "the log holds exchanges only");
+    }
+
+    #[tokio::test]
     async fn record_broadcasts_entry_to_subscriber() {
         let store = Store::new(None, None).unwrap();
         let mut rx = store.subscribe();
         store.record(make_entry("live-1", "example.com", "GET", 200));
-        let got = rx.recv().await.unwrap();
+        let got = rx.recv().await.unwrap().entry();
         assert_eq!(got.id, "live-1");
     }
 
@@ -1014,8 +1122,8 @@ mod tests {
         let mut rx1 = store.subscribe();
         let mut rx2 = store.subscribe();
         store.record(make_entry("fan-out", "example.com", "GET", 200));
-        assert_eq!(rx1.recv().await.unwrap().id, "fan-out");
-        assert_eq!(rx2.recv().await.unwrap().id, "fan-out");
+        assert_eq!(rx1.recv().await.unwrap().entry().id, "fan-out");
+        assert_eq!(rx2.recv().await.unwrap().entry().id, "fan-out");
     }
 
     #[tokio::test]
@@ -1024,7 +1132,7 @@ mod tests {
         store.record(make_entry("before", "example.com", "GET", 200));
         let mut rx = store.subscribe();
         store.record(make_entry("after", "example.com", "GET", 200));
-        let got = rx.recv().await.unwrap();
+        let got = rx.recv().await.unwrap().entry();
         assert_eq!(got.id, "after", "feed is live, not a replay of history");
     }
 

@@ -42,11 +42,11 @@ dirs = "5"
 axum = { version = "0.8.9", features = ["ws"] }
 ring = "0.17"
 tower = { version = "0.5.3", features = ["util"] }
+futures-util = "0.3.34"
+tokio-tungstenite = "0.30.0"
 
 [dev-dependencies]
-futures-util = "0.3.34"
 tempfile = "3"
-tokio-tungstenite = "0.30.0"
 
 [profile.release]
 opt-level = 3

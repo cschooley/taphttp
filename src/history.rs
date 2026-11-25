@@ -38,6 +38,8 @@ pub struct HistoryQuery {
     pub replay_of: Option<String>,
     /// Only exchanges recorded this way.
     pub origin: Option<Origin>,
+    /// Only refused exchanges (`true`) or only the rest (`false`).
+    pub refused: Option<bool>,
     /// Cursor: only entries recorded before the entry with this id.
     pub before: Option<String>,
     /// Page size; default [`DEFAULT_LIMIT`], capped at [`MAX_LIMIT`].
@@ -99,7 +101,7 @@ impl From<rusqlite::Error> for HistoryError {
 }
 
 const COLUMNS: &str = "rowid, id, ts, host, method, url, req_headers, req_body, \
-    req_body_encoding, status, res_headers, res_body, res_body_encoding, duration_ms, replay_of, source, meta, error, origin, peer";
+    req_body_encoding, status, res_headers, res_body, res_body_encoding, duration_ms, replay_of, source, meta, error, origin, peer, refused";
 
 impl SqliteBackend {
     /// Newest first, filtered, at most `limit` entries.
@@ -121,6 +123,13 @@ impl SqliteBackend {
         if let Some(origin) = q.origin {
             sql.push_str(" AND origin = ?");
             params.push(Box::new(crate::storage::origin_str(origin)));
+        }
+        if let Some(refused) = q.refused {
+            sql.push_str(if refused {
+                " AND refused = 1"
+            } else {
+                " AND (refused IS NULL OR refused = 0)"
+            });
         }
         if let Some(host) = &q.host {
             sql.push_str(r" AND host LIKE ? ESCAPE '\'");
@@ -187,6 +196,25 @@ impl SqliteBackend {
             r.get(0)
         })
         .optional()
+    }
+
+    /// Up to `limit` messages of exchange `id`, in sequence order, starting
+    /// after `after` (a `seq`) if given.
+    pub fn messages(
+        &self,
+        id: &str,
+        after: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<taphttp_types::Message>> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let mut stmt = conn.prepare(
+            "SELECT exchange_id, seq, ts, kind, direction, opcode, event, event_id, size,
+                data, data_encoding, truncated
+             FROM messages WHERE exchange_id = ?1 AND seq > ?2 ORDER BY seq ASC LIMIT ?3",
+        )?;
+        let after = after.map_or(-1, |a| i64::try_from(a).unwrap_or(i64::MAX));
+        let rows = stmt.query_map(rusqlite::params![id, after, limit as i64], row_to_message)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// Up to `limit` entries recorded after position `rowid`, oldest first,
@@ -277,8 +305,38 @@ fn row_to_entry(r: &Row) -> rusqlite::Result<(i64, TrafficEntry)> {
             Some(text) => Some(text.parse().map_err(|e| conversion(19, Box::new(e)))?),
             None => None,
         },
+        refused: r.get::<_, Option<bool>>(20)?.unwrap_or(false),
     };
     Ok((r.get(0)?, entry))
+}
+
+fn row_to_message(r: &Row) -> rusqlite::Result<taphttp_types::Message> {
+    fn parse<T: serde::de::DeserializeOwned>(r: &Row, i: usize) -> rusqlite::Result<T> {
+        let s: String = r.get(i)?;
+        serde_json::from_value(serde_json::Value::String(s)).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(i, rusqlite::types::Type::Text, e.into())
+        })
+    }
+    let ts: String = r.get(2)?;
+    Ok(taphttp_types::Message {
+        exchange_id: r.get(0)?,
+        seq: r.get::<_, i64>(1)?.try_into().unwrap_or(0),
+        ts: ts.parse().map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e))
+        })?,
+        kind: parse(r, 3)?,
+        direction: parse(r, 4)?,
+        opcode: match r.get::<_, Option<String>>(5)? {
+            Some(_) => Some(parse(r, 5)?),
+            None => None,
+        },
+        event: r.get(6)?,
+        event_id: r.get(7)?,
+        size: r.get::<_, i64>(8)?.try_into().unwrap_or(0),
+        data: r.get(9)?,
+        data_encoding: parse(r, 10)?,
+        truncated: r.get(11)?,
+    })
 }
 
 #[cfg(test)]
@@ -307,6 +365,7 @@ mod tests {
             error: None,
             origin: crate::storage::Origin::Proxy,
             peer: None,
+            refused: false,
         }
     }
 
@@ -749,6 +808,33 @@ mod tests {
     }
 
     #[test]
+    fn refused_round_trips_and_filters() {
+        let dir = TempDir::new().unwrap();
+        let db = SqliteBackend::new(&dir.path().join("t.db")).unwrap();
+        let sent = entry("sent", "h", "GET", 200, "/");
+        let mut refused = entry("no", "h", "GET", 200, "/");
+        refused.status = None;
+        refused.refused = true;
+        refused.error = Some("refused: host not allowed".into());
+        for e in [&sent, &refused] {
+            db.append(e).unwrap();
+            assert_eq!(&db.get(&e.id).unwrap().unwrap(), e);
+        }
+        let only = |r| -> Vec<String> {
+            db.query(&HistoryQuery {
+                refused: Some(r),
+                ..Default::default()
+            })
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect()
+        };
+        assert_eq!(only(true), ["no"]);
+        assert_eq!(only(false), ["sent"]);
+    }
+
+    #[test]
     fn rows_from_before_v6_get_an_origin_from_replay_of() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("t.db");
@@ -786,6 +872,51 @@ mod tests {
         };
         assert_eq!(only(Origin::Proxy), ["old"], "filled in on open");
         assert_eq!(only(Origin::Replay), ["again"]);
+    }
+
+    #[test]
+    fn messages_page_in_sequence_order() {
+        use taphttp_types::{Direction, Message, MessageKind};
+        let dir = TempDir::new().unwrap();
+        let db = SqliteBackend::new(&dir.path().join("t.db")).unwrap();
+        let msg = |ex: &str, seq: u64| {
+            let mut m = Message {
+                exchange_id: ex.into(),
+                seq,
+                ts: "2026-11-24T00:00:00.5Z".parse().unwrap(),
+                kind: MessageKind::Sse,
+                direction: Direction::ServerToClient,
+                opcode: None,
+                event: Some("tick".into()),
+                event_id: Some(seq.to_string()),
+                size: 0,
+                data: None,
+                data_encoding: BodyEncoding::Utf8,
+                truncated: false,
+            };
+            m.set_data(format!("data {seq}").as_bytes(), 4);
+            m
+        };
+        for seq in [2, 0, 1, 3] {
+            db.append_message(&msg("a", seq)).unwrap();
+        }
+        db.append_message(&msg("b", 0)).unwrap();
+        let seqs = |after, limit| -> Vec<u64> {
+            db.messages("a", after, limit)
+                .unwrap()
+                .into_iter()
+                .map(|m| m.seq)
+                .collect()
+        };
+        assert_eq!(seqs(None, 10), [0, 1, 2, 3]);
+        assert_eq!(seqs(None, 2), [0, 1]);
+        assert_eq!(seqs(Some(1), 10), [2, 3]);
+        assert_eq!(
+            db.messages("a", None, 10).unwrap()[1],
+            msg("a", 1),
+            "round-trips"
+        );
+        assert!(db.messages("none", None, 10).unwrap().is_empty());
     }
 
     #[test]

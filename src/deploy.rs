@@ -226,7 +226,7 @@ impl ProxyCredentials {
     }
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -340,7 +340,9 @@ pub fn banner(b: &BannerInfo) -> String {
             let list: Vec<String> = b.allow_clients.iter().map(|c| c.to_string()).collect();
             access.push(format!("clients {}", list.join(", ")));
         }
-        if e.proxy_auth {
+        if e.proxy_auth && b.proxy_users == 0 {
+            access.push("proxy auth (issued credentials only)".to_string());
+        } else if e.proxy_auth {
             access.push(format!(
                 "proxy auth ({} user{})",
                 b.proxy_users,

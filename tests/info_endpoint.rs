@@ -309,3 +309,122 @@ fn send_can_be_turned_off_at_startup() {
     );
     assert_eq!(status, 403, "{body}");
 }
+
+/// One request through the proxy at `proxy`; return the status.
+fn proxy_get(proxy: &str, url: &str, auth: Option<&str>) -> u16 {
+    let mut s = TcpStream::connect(proxy).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let auth = auth
+        .map(|a| format!("Proxy-Authorization: {a}\r\n"))
+        .unwrap_or_default();
+    write!(
+        s,
+        "GET {url} HTTP/1.1\r\nHost: x\r\n{auth}Connection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut raw = String::new();
+    s.read_to_string(&mut raw).unwrap();
+    raw[9..12].parse().unwrap()
+}
+
+#[test]
+fn proxy_auth_api_issues_enforces_and_revokes_credentials() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let token_file = dir.path().join("tok");
+    std::fs::write(&token_file, TOKEN).unwrap();
+    let t = start(
+        dir.path(),
+        &[
+            "--listen",
+            "127.0.0.1:0",
+            "--api-listen",
+            "127.0.0.1:0",
+            "--api-token-file",
+            token_file.to_str().unwrap(),
+            "--proxy-auth-api",
+        ],
+    );
+    let (_, body) = get(&t.api, "/info", Some(TOKEN));
+    let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(info["proxy"]["auth"], "basic");
+    let proxy = info["proxy"]["listen"].as_str().unwrap().to_string();
+
+    let (status, body) = post(
+        &t.api,
+        "/clients",
+        TOKEN,
+        &serde_json::json!({"allow": ["127.0.0.1"], "meta": {"task": "T-7"}}),
+    );
+    assert_eq!(status, 201, "{body}");
+    let issued: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let userpass = format!(
+        "{}:{}",
+        issued["username"].as_str().unwrap(),
+        issued["password"].as_str().unwrap()
+    );
+    let basic = format!("Basic {}", b64(userpass.as_bytes()));
+
+    // No credential: 407. The API itself is in the allowlist by address but
+    // is one of taphttp's own listeners: refused and recorded.
+    let target = format!("http://{}/info", t.api);
+    assert_eq!(proxy_get(&proxy, &target, None), 407);
+    assert_eq!(proxy_get(&proxy, &target, Some(&basic)), 403);
+    let (_, refused) = get(&t.api, "/exchanges?refused=true", Some(TOKEN));
+    let refused: serde_json::Value = serde_json::from_str(&refused).unwrap();
+    assert_eq!(refused[0]["meta"]["task"], "T-7");
+    assert_eq!(refused[0]["source"], issued["id"]);
+
+    let (_, list) = get(&t.api, "/clients", Some(TOKEN));
+    let list: serde_json::Value = serde_json::from_str(&list).unwrap();
+    assert_eq!(list[0]["refused"], 1);
+    assert!(!list
+        .to_string()
+        .contains(issued["password"].as_str().unwrap()));
+
+    // The e-stop.
+    let mut s = TcpStream::connect(&t.api).unwrap();
+    write!(
+        s,
+        "DELETE /clients HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {TOKEN}\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut raw = String::new();
+    s.read_to_string(&mut raw).unwrap();
+    assert!(raw.starts_with("HTTP/1.1 200"), "{raw}");
+    assert_eq!(proxy_get(&proxy, &target, Some(&basic)), 407);
+}
+
+#[test]
+fn proxy_auth_api_needs_the_api() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_taphttp"))
+        .arg("--data-dir")
+        .arg(dir.path())
+        .args(["start", "--listen", "127.0.0.1:0", "--proxy-auth-api"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--proxy-auth-api needs --api-listen"),
+        "{stderr}"
+    );
+}
+
+fn b64(bytes: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for c in bytes.chunks(3) {
+        let n = (u32::from(c[0]) << 16)
+            | (u32::from(*c.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*c.get(2).unwrap_or(&0));
+        for i in 0..4 {
+            out.push(if i <= c.len() {
+                A[(n >> (18 - 6 * i)) as usize & 63] as char
+            } else {
+                '='
+            });
+        }
+    }
+    out
+}
