@@ -805,7 +805,12 @@ Each line is one exchange (shown pretty-printed here):
   it and doesn't interpret it.
 - `error` is why the exchange has no complete response (the upstream
   couldn't be reached, or the response broke off), or `null`. Failed
-  replays are recorded this way, so history has no gaps.
+  replays are recorded this way, so history has no gaps. A response that
+  breaks off keeps its `status`, `res_headers` and the body bytes that
+  arrived, and `error` says how far it got: `upstream body ended early:
+  11309 of 11321 bytes` when it fell short of its `Content-Length`. Through
+  the proxy, the client gets the same: the head and those bytes, then the
+  connection closes with the body incomplete, as it would without taphttp.
 - `origin` is how the exchange was recorded: `"proxy"` (a client sent it
   through the proxy), `"replay"` (`taphttp replay` or `POST /replay`) or
   `"send"` (`POST /send`).

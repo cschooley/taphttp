@@ -158,3 +158,106 @@ pub fn error_chain(e: &dyn std::error::Error) -> String {
     }
     out
 }
+
+/// Read a response body to its end, or as far as it got. A body that fails
+/// partway keeps the bytes that arrived, and the error says what happened:
+/// how far short of its `Content-Length` it ended, if it had one.
+pub async fn read_body<B>(body: B, headers: &hyper::HeaderMap) -> (Bytes, Option<String>)
+where
+    B: hyper::body::Body<Data = Bytes>,
+    B::Error: std::error::Error,
+{
+    use http_body_util::BodyExt;
+    let declared = headers
+        .get(hyper::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    let mut body = std::pin::pin!(body);
+    let mut got = bytes::BytesMut::new();
+    while let Some(frame) = body.frame().await {
+        match frame {
+            Ok(frame) => {
+                if let Ok(data) = frame.into_data() {
+                    got.extend_from_slice(&data);
+                }
+            }
+            Err(e) => {
+                let n = got.len() as u64;
+                let why = match declared {
+                    Some(len) if n < len => {
+                        format!("upstream body ended early: {n} of {len} bytes")
+                    }
+                    _ => format!("reading response body after {n} bytes: {}", error_chain(&e)),
+                };
+                return (got.freeze(), Some(why));
+            }
+        }
+    }
+    (got.freeze(), None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http_body_util::StreamBody;
+    use hyper::body::Frame;
+
+    fn body(
+        parts: Vec<Result<&'static [u8], std::io::Error>>,
+    ) -> StreamBody<impl futures_util::Stream<Item = Result<Frame<Bytes>, std::io::Error>>> {
+        StreamBody::new(futures_util::stream::iter(
+            parts
+                .into_iter()
+                .map(|p| p.map(|b| Frame::data(Bytes::from_static(b)))),
+        ))
+    }
+
+    fn length(n: u64) -> hyper::HeaderMap {
+        let mut h = hyper::HeaderMap::new();
+        h.insert(hyper::header::CONTENT_LENGTH, n.into());
+        h
+    }
+
+    fn cut() -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "connection closed")
+    }
+
+    #[tokio::test]
+    async fn a_whole_body_is_read_without_error() {
+        let (bytes, error) = read_body(body(vec![Ok(b"he"), Ok(b"llo")]), &length(5)).await;
+        assert_eq!(&bytes[..], b"hello");
+        assert_eq!(error, None);
+    }
+
+    #[tokio::test]
+    async fn a_body_short_of_its_content_length_keeps_what_arrived() {
+        let (bytes, error) =
+            read_body(body(vec![Ok(b"he"), Ok(b"llo"), Err(cut())]), &length(9)).await;
+        assert_eq!(&bytes[..], b"hello");
+        assert_eq!(
+            error.as_deref(),
+            Some("upstream body ended early: 5 of 9 bytes")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_body_without_a_length_that_fails_says_why_and_how_far() {
+        let (bytes, error) =
+            read_body(body(vec![Ok(b"abc"), Err(cut())]), &hyper::HeaderMap::new()).await;
+        assert_eq!(&bytes[..], b"abc");
+        assert_eq!(
+            error.as_deref(),
+            Some("reading response body after 3 bytes: connection closed")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failure_before_any_byte_is_reported() {
+        let (bytes, error) = read_body(body(vec![Err(cut())]), &length(4)).await;
+        assert!(bytes.is_empty());
+        assert_eq!(
+            error.as_deref(),
+            Some("upstream body ended early: 0 of 4 bytes")
+        );
+    }
+}

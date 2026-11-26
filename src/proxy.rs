@@ -52,7 +52,8 @@ pub struct ProxyConfig {
 }
 
 /// What the proxy answers its clients with: buffered, or streamed through.
-pub type ProxyBody = UnsyncBoxBody<Bytes, hyper::Error>;
+/// An error ends the client's response there, with the connection.
+pub type ProxyBody = UnsyncBoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
 
 /// A buffered body.
 fn full(bytes: impl Into<Bytes>) -> ProxyBody {
@@ -61,6 +62,21 @@ fn full(bytes: impl Into<Bytes>) -> ProxyBody {
 
 fn full_body(body: Full<Bytes>) -> ProxyBody {
     body.map_err(|never| match never {}).boxed_unsync()
+}
+
+/// The bytes that arrived, then an error: the client's response ends as
+/// upstream's did, incomplete, rather than as a whole shorter body. The
+/// error waits one turn so hyper flushes what came before it; on an error
+/// it closes the connection without flushing.
+fn cut_off(bytes: Bytes, why: String) -> ProxyBody {
+    use futures_util::StreamExt;
+    type Frame = Result<hyper::body::Frame<Bytes>, Box<dyn std::error::Error + Send + Sync>>;
+    let data = futures_util::stream::once(async { Frame::Ok(hyper::body::Frame::data(bytes)) });
+    let error = futures_util::stream::once(async {
+        tokio::task::yield_now().await;
+        Frame::Err(why.into())
+    });
+    http_body_util::StreamBody::new(data.chain(error)).boxed_unsync()
 }
 
 impl ProxyConfig {
@@ -894,26 +910,30 @@ async fn forward(
         Err(e) => Err(e),
     };
 
-    let mut upstream_error = None;
-    let (mut status, mut res_headers, mut res_raw_headers, mut res_body_bytes) = match res {
-        Ok(r) => {
-            let s = r.status().as_u16();
-            let h = collect_headers(r.headers());
-            let raw = r.headers().clone();
-            let b = r.into_body().collect().await?.to_bytes();
-            (Some(s), h, raw, b)
-        }
-        Err(e) => {
-            tracing::debug!("upstream error: {e}");
-            upstream_error = Some(e);
-            (None, Headers::new(), hyper::HeaderMap::new(), Bytes::new())
-        }
-    };
-    if !record {
-        return match status {
-            Some(s) => client_response(s, &res_raw_headers, res_body_bytes),
-            None => make_drop_response(502, None),
+    // A body that breaks off keeps the status, headers and bytes that
+    // arrived, with the error saying how far it got.
+    let (mut status, mut res_headers, mut res_raw_headers, mut res_body_bytes, upstream_error) =
+        match res {
+            Ok(r) => {
+                let s = r.status().as_u16();
+                let h = collect_headers(r.headers());
+                let raw = r.headers().clone();
+                let (b, e) = crate::upstream::read_body(r.into_body(), &raw).await;
+                (Some(s), h, raw, b, e)
+            }
+            Err(e) => {
+                tracing::debug!("upstream error: {e}");
+                (
+                    None,
+                    Headers::new(),
+                    hyper::HeaderMap::new(),
+                    Bytes::new(),
+                    Some(e),
+                )
+            }
         };
+    if !record {
+        return upstream_response(status, &res_raw_headers, res_body_bytes, upstream_error);
     }
 
     // --- intercept response ---
@@ -949,6 +969,7 @@ async fn forward(
 
     let (req_body, req_body_encoding) = encode_body(&req_body_bytes);
     let (res_body, res_body_encoding) = encode_body(&res_body_bytes);
+    let cut = upstream_error.clone();
     let entry = TrafficEntry {
         id,
         ts: Timestamp::now(),
@@ -973,21 +994,39 @@ async fn forward(
     };
 
     tracing::info!(
-        "{} {} {} {}ms",
+        "{} {} {} {}ms{}",
         entry.method,
         entry.url,
         entry
             .status
             .map(|s| s.to_string())
             .unwrap_or_else(|| "ERR".to_string()),
-        duration_ms
+        duration_ms,
+        entry
+            .error
+            .as_ref()
+            .map(|e| format!(" ({e})"))
+            .unwrap_or_default()
     );
 
     store.record(entry);
 
-    match status {
-        Some(s) => client_response(s, &res_raw_headers, res_body_bytes),
-        None => make_drop_response(502, None),
+    upstream_response(status, &res_raw_headers, res_body_bytes, cut)
+}
+
+/// The client's answer to a forwarded request: upstream's response, cut
+/// off where upstream's was if its body broke off (`error` with a
+/// `status`), or a bare 502 if no response head arrived.
+fn upstream_response(
+    status: Option<u16>,
+    headers: &hyper::HeaderMap,
+    body: Bytes,
+    error: Option<String>,
+) -> Result<Response<ProxyBody>> {
+    match (status, error) {
+        (Some(s), None) => client_response(s, headers, body),
+        (Some(s), Some(why)) => client_response_streamed(s, headers, cut_off(body, why)),
+        (None, _) => make_drop_response(502, None),
     }
 }
 
@@ -1485,6 +1524,97 @@ mod tests {
         assert!(error.to_lowercase().contains("connect"), "{error}");
         assert!(entry.meta.is_empty());
         assert_eq!(entry.peer, None, "never connected");
+    }
+
+    /// Upstream that promises 20 body bytes, sends 8, and hangs up.
+    async fn start_short_upstream() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = vec![0u8; 8192];
+            let _ = stream.read(&mut buf).await;
+            let res = b"HTTP/1.1 200 OK\r\ncontent-length: 20\r\nx-up: yes\r\n\r\npartial!";
+            stream.write_all(res).await.ok();
+        });
+        port
+    }
+
+    /// Everything the client got before the proxy closed the connection,
+    /// cleanly or not.
+    async fn read_until_closed(proxy_port: u16, up: u16) -> String {
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{proxy_port}"))
+            .await
+            .unwrap();
+        let raw = format!(
+            "GET http://127.0.0.1:{up}/ftp HTTP/1.1\r\nHost: 127.0.0.1:{up}\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(raw.as_bytes()).await.unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => break,
+                Ok(Ok(n)) => got.extend_from_slice(&buf[..n]),
+                Err(_) => panic!("the proxy never closed the connection"),
+            }
+        }
+        String::from_utf8_lossy(&got).into_owned()
+    }
+
+    /// The client gets the head and the bytes that arrived, then the
+    /// connection ends without the body being complete: no last chunk, and
+    /// no Content-Length claiming the short body is whole.
+    fn assert_cut_off_like_upstream(response: &str) {
+        assert!(response.starts_with("HTTP/1.1 200"), "{response:?}");
+        assert!(response.contains("x-up: yes"), "{response:?}");
+        assert!(response.contains("partial!"), "{response:?}");
+        assert!(!response.ends_with("0\r\n\r\n"), "{response:?}");
+        assert!(
+            !response.to_lowercase().contains("content-length: 8"),
+            "{response:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_body_short_of_its_content_length_is_recorded_and_passed_on_cut_off() {
+        let up = start_short_upstream().await;
+        let dir = TempDir::new().unwrap();
+        let log_file = dir.path().join("traffic.jsonl");
+        let proxy_port = start_proxy(dir.path(), &log_file, None).await;
+
+        let response = read_until_closed(proxy_port, up).await;
+        assert_cut_off_like_upstream(&response);
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let content = std::fs::read_to_string(&log_file).expect("the attempt is recorded");
+        let entry: TrafficEntry = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        assert_eq!(entry.status, Some(200));
+        assert_eq!(entry.res_headers.get("content-length"), Some("20"));
+        assert_eq!(entry.res_headers.get("x-up"), Some("yes"));
+        assert_eq!(entry.res_body.as_deref(), Some("partial!"));
+        assert_eq!(
+            entry.error.as_deref(),
+            Some("upstream body ended early: 8 of 20 bytes")
+        );
+        assert!(entry.peer.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_short_body_outside_the_filter_is_still_passed_on_cut_off() {
+        let up = start_short_upstream().await;
+        let dir = TempDir::new().unwrap();
+        let log_file = dir.path().join("traffic.jsonl");
+        let config = ProxyConfig {
+            filter_host: Some("only-this-host.example".to_string()),
+            ..Default::default()
+        };
+        let proxy_port = start_proxy_with(dir.path(), &log_file, config).await;
+
+        let response = read_until_closed(proxy_port, up).await;
+        assert_cut_off_like_upstream(&response);
     }
 
     /// Upstream that answers with two Set-Cookie headers, a header value that

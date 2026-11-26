@@ -318,7 +318,7 @@ impl SseTap {
     }
 
     pub fn boxed(self) -> crate::proxy::ProxyBody {
-        BodyExt::boxed_unsync(self)
+        BodyExt::boxed_unsync(BodyExt::map_err(self, Into::into))
     }
 }
 

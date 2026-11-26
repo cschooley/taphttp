@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::Full;
 use hyper::Request;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -342,21 +342,14 @@ async fn send(req: Request<Full<Bytes>>, addrs: Vec<SocketAddr>) -> Outcome {
 
     let status = Some(res.status().as_u16());
     let headers = crate::proxy::collect_headers(res.headers());
-    match res.into_body().collect().await {
-        Ok(body) => Outcome {
-            status,
-            headers,
-            body: body.to_bytes(),
-            error: None,
-            peer: peer.get(),
-        },
-        Err(e) => Outcome {
-            status,
-            headers,
-            body: Bytes::new(),
-            error: Some(format!("reading response body: {}", error_chain(&e))),
-            peer: peer.get(),
-        },
+    let (raw, body) = res.into_parts();
+    let (body, error) = crate::upstream::read_body(body, &raw.headers).await;
+    Outcome {
+        status,
+        headers,
+        body,
+        error,
+        peer: peer.get(),
     }
 }
 
@@ -413,7 +406,7 @@ mod tests {
     use crate::cli::ReplayArgs;
     use crate::storage::{JsonLinesBackend, TrafficEntry};
     use bytes::Bytes;
-    use http_body_util::Full;
+    use http_body_util::{BodyExt, Full};
     use hyper::body::Incoming;
     use hyper::service::service_fn;
     use hyper::{Request, Response};
@@ -1279,8 +1272,15 @@ mod tests {
         };
         assert_eq!(entry.status, Some(200));
         assert_eq!(entry.res_headers.get("x-up"), Some("yes"));
-        let error = entry.error.as_deref().unwrap();
-        assert!(error.contains("response body"), "{error}");
+        assert_eq!(
+            entry.res_body.as_deref(),
+            Some("hello"),
+            "what arrived is kept"
+        );
+        assert_eq!(
+            entry.error.as_deref(),
+            Some("upstream body ended early: 5 of 100 bytes")
+        );
         assert!(entry.peer.is_some(), "the head arrived, so it connected");
     }
 
